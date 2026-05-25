@@ -63,6 +63,33 @@ function waitForSync(c, timeoutMs = 60000) {
   });
 }
 
+// Wipe the Rust crypto IndexedDB stores. matrix-js-sdk binds a store to the
+// (user_id, device_id) tuple it was created with; on a fresh login the server
+// hands out a new device_id, so any leftover store from a prior session will
+// fail initRustCrypto with "the account in the store doesn't match the
+// account in the constructor". Clearing on fresh login (and on logout) keeps
+// the flow idempotent. Old Megolm sessions are inaccessible by the new device
+// anyway, so nothing useful is lost.
+async function clearCryptoStores() {
+  if (typeof indexedDB === 'undefined' || typeof indexedDB.databases !== 'function') {
+    return;
+  }
+  let dbs;
+  try {
+    dbs = await indexedDB.databases();
+  } catch {
+    return;
+  }
+  await Promise.all(
+    dbs
+      .filter((db) => db.name && (db.name.startsWith('matrix-') || db.name.includes('matrix-sdk-crypto')))
+      .map((db) => new Promise((resolve) => {
+        const req = indexedDB.deleteDatabase(db.name);
+        req.onsuccess = req.onerror = req.onblocked = () => resolve();
+      }))
+  );
+}
+
 // Promisified timeout wrapper so a stuck network or stuck wasm load surfaces
 // as a real error instead of an endless spinner.
 function withTimeout(promise, ms, label) {
@@ -135,6 +162,11 @@ export async function login(homeserver, username, password) {
   // Step 3: crypto. This loads wasm + opens IndexedDB; it can stall in
   // private-browsing modes or when storage is blocked. The timeout makes
   // that visible instead of leaving the UI frozen.
+  // Drop any prior crypto store first — its device_id won't match the one
+  // we just got from the server, and initRustCrypto refuses to reuse a
+  // mismatched store.
+  progress('Clearing prior crypto store…');
+  await clearCryptoStores();
   progress('Initializing encryption…');
   await withTimeout(client.initRustCrypto(), 30000, 'Crypto init');
 
@@ -197,4 +229,6 @@ export async function logout() {
     client = null;
   }
   sessionStorage.removeItem('mx_session');
+  // Drop the crypto store so the next fresh login doesn't collide with it.
+  await clearCryptoStores();
 }
