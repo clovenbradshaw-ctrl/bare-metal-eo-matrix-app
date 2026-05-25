@@ -2,16 +2,16 @@
  * operators.js — The nine operators
  *
  * A closed algebra of transformation. Every change to application state
- * decomposes into one or more of these. Each one preserves what KIND of
- * change it was. They are dependency-ordered:
+ * decomposes into one or more of these. Dependency-ordered:
  *
  *   NUL → SIG → INS → SEG → CON → SYN → DEF → EVA → REC
  *
- * NUL and SIG do not produce timeline events (observation and attention
- * are ephemeral). The remaining seven are the event types that populate
- * the room timeline and feed the fold.
+ * NUL and SIG are ephemeral (no timeline events). The remaining seven
+ * populate the room timeline and feed the fold.
  *
- * Configure the namespace per-app. Default: io.matrix-events
+ * Anchors are content-addressed: hash of (entity_type + payload + sender + ts).
+ * Same inputs produce the same anchor — idempotent INS.
+ * Git model: hash for identity, hash for change.
  */
 
 import { getClient } from './client.js';
@@ -20,31 +20,28 @@ import { getClient } from './client.js';
 
 let NS = 'io.matrix-events';
 
-/**
- * Set the event type namespace for this app.
- * Call once at startup before emitting events.
- * @param {string} namespace - e.g. "com.myapp", "io.groundtruth.vault"
- */
-export function setNamespace(namespace) {
-  NS = namespace;
-}
+export function setNamespace(namespace) { NS = namespace; }
+export function getNamespace() { return NS; }
 
-export function getNamespace() {
-  return NS;
+// ── Fast hash (cyrb53) ──
+// 53-bit hash, excellent distribution, not crypto. Used for
+// content-addressed anchors (git-style: identity = hash of content).
+function cyrb53(str, seed = 0) {
+  let h1 = 0xdeadbeef ^ seed, h2 = 0x41c6ce57 ^ seed;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
 }
 
 // ── Operator definitions ──
 
-/**
- * The nine operators.
- *
- * Each has:
- *   key    — short name, used as the event type suffix
- *   glyph  — symbolic notation
- *   triad  — which triad it belongs to (existence / structure / significance)
- *   order  — dependency position (0-8)
- *   stored — whether it produces timeline events
- */
 export const OP = {
   NUL: { key: 'nul', glyph: '∅', triad: 'existence',    order: 0, stored: false },
   SIG: { key: 'sig', glyph: '○', triad: 'existence',    order: 1, stored: false },
@@ -57,38 +54,21 @@ export const OP = {
   REC: { key: 'rec', glyph: '⊛', triad: 'significance', order: 8, stored: true  },
 };
 
-/**
- * Get the full Matrix event type string for an operator.
- * @param {object} op - One of the OP constants
- * @returns {string} e.g. "io.matrix-events.ins"
- */
 export function eventType(op) {
   return `${NS}.${op.key}`;
 }
 
-/**
- * Check if a Matrix event type string belongs to this app's operator set.
- * @param {string} type - Matrix event type
- * @returns {object|null} The matching OP constant, or null
- */
 export function parseEventType(type) {
   if (!type.startsWith(NS + '.')) return null;
   const suffix = type.slice(NS.length + 1);
-  return Object.values(OP).find((op) => op.key === suffix) || null;
+  return Object.values(OP).find(op => op.key === suffix) || null;
 }
 
 // ── Emit ──
 
 /**
  * Emit an operator event into a room.
- *
- * If the room has encryption enabled, the SDK encrypts the event
- * with Megolm automatically. The homeserver stores ciphertext.
- *
- * @param {string} roomId  - Target room
- * @param {object} op      - One of the OP constants (must be stored: true)
- * @param {object} content - Event content body
- * @returns {string} The event ID
+ * If the room has encryption enabled, the SDK encrypts automatically.
  */
 export async function emit(roomId, op, content) {
   if (!op.stored) {
@@ -105,10 +85,22 @@ export async function emit(roomId, op, content) {
 
 /**
  * INS — Instantiate a new entity.
- * Mints a content-addressed anchor ID that never changes.
+ *
+ * Anchor is content-addressed: hash of (type + payload + sender + timestamp).
+ * Git model — the identity IS the hash of what created it.
+ * Same creation event produces the same anchor (idempotent INS).
+ * Different creation events always produce different anchors (no-cloning).
  */
 export async function ins(roomId, entityType, payload = {}) {
-  const anchor = `${entityType}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const client = getClient();
+  const sender = client ? client.getUserId() : 'anon';
+  const ts = Date.now();
+
+  // Content-addressed anchor: hash of creation content
+  const input = `${entityType}\0${JSON.stringify(payload)}\0${sender}\0${ts}`;
+  const hash = cyrb53(input);
+  const anchor = `${entityType}_${hash.toString(16)}`;
+
   await emit(roomId, OP.INS, { anchor, entity_type: entityType, payload });
   return anchor;
 }

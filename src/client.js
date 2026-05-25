@@ -36,6 +36,61 @@ export function getClient() {
   return client;
 }
 
+// ── Crypto store management ──
+
+// The Rust crypto SDK persists its state in IndexedDB under this name.
+// When a fresh login mints a new device ID but the old store remains,
+// initRustCrypto() throws "account in the store doesn't match". We must
+// delete the stale store before retrying.
+const CRYPTO_STORE_NAME = 'matrix-js-sdk::matrix-sdk-crypto';
+
+/**
+ * Delete the Rust crypto IndexedDB store.
+ * Returns a promise that resolves once the DB is gone.
+ */
+function clearCryptoStore() {
+  return new Promise((resolve, reject) => {
+    progress('Clearing stale crypto store…');
+    const req = indexedDB.deleteDatabase(CRYPTO_STORE_NAME);
+    req.onsuccess = () => { progress('Crypto store cleared'); resolve(); };
+    req.onerror = () => { progress('Crypto store clear failed'); reject(req.error); };
+    req.onblocked = () => { progress('Crypto store clear blocked — closing connections'); resolve(); };
+  });
+}
+
+/**
+ * Detect the "account in the store doesn't match" error from the Rust
+ * crypto SDK. The exact message varies slightly across SDK versions so
+ * we match on the distinctive substring.
+ */
+function isCryptoStoreMismatch(err) {
+  const msg = String(err && err.message || err || '');
+  return msg.includes('account in the store doesn\'t match') ||
+         msg.includes('account in the store does not match');
+}
+
+/**
+ * Initialize Rust crypto with automatic retry on store mismatch.
+ * On a fresh login with a new device ID, the old IndexedDB store from
+ * a previous device causes a hard error. We catch it, wipe the store,
+ * and retry exactly once.
+ */
+async function initCryptoWithRetry(c, timeoutMs = 30000) {
+  try {
+    await withTimeout(c.initRustCrypto(), timeoutMs, 'Crypto init');
+  } catch (err) {
+    if (isCryptoStoreMismatch(err)) {
+      progress('Device ID changed — clearing old crypto store and retrying…');
+      await clearCryptoStore();
+      await withTimeout(c.initRustCrypto(), timeoutMs, 'Crypto init (retry)');
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ── Sync helpers ──
+
 // Wait until the sync state reaches a "ready" value. Uses `on` (not `once`)
 // because the SDK can emit intermediate states (RECONNECTING, ERROR with
 // retry) before reaching PREPARED. The previous `once` listener rejected on
@@ -54,12 +109,13 @@ function waitForSync(c, timeoutMs = 60000) {
         cleanup();
         resolve();
       } else if (state === 'ERROR' && data && data.error) {
-        // Surface persistent errors immediately. Transient errors that the
-        // SDK retries will move back to RECONNECTING/SYNCING on their own.
         const err = data.error;
-        if (err.httpStatus === 401 || err.errcode === 'M_UNKNOWN_TOKEN') {
+        // Surface auth failures immediately; transient errors retry on
+        // their own and the SDK will move back to RECONNECTING/SYNCING.
+        if (err.httpStatus === 401 || err.httpStatus === 403 ||
+            err.errcode === 'M_UNKNOWN_TOKEN') {
           cleanup();
-          reject(new Error('Access token rejected'));
+          reject(new Error('Session expired — please log in again'));
         }
       }
     };
@@ -90,6 +146,8 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+// ── Crypto callbacks ──
+
 // Cryptocallback bridging the SDK's secret-storage requests to the UI.
 // The SDK calls this whenever it needs to unlock secret storage (e.g. on
 // a new device that has cross-signing on the server but no local keys).
@@ -116,6 +174,8 @@ async function getSecretStorageKey({ keys }) {
     return null;
   }
 }
+
+// ── Encryption bootstrap ──
 
 // Make sure cross-signing, secret storage, and key backup are all set up
 // for this account. Called after sync on first login (when we still have
@@ -190,12 +250,13 @@ async function ensureEncryptionSetUp({ userMxid, password }) {
   }
 }
 
+// ── Homeserver discovery ──
+
 // Resolve the actual client API URL via .well-known/matrix/client. Many
 // homeservers (matrix.org, EMS-hosted, etc.) advertise an API host that
 // differs from the server name. Without this discovery step, login POSTs
 // to the wrong origin and the request can hang or be CORS-blocked.
 async function discoverBaseUrl(rawHs, mxid) {
-  // If the user supplied an explicit URL, try well-known on that hostname.
   const serverName = mxid && mxid.includes(':')
     ? mxid.split(':').slice(1).join(':')
     : new URL(rawHs).hostname;
@@ -218,6 +279,8 @@ async function discoverBaseUrl(rawHs, mxid) {
   return rawHs.replace(/\/+$/, '');
 }
 
+// ── Public API ──
+
 export async function login(homeserver, username, password) {
   const user = username.replace(/^@/, '').split(':')[0];
 
@@ -239,13 +302,12 @@ export async function login(homeserver, username, password) {
   );
   progress(`Authenticated as ${resp.user_id}`);
 
-  // Persist credentials immediately, before any step that can block or
-  // hang. The access token + device id are valid the moment auth
-  // succeeds; everything after this point is recoverable on next load.
-  // Saving later (after sync, after the recovery-key modal) meant a
-  // reload mid-bootstrap dropped the session and forced the homeserver
-  // to mint a new device on the next login — the duplicate-session-ID
-  // symptom we keep seeing.
+  // Step 2: persist credentials IMMEDIATELY. The access token + device id
+  // are valid the moment auth succeeds. Saving later (after sync, after
+  // the recovery-key modal) meant a reload mid-bootstrap dropped the
+  // session, forced a new device on the next login, and left the old
+  // crypto store orphaned — causing the "account in the store doesn't
+  // match" error on the next attempt.
   localStorage.setItem(
     'mx_session',
     JSON.stringify({
@@ -256,7 +318,7 @@ export async function login(homeserver, username, password) {
     })
   );
 
-  // Step 2: real client with credentials.
+  // Step 3: real client with credentials.
   client = sdk.createClient({
     baseUrl,
     accessToken: resp.access_token,
@@ -265,20 +327,18 @@ export async function login(homeserver, username, password) {
     cryptoCallbacks: { getSecretStorageKey },
   });
 
-  // Step 3: crypto. This loads wasm + opens IndexedDB; it can stall in
-  // private-browsing modes or when storage is blocked. The timeout makes
-  // that visible instead of leaving the UI frozen.
+  // Step 4: crypto. Uses retry logic so a stale IndexedDB store from a
+  // previous device doesn't block login permanently.
   progress('Initializing encryption…');
-  await withTimeout(client.initRustCrypto(), 30000, 'Crypto init');
+  await initCryptoWithRetry(client);
 
-  // Step 4: sync.
+  // Step 5: sync.
   progress('Starting sync…');
   await client.startClient({ initialSyncLimit: 100 });
   await waitForSync(client);
   progress('Sync ready');
 
-  // Step 5: cross-signing + key backup. First login bootstraps a recovery
-  // key; new devices on the same account restore from one.
+  // Step 6: cross-signing + key backup.
   try {
     await ensureEncryptionSetUp({ userMxid: resp.user_id, password });
   } catch (e) {
@@ -307,13 +367,11 @@ export async function restoreSession() {
       cryptoCallbacks: { getSecretStorageKey },
     });
     progress('Restoring session…');
-    await withTimeout(client.initRustCrypto(), 30000, 'Crypto init');
+    await initCryptoWithRetry(client);
     await client.startClient({ initialSyncLimit: 100 });
     await waitForSync(client);
 
     // Restore-only path: no password, so first-time bootstrap is skipped.
-    // If the account already has cross-signing on the server, this will
-    // prompt the UI for the recovery key to pull it down to this device.
     try {
       await ensureEncryptionSetUp({ userMxid: userId, password: null });
     } catch (e) {
@@ -326,10 +384,11 @@ export async function restoreSession() {
     // Only wipe the saved session when the homeserver has actually
     // rejected the token. Transient failures (sync timeout, slow wasm
     // load, IndexedDB hiccup, recovery-key modal dismissed) leave the
-    // credentials intact so the next reload tries again instead of
-    // forcing a fresh login and a new device id.
+    // credentials intact so the next reload retries instead of forcing
+    // a fresh login and a new device id.
     const msg = String(e && e.message || '');
-    const fatal = msg.includes('Access token rejected') ||
+    const fatal = msg.includes('Session expired') ||
+                  msg.includes('Access token rejected') ||
                   e?.httpStatus === 401 ||
                   e?.errcode === 'M_UNKNOWN_TOKEN';
     if (fatal) {
@@ -354,4 +413,6 @@ export async function logout() {
     client = null;
   }
   localStorage.removeItem('mx_session');
+  // Also clear the crypto store so the next login starts clean
+  try { await clearCryptoStore(); } catch {}
 }
