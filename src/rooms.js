@@ -12,7 +12,7 @@
 
 import { getClient } from './client.js';
 import { getNamespace } from './operators.js';
-import { RoomEvent } from 'matrix-js-sdk';
+import { ClientEvent, RoomEvent } from 'matrix-js-sdk';
 
 const META_TYPE = () => `${getNamespace()}.meta`;
 
@@ -56,10 +56,13 @@ export async function createRoom(name, roomType, meta = {}) {
 
 /**
  * Discover all rooms belonging to this app.
- * Scans joined rooms for the app metadata state event.
+ * Scans joined rooms for the app metadata state event. Pending invites are
+ * included unconditionally — their stripped state typically does not carry
+ * custom state events, so we can't tell whether the invite is to an app room
+ * until the user accepts and the full state syncs.
  *
- * @param {string} [roomType] - Optional filter by room type
- * @returns {Array<{ roomId, name, roomType, meta }>}
+ * @param {string} [roomType] - Optional filter by room type (joined rooms only)
+ * @returns {Array<{ roomId, name, roomType, membership, meta, inviter }>}
  */
 export function discoverRooms(roomType = null) {
   const client = getClient();
@@ -69,6 +72,24 @@ export function discoverRooms(roomType = null) {
   const appRooms = [];
 
   for (const room of rooms) {
+    const membership = room.getMyMembership();
+
+    if (membership === 'invite') {
+      const myUserId = client.getUserId();
+      const myMember = room.getMember(myUserId);
+      appRooms.push({
+        roomId: room.roomId,
+        name: room.name,
+        roomType: 'invite',
+        membership,
+        inviter: myMember?.events?.member?.getSender() || null,
+        meta: {},
+      });
+      continue;
+    }
+
+    if (membership !== 'join') continue;
+
     const metaEvent = room.currentState.getStateEvents(META_TYPE(), '');
     if (!metaEvent) continue;
 
@@ -80,11 +101,47 @@ export function discoverRooms(roomType = null) {
       roomId: room.roomId,
       name: room.name,
       roomType: content.room_type,
+      membership,
+      inviter: null,
       meta: content,
     });
   }
 
   return appRooms;
+}
+
+/**
+ * Accept a pending invite. After this resolves the room moves to `join`
+ * membership and the full timeline becomes available.
+ *
+ * @param {string} roomId
+ */
+export async function acceptInvite(roomId) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+  await client.joinRoom(roomId);
+}
+
+/**
+ * Subscribe to events that change which rooms should appear in the list:
+ * a new room arriving via sync (e.g. a fresh invite) or our own membership
+ * flipping (invite → join, leave, etc.).
+ *
+ * @param {function} handler - Called with no arguments on any change
+ * @returns {function} Unsubscribe
+ */
+export function onRoomChanges(handler) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+
+  const onRoom = () => handler();
+  const onMembership = () => handler();
+  client.on(ClientEvent.Room, onRoom);
+  client.on(RoomEvent.MyMembership, onMembership);
+  return () => {
+    client.removeListener(ClientEvent.Room, onRoom);
+    client.removeListener(RoomEvent.MyMembership, onMembership);
+  };
 }
 
 /**

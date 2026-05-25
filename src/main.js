@@ -9,7 +9,7 @@
 import { login, restoreSession, logout, getClient, setProgress } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, eva, rec } from './operators.js';
 import { fold, foldFrom, initial, entitiesOfType } from './fold.js';
-import { createRoom, discoverRooms, getTimeline, onTimeline, loadFullTimeline, invite, getMembers } from './rooms.js';
+import { createRoom, discoverRooms, getTimeline, onTimeline, loadFullTimeline, invite, getMembers, acceptInvite, onRoomChanges } from './rooms.js';
 
 // ── Configure namespace for your app ──
 setNamespace('io.matrix-events');
@@ -18,6 +18,7 @@ setNamespace('io.matrix-events');
 let currentRoomId = null;
 let currentState = initial();
 let unsubTimeline = null; // cleanup handle for room listener
+let unsubRoomChanges = null; // cleanup handle for room-list listener
 
 // ── DOM helpers ──
 const $ = (id) => document.getElementById(id);
@@ -66,6 +67,8 @@ async function handleLogin() {
 }
 
 async function handleLogout() {
+  if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
+  if (unsubTimeline) { unsubTimeline(); unsubTimeline = null; }
   await logout();
   $('authPanel').classList.remove('hidden');
   $('appPanel').classList.add('hidden');
@@ -77,6 +80,10 @@ function showApp(userId) {
   $('appPanel').classList.remove('hidden');
   $('userDisplay').textContent = userId;
   log('Connected as ' + userId, 'ok');
+
+  if (unsubRoomChanges) unsubRoomChanges();
+  unsubRoomChanges = onRoomChanges(() => refreshRooms());
+
   refreshRooms();
 }
 
@@ -94,10 +101,31 @@ async function refreshRooms() {
   rooms.forEach((r) => {
     const el = document.createElement('div');
     el.className = 'room-item' + (r.roomId === currentRoomId ? ' active' : '');
-    el.textContent = `${r.name} (${r.roomType})`;
-    el.addEventListener('click', () => openRoom(r.roomId, r.name));
+    if (r.membership === 'invite') {
+      const from = r.inviter ? ` from ${r.inviter}` : '';
+      el.textContent = `${r.name} (invite${from}) — click to accept`;
+      el.style.color = 'var(--accent)';
+      el.addEventListener('click', () => handleAcceptInvite(r.roomId, r.name));
+    } else {
+      el.textContent = `${r.name} (${r.roomType})`;
+      el.addEventListener('click', () => openRoom(r.roomId, r.name));
+    }
     list.appendChild(el);
   });
+}
+
+async function handleAcceptInvite(roomId, name) {
+  log(`Accepting invite to ${name}…`);
+  try {
+    await acceptInvite(roomId);
+    log(`Joined ${name}`, 'ok');
+    // refreshRooms fires automatically via onRoomChanges once membership flips,
+    // but call it directly so the click feels responsive.
+    refreshRooms();
+    openRoom(roomId, name);
+  } catch (e) {
+    log('Accept failed: ' + e.message, 'err');
+  }
 }
 
 async function handleCreateRoom() {
