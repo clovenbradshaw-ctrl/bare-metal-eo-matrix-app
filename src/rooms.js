@@ -12,7 +12,7 @@
 
 import { getClient } from './client.js';
 import { getNamespace } from './operators.js';
-import { ClientEvent, MatrixEventEvent, RoomEvent } from 'matrix-js-sdk';
+import { ClientEvent, MatrixEventEvent, RoomEvent, RoomStateEvent } from 'matrix-js-sdk';
 
 const META_TYPE = () => `${getNamespace()}.meta`;
 
@@ -61,6 +61,10 @@ export async function createRoom(name, roomType, meta = {}) {
  * custom state events, so we can't tell whether the invite is to an app room
  * until the user accepts and the full state syncs.
  *
+ * Joined rooms whose state hasn't fully synced yet (no meta event) are
+ * included with roomType '…' so they remain visible rather than vanishing
+ * from the list.
+ *
  * @param {string} [roomType] - Optional filter by room type (joined rooms only)
  * @returns {Array<{ roomId, name, roomType, membership, meta, inviter }>}
  */
@@ -91,7 +95,23 @@ export function discoverRooms(roomType = null) {
     if (membership !== 'join') continue;
 
     const metaEvent = room.currentState.getStateEvents(META_TYPE(), '');
-    if (!metaEvent) continue;
+    if (!metaEvent) {
+      // Room was just joined — full state hasn't synced yet, or this
+      // isn't an app room. Show it so it doesn't vanish from the list
+      // after accepting an invite. Once state arrives the onRoomChanges
+      // listener will refresh and pick up the real type.
+      if (!roomType) {
+        appRooms.push({
+          roomId: room.roomId,
+          name: room.name,
+          roomType: '…',
+          membership,
+          inviter: null,
+          meta: {},
+        });
+      }
+      continue;
+    }
 
     const content = metaEvent.getContent();
     if (content.app !== getNamespace()) continue;
@@ -124,8 +144,9 @@ export async function acceptInvite(roomId) {
 
 /**
  * Subscribe to events that change which rooms should appear in the list:
- * a new room arriving via sync (e.g. a fresh invite) or our own membership
- * flipping (invite → join, leave, etc.).
+ * a new room arriving via sync (e.g. a fresh invite), our own membership
+ * flipping (invite → join, leave, etc.), or a room's state events updating
+ * (so the meta event appearing after join triggers a refresh).
  *
  * @param {function} handler - Called with no arguments on any change
  * @returns {function} Unsubscribe
@@ -136,11 +157,16 @@ export function onRoomChanges(handler) {
 
   const onRoom = () => handler();
   const onMembership = () => handler();
+  // Also listen for state events so that when the meta event arrives
+  // after a join, the room list refreshes with the correct type.
+  const onState = () => handler();
   client.on(ClientEvent.Room, onRoom);
   client.on(RoomEvent.MyMembership, onMembership);
+  client.on(RoomStateEvent.Events, onState);
   return () => {
     client.removeListener(ClientEvent.Room, onRoom);
     client.removeListener(RoomEvent.MyMembership, onMembership);
+    client.removeListener(RoomStateEvent.Events, onState);
   };
 }
 
@@ -234,6 +260,30 @@ export function onDecrypted(roomId, handler) {
 
   client.on(MatrixEventEvent.Decrypted, listener);
   return () => client.removeListener(MatrixEventEvent.Decrypted, listener);
+}
+
+/**
+ * Load the full timeline, then return only events newer than `sinceTs`.
+ * Used for delta sync: the store has everything up to `sinceTs`, so we
+ * only need the tail.
+ *
+ * @param {string} roomId
+ * @param {number} sinceTs - Timestamp (ms) of last stored event
+ * @returns {{ total: number, newEvents: Array }} Total timeline size + new events only
+ */
+export async function loadTimelineSince(roomId, sinceTs) {
+  const total = await loadFullTimeline(roomId);
+  if (sinceTs <= 0) {
+    return { total, newEvents: getTimeline(roomId) };
+  }
+
+  const all = getTimeline(roomId);
+  const newEvents = all.filter(e => {
+    const ts = typeof e.getTs === 'function' ? e.getTs() : e.origin_server_ts || 0;
+    return ts >= sinceTs;
+  });
+
+  return { total, newEvents };
 }
 
 /**

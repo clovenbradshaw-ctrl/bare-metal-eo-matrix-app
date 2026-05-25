@@ -44,10 +44,7 @@ button.primary{background:var(--accent-dim);border-color:var(--accent);color:var
     <h1>Matrix Events</h1>
     <span class="tag">rooms as database · operators as schema · fold as query</span>
   </div>
-
   <div id="log"></div>
-
-  <!-- LOGIN -->
   <div id="authPanel" class="panel">
     <h2>Connect</h2>
     <div class="field"><label>Username</label><input id="inUser" placeholder="@user:homeserver.com" oninput="
@@ -59,15 +56,11 @@ button.primary{background:var(--accent-dim);border-color:var(--accent);color:var
     <div class="field" id="hsField"><label>Homeserver</label><input id="inHS" placeholder="https://matrix.org"></div>
     <div class="btn-row"><button class="primary" id="loginBtn">Login</button></div>
   </div>
-
-  <!-- APP -->
   <div id="appPanel" class="hidden">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
       <span id="userDisplay" style="color:var(--accent);font-size:12px"></span>
       <button id="logoutBtn" style="font-size:11px">Logout</button>
     </div>
-
-    <!-- ROOMS -->
     <div class="panel">
       <h2>Rooms</h2>
       <div id="roomList" style="margin-bottom:12px"></div>
@@ -77,8 +70,6 @@ button.primary{background:var(--accent-dim);border-color:var(--accent);color:var
         <button id="createRoomBtn">Create</button>
       </div>
     </div>
-
-    <!-- CONTROLS -->
     <div class="panel hidden" id="roomControls">
       <h2 id="currentRoomName">—</h2>
       <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Members: <span id="memberList">—</span></div>
@@ -88,15 +79,12 @@ button.primary{background:var(--accent-dim);border-color:var(--accent);color:var
         <button id="inviteBtn">⋈ Invite user</button>
       </div>
     </div>
-
-    <!-- FOLD OUTPUT -->
     <div class="panel">
       <h2>Projected State (integral fold)</h2>
       <pre id="stateView" style="min-height:60px">{ }</pre>
     </div>
   </div>
 </div>
-<!-- Recovery-key display (shown once after first-time encryption setup) -->
 <div id="recoveryDisplayModal" class="modal-backdrop hidden">
   <div class="modal">
     <h3>Save your recovery key</h3>
@@ -107,8 +95,6 @@ button.primary{background:var(--accent-dim);border-color:var(--accent);color:var
     </div>
   </div>
 </div>
-
-<!-- Recovery-key entry (shown on a new device with existing cross-signing) -->
 <div id="recoveryEntryModal" class="modal-backdrop hidden">
   <div class="modal">
     <h3>Enter your recovery key</h3>
@@ -120,7 +106,6 @@ button.primary{background:var(--accent-dim);border-color:var(--accent);color:var
     </div>
   </div>
 </div>
-
 <script type="module" src="/src/main.js"></script>
 </body>
 </html>

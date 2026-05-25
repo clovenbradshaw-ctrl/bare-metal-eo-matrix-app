@@ -1,15 +1,16 @@
 /**
  * main.js — Entry point
  *
- * Minimal proof-of-life UI. Login, pick/create a room, emit events,
- * see the fold. Replace this file with your app's UI.
- * The foundation (client, operators, fold, rooms) stays the same.
+ * Fold once from the OPFS store (or checkpoint + delta).
+ * After that, every new event is foldFrom() — O(1) per event.
+ * The full fold never runs again unless the store is empty.
  */
 
 import { login, restoreSession, logout, getClient, setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
-import { setNamespace, OP, ins, def, seg, con, eva, rec } from './operators.js';
-import { fold, foldFrom, initial, entitiesOfType } from './fold.js';
-import { createRoom, discoverRooms, getTimeline, onTimeline, loadFullTimeline, invite, getMembers, acceptInvite, onRoomChanges, onDecrypted } from './rooms.js';
+import { setNamespace, OP, ins, def, seg, con, eva, rec, getNamespace } from './operators.js';
+import { fold, foldFrom, initial, entitiesOfType, stateHash } from './fold.js';
+import { createRoom, discoverRooms, getTimeline, onTimeline, loadTimelineSince, invite, getMembers, acceptInvite, onRoomChanges, onDecrypted } from './rooms.js';
+import { EventStore } from './store.js';
 
 // ── Configure namespace for your app ──
 setNamespace('io.matrix-events');
@@ -17,9 +18,24 @@ setNamespace('io.matrix-events');
 // ── State ──
 let currentRoomId = null;
 let currentState = initial();
-let unsubTimeline = null; // cleanup handle for room listener
-let unsubDecrypted = null; // cleanup handle for late-decryption listener
-let unsubRoomChanges = null; // cleanup handle for room-list listener
+let currentStore = null;
+let unsubTimeline = null;
+let unsubDecrypted = null;
+let unsubRoomChanges = null;
+
+// ── Render coalescing ──
+// Fold is O(1) per event. Render (JSON.stringify of full state) is
+// O(n). So we fold immediately on each event but coalesce renders
+// to the next animation frame.
+let renderScheduled = false;
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderState();
+    renderScheduled = false;
+  });
+}
 
 // ── DOM helpers ──
 const $ = (id) => document.getElementById(id);
@@ -33,11 +49,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('emitDefBtn').addEventListener('click', handleEmitDef);
   $('inviteBtn').addEventListener('click', handleInvite);
 
-  // Surface per-step progress from client.js into the UI log so a stalled
-  // login shows which phase it's stuck in (auth / crypto / sync).
   setProgress((msg) => log(msg));
 
-  // Recovery-key display: shown once, after first-time bootstrap.
   setRecoveryKeyDisplayer((key) => new Promise((resolve) => {
     $('recoveryKeyText').textContent = key;
     $('recoveryDisplayModal').classList.remove('hidden');
@@ -49,8 +62,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     $('recoveryDisplayAck').addEventListener('click', ack);
   }));
 
-  // Recovery-key entry: shown on a new device that needs to unlock secret
-  // storage. Resolves to the entered key string or null if skipped.
   setRecoveryKeyProvider(() => new Promise((resolve) => {
     $('recoveryKeyInput').value = '';
     $('recoveryEntryModal').classList.remove('hidden');
@@ -69,7 +80,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     $('recoveryEntrySkip').addEventListener('click', skip);
   }));
 
-  // Try session restore
   const client = await restoreSession();
   if (client) {
     showApp(client.getUserId());
@@ -81,7 +91,6 @@ async function handleLogin() {
   const pass = $('inPass').value;
   let hs = $('inHS').value.trim();
 
-  // Extract homeserver from username if present
   if (rawUser.includes(':')) {
     hs = 'https://' + rawUser.split(':').slice(1).join(':');
   }
@@ -100,6 +109,10 @@ async function handleLogin() {
 }
 
 async function handleLogout() {
+  // Save checkpoint before leaving
+  if (currentStore && currentStore.hasData()) {
+    await currentStore.saveCheckpoint(currentState);
+  }
   if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
   if (unsubTimeline) { unsubTimeline(); unsubTimeline = null; }
   if (unsubDecrypted) { unsubDecrypted(); unsubDecrypted = null; }
@@ -153,10 +166,7 @@ async function handleAcceptInvite(roomId, name) {
   try {
     await acceptInvite(roomId);
     log(`Joined ${name}`, 'ok');
-    // refreshRooms fires automatically via onRoomChanges once membership flips,
-    // but call it directly so the click feels responsive.
-    refreshRooms();
-    openRoom(roomId, name);
+    // Let onRoomChanges handle the refresh once state syncs.
   } catch (e) {
     log('Accept failed: ' + e.message, 'err');
   }
@@ -172,8 +182,6 @@ async function handleCreateRoom() {
     const roomId = await createRoom(name, type);
     log('Created: ' + roomId, 'ok');
     $('newRoomName').value = '';
-
-    // Wait a tick for sync to pick up the new room
     setTimeout(() => {
       refreshRooms();
       openRoom(roomId, name);
@@ -183,29 +191,131 @@ async function handleCreateRoom() {
   }
 }
 
+/**
+ * openRoom — the core flow.
+ *
+ * 1. Open OPFS store
+ * 2. Try checkpoint → delta fold (fastest cold start)
+ * 3. If no checkpoint → full fold from store (one-time O(n))
+ * 4. If no store data → load full timeline from Matrix, persist, fold
+ * 5. Sync delta from Matrix for events between sessions
+ * 6. Wire live listeners with incremental fold
+ */
 async function openRoom(roomId, name) {
-  // Clean up previous room listeners
+  // ── Cleanup previous room ──
+  if (currentStore && currentStore.hasData()) {
+    await currentStore.saveCheckpoint(currentState);
+  }
   if (unsubTimeline) { unsubTimeline(); unsubTimeline = null; }
   if (unsubDecrypted) { unsubDecrypted(); unsubDecrypted = null; }
 
   currentRoomId = roomId;
+  currentState = initial();
   $('currentRoomName').textContent = name;
   $('roomControls').classList.remove('hidden');
   refreshRooms();
 
-  // Load complete history before folding — the fold needs ALL events
-  log('Loading full timeline…');
-  const count = await loadFullTimeline(roomId);
-  log(`${count} events loaded`, 'ok');
+  // ── 1. Open store ──
+  currentStore = new EventStore(roomId, getNamespace());
+  await currentStore.open();
 
-  recomputeState();
+  const storedCount = currentStore.getCount();
+  const cursor = currentStore.getCursor();
 
-  // Listen for new events — recompute state on each
-  unsubTimeline = onTimeline(roomId, () => recomputeState());
-  // Re-fold when keys arrive later and previously-encrypted events
-  // become readable. Without this, the fold permanently ignores any
-  // event that was still encrypted at first load.
-  unsubDecrypted = onDecrypted(roomId, () => recomputeState());
+  // ── 2. Fold from local (checkpoint + delta OR full replay) ──
+  if (storedCount > 0) {
+    const checkpoint = await currentStore.loadCheckpoint();
+
+    if (checkpoint && checkpoint.cursor <= cursor) {
+      currentState = checkpoint.state;
+      if (currentState._undecryptable === undefined) currentState._undecryptable = 0;
+      if (!currentState._violations) currentState._violations = [];
+
+      const delta = await currentStore.getEventsSince(checkpoint.cursor);
+      if (delta.length > 0) {
+        currentState = foldFrom(currentState, delta);
+        log(`Restored checkpoint + ${delta.length} delta events`, 'ok');
+      } else {
+        log(`Restored checkpoint (${checkpoint.count} events, no delta)`, 'ok');
+      }
+    } else {
+      log(`Full replay of ${storedCount} events from OPFS…`);
+      const allEvents = await currentStore.getAll();
+      currentState = fold(allEvents);
+      log(`Fold complete`, 'ok');
+      await currentStore.saveCheckpoint(currentState);
+    }
+
+    renderState();
+    refreshMembers();
+  }
+
+  // ── 3. Sync delta from Matrix ──
+  // The SDK sync loop has already delivered recent events to the
+  // in-memory timeline. We check what's there that isn't in our store.
+  if (cursor > 0) {
+    log('Checking for new server events…');
+  } else {
+    log('Loading full timeline from server…');
+  }
+
+  const { total, newEvents } = await loadTimelineSince(roomId, cursor);
+
+  if (newEvents.length > 0) {
+    // Brief pause for decryption on the batch
+    await new Promise(r => setTimeout(r, 1500));
+
+    // Re-fetch timeline — some events may have decrypted during wait
+    const freshTimeline = getTimeline(roomId);
+    const freshNew = cursor > 0
+      ? freshTimeline.filter(e => {
+          const ts = typeof e.getTs === 'function' ? e.getTs() : e.origin_server_ts || 0;
+          return ts >= cursor; // >= not > to catch same-timestamp events; dedup handles dupes
+        })
+      : freshTimeline;
+
+    const added = await currentStore.append(freshNew);
+    if (added.length > 0) {
+      // Incremental fold — O(delta), not O(total)
+      currentState = foldFrom(currentState, added);
+      log(`${added.length} new events synced + folded`, 'ok');
+      renderState();
+    }
+  } else if (storedCount === 0) {
+    log('Room is empty', 'ok');
+    renderState();
+  } else {
+    log(`${storedCount} events, all up to date`, 'ok');
+  }
+
+  // ── 4. Wire live listeners (incremental) ──
+
+  // New events from the sync loop — each one is O(1) fold
+  unsubTimeline = onTimeline(roomId, async (event) => {
+    if (!currentStore) return;
+    const added = await currentStore.append([event]);
+    if (added.length > 0) {
+      currentState = foldFrom(currentState, added);
+      scheduleRender();
+
+      // Periodic checkpoint
+      if (currentStore.shouldCheckpoint()) {
+        await currentStore.saveCheckpoint(currentState);
+      }
+    }
+  });
+
+  // Late decryption — event was encrypted when first seen, now has keys.
+  // The event object itself has been updated in place by the SDK.
+  // Pass it to append (dedup prevents double-storing if already known).
+  unsubDecrypted = onDecrypted(roomId, async (event) => {
+    if (!currentStore) return;
+    const added = await currentStore.append([event]);
+    if (added.length > 0) {
+      currentState = foldFrom(currentState, added);
+      scheduleRender();
+    }
+  });
 }
 
 // ── Emit ──
@@ -228,12 +338,20 @@ async function handleEmitDef() {
   if (!currentRoomId) return;
   const anchors = Object.keys(currentState.entities);
   if (anchors.length === 0) {
+    // Dependency enforcement: DEF requires INS
     log('No entities to update — create one first', 'err');
     return;
   }
 
   const anchor = prompt('Anchor:\n' + anchors.join('\n'), anchors[0]);
   if (!anchor) return;
+
+  // Validate anchor exists — dependency check
+  if (!currentState.entities[anchor]) {
+    log(`Anchor ${anchor} does not exist — INS must precede DEF`, 'err');
+    return;
+  }
+
   const path = prompt('Path:', 'status');
   const value = prompt('Value:', 'active');
 
@@ -246,15 +364,7 @@ async function handleEmitDef() {
   }
 }
 
-// ── Fold ──
-function recomputeState() {
-  if (!currentRoomId) return;
-  const events = getTimeline(currentRoomId);
-  currentState = fold(events);
-  renderState();
-  refreshMembers();
-}
-
+// ── Members ──
 function refreshMembers() {
   if (!currentRoomId) return;
   const members = getMembers(currentRoomId);
@@ -277,9 +387,51 @@ async function handleInvite() {
   }
 }
 
+// ── Render ──
+let lastStateHash = 0;
+
 function renderState() {
   const el = $('stateView');
-  el.textContent = JSON.stringify(currentState, null, 2);
+
+  // Git-style change detection: skip render if state hasn't changed
+  const currentHash = stateHash(currentState);
+  if (lastStateHash !== 0 && currentHash === lastStateHash) return;
+  lastStateHash = currentHash;
+
+  const undecryptable = currentState._undecryptable || 0;
+  const violations = currentState._violations || [];
+  let display = JSON.stringify(currentState, null, 2);
+
+  const lines = [];
+  if (currentStore && currentStore.hasData()) {
+    const bytes = currentStore.getByteSize();
+    const count = currentStore.getCount();
+    lines.push(`📦 ${count} events in OPFS (${(bytes / 1024).toFixed(1)} KB)`);
+  }
+  if (undecryptable > 0) {
+    lines.push(`⚠ ${undecryptable} event(s) still encrypted (waiting for keys)`);
+  }
+  if (violations.length > 0) {
+    lines.push(`⚡ ${violations.length} dependency violation(s):`);
+    const recent = violations.slice(-5);
+    for (const v of recent) {
+      if (v.type === 'criterionless_judgment') {
+        lines.push(`  EVA on ${v.anchor} — no prior DEF (hwm=${v.hwm})`);
+      } else if (v.type === 'cartesian_product') {
+        lines.push(`  CON ${v.source}→${v.target} — ${v.missing} missing`);
+      } else if (v.type === 'blind_restructuring') {
+        lines.push(`  REC without prior EVA`);
+      } else if (v.type === 'missing_ins') {
+        lines.push(`  ${v.op} on ${v.anchor} — not yet INS'd`);
+      }
+    }
+  }
+  if (lines.length > 0) {
+    display = lines.join('\n') + '\n\n' + display;
+  }
+
+  el.textContent = display;
+  refreshMembers();
 }
 
 // ── Log ──
