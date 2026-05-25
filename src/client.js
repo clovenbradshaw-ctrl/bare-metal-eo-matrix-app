@@ -144,7 +144,7 @@ export async function login(homeserver, username, password) {
   await waitForSync(client);
   progress('Sync ready');
 
-  sessionStorage.setItem(
+  localStorage.setItem(
     'mx_session',
     JSON.stringify({
       baseUrl,
@@ -162,7 +162,7 @@ export async function login(homeserver, username, password) {
 }
 
 export async function restoreSession() {
-  const raw = sessionStorage.getItem('mx_session');
+  const raw = localStorage.getItem('mx_session');
   if (!raw) return null;
 
   try {
@@ -177,7 +177,7 @@ export async function restoreSession() {
     return client;
   } catch (e) {
     console.warn('[matrix] session restore failed:', e);
-    sessionStorage.removeItem('mx_session');
+    localStorage.removeItem('mx_session');
     client = null;
     return null;
   }
@@ -196,5 +196,5 @@ export async function logout() {
     }
     client = null;
   }
-  sessionStorage.removeItem('mx_session');
+  localStorage.removeItem('mx_session');
 }
