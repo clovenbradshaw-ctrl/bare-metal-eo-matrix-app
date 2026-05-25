@@ -15,6 +15,15 @@
  */
 
 import { getClient } from './client.js';
+import { enqueue } from './outbox.js';
+
+// ── Optimistic dispatch hook ──
+// main.js installs this so emit() can apply the operator to the
+// in-memory state immediately, before the server echoes the event back.
+// The hook receives a plain event object the same shape onTimeline
+// hands to the store.
+let optimisticHook = null;
+export function setOptimisticHook(fn) { optimisticHook = fn; }
 
 // ── Namespace ──
 
@@ -68,17 +77,42 @@ export function parseEventType(type) {
 
 /**
  * Emit an operator event into a room.
- * If the room has encryption enabled, the SDK encrypts automatically.
+ *
+ * Goes through the outbox: the operation is persisted locally (and
+ * folded into in-memory state immediately, via the optimistic hook),
+ * then flushed to the homeserver by the OutboxFlusher when the network
+ * is available. The returned id is the local txnId — the same value
+ * appears as `unsigned.transaction_id` on the echoed timeline event,
+ * so callers can correlate.
  */
 export async function emit(roomId, op, content) {
   if (!op.stored) {
     throw new Error(`${op.key} is ephemeral and cannot be emitted to the timeline`);
   }
   const client = getClient();
-  if (!client) throw new Error('Not connected');
+  const sender = client ? client.getUserId() : 'anon';
 
-  const resp = await client.sendEvent(roomId, eventType(op), content);
-  return resp.event_id;
+  const record = await enqueue({ roomId, eventType: eventType(op), content });
+
+  if (optimisticHook) {
+    try {
+      optimisticHook({
+        roomId,
+        event: {
+          type: eventType(op),
+          content,
+          origin_server_ts: Date.now(),
+          sender,
+          event_id: record.localId,
+          _pending: true,
+        },
+      });
+    } catch (e) {
+      console.warn('[operators] optimistic hook failed:', e);
+    }
+  }
+
+  return record.localId;
 }
 
 // ── Convenience emitters ──

@@ -2,52 +2,42 @@
  * client.js — Matrix connection layer
  *
  * Wraps matrix-js-sdk: login, session persistence, sync, crypto init.
- * The SDK handles Megolm E2EE transparently once initRustCrypto() is called.
+ * Adds vault-encrypted session storage and offline-capable unlock.
+ *
+ * Three entry points:
+ *   - login(hs, user, password)         : first time on this device
+ *   - unlock(userId, password)          : subsequent launches; works offline
+ *   - restoreSession(userId)            : auto-unlock from in-memory key (no-op when locked)
+ *
+ * The session token is stored vault-encrypted in localStorage so that a
+ * device with a locked vault cannot mint Matrix requests, and the
+ * token is wiped from disk on full logout.
  */
 
 import * as sdk from 'matrix-js-sdk';
 import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/index.js';
+import { vault, sessionKey, rememberLastUser, forgetLastUser } from './vault.js';
+import { wipeAllRoomData } from './store.js';
+import { clearAll as clearOutbox } from './outbox.js';
+import { watchSync } from './network.js';
 
 let client = null;
+let _watchSyncUnsub = null;
 
-// Optional progress reporter — main.js can set this to surface step progress
-// to the user instead of leaving them staring at "Logging in…".
 let progress = (msg) => console.log('[matrix]', msg);
-
 export function setProgress(fn) {
   progress = (msg) => { console.log('[matrix]', msg); fn(msg); };
 }
 
-// UI callbacks for the recovery key flow. The UI registers these before
-// login so the client layer can request the key from the user (on a new
-// device) or hand back a newly-generated key for them to save.
-let recoveryKeyProvider = null; // async () => string (the user's recovery key)
-let recoveryKeyDisplayer = null; // async (string) => void (show + acknowledge)
+let recoveryKeyProvider = null;
+let recoveryKeyDisplayer = null;
+export function setRecoveryKeyProvider(fn) { recoveryKeyProvider = fn; }
+export function setRecoveryKeyDisplayer(fn) { recoveryKeyDisplayer = fn; }
 
-export function setRecoveryKeyProvider(fn) {
-  recoveryKeyProvider = fn;
-}
+export function getClient() { return client; }
 
-export function setRecoveryKeyDisplayer(fn) {
-  recoveryKeyDisplayer = fn;
-}
-
-export function getClient() {
-  return client;
-}
-
-// ── Crypto store management ──
-
-// The Rust crypto SDK persists its state in IndexedDB under this name.
-// When a fresh login mints a new device ID but the old store remains,
-// initRustCrypto() throws "account in the store doesn't match". We must
-// delete the stale store before retrying.
 const CRYPTO_STORE_NAME = 'matrix-js-sdk::matrix-sdk-crypto';
 
-/**
- * Delete the Rust crypto IndexedDB store.
- * Returns a promise that resolves once the DB is gone.
- */
 function clearCryptoStore() {
   return new Promise((resolve, reject) => {
     progress('Clearing stale crypto store…');
@@ -58,23 +48,12 @@ function clearCryptoStore() {
   });
 }
 
-/**
- * Detect the "account in the store doesn't match" error from the Rust
- * crypto SDK. The exact message varies slightly across SDK versions so
- * we match on the distinctive substring.
- */
 function isCryptoStoreMismatch(err) {
   const msg = String(err && err.message || err || '');
   return msg.includes('account in the store doesn\'t match') ||
          msg.includes('account in the store does not match');
 }
 
-/**
- * Initialize Rust crypto with automatic retry on store mismatch.
- * On a fresh login with a new device ID, the old IndexedDB store from
- * a previous device causes a hard error. We catch it, wipe the store,
- * and retry exactly once.
- */
 async function initCryptoWithRetry(c, timeoutMs = 30000) {
   try {
     await withTimeout(c.initRustCrypto(), timeoutMs, 'Crypto init');
@@ -89,12 +68,6 @@ async function initCryptoWithRetry(c, timeoutMs = 30000) {
   }
 }
 
-// ── Sync helpers ──
-
-// Wait until the sync state reaches a "ready" value. Uses `on` (not `once`)
-// because the SDK can emit intermediate states (RECONNECTING, ERROR with
-// retry) before reaching PREPARED. The previous `once` listener rejected on
-// the first non-ready state and timed out if it had already fired.
 function waitForSync(c, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     const current = c.getSyncState && c.getSyncState();
@@ -110,8 +83,6 @@ function waitForSync(c, timeoutMs = 60000) {
         resolve();
       } else if (state === 'ERROR' && data && data.error) {
         const err = data.error;
-        // Surface auth failures immediately; transient errors retry on
-        // their own and the SDK will move back to RECONNECTING/SYNCING.
         if (err.httpStatus === 401 || err.httpStatus === 403 ||
             err.errcode === 'M_UNKNOWN_TOKEN') {
           cleanup();
@@ -134,8 +105,6 @@ function waitForSync(c, timeoutMs = 60000) {
   });
 }
 
-// Promisified timeout wrapper so a stuck network or stuck wasm load surfaces
-// as a real error instead of an endless spinner.
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
@@ -146,13 +115,6 @@ function withTimeout(promise, ms, label) {
   });
 }
 
-// ── Crypto callbacks ──
-
-// Cryptocallback bridging the SDK's secret-storage requests to the UI.
-// The SDK calls this whenever it needs to unlock secret storage (e.g. on
-// a new device that has cross-signing on the server but no local keys).
-// We ask the UI for the user's recovery key string, decode it, and hand
-// back [keyId, privateKey] for the first key the SDK lists.
 async function getSecretStorageKey({ keys }) {
   if (!recoveryKeyProvider) {
     progress('Recovery key required but no UI provider registered');
@@ -161,8 +123,6 @@ async function getSecretStorageKey({ keys }) {
   const keyId = Object.keys(keys)[0];
   if (!keyId) return null;
 
-  // The provider may resolve to null/empty if the user cancels — surface
-  // that as "no key" rather than throwing inside the SDK.
   const encoded = await recoveryKeyProvider();
   if (!encoded) return null;
 
@@ -175,19 +135,11 @@ async function getSecretStorageKey({ keys }) {
   }
 }
 
-// ── Encryption bootstrap ──
-
-// Make sure cross-signing, secret storage, and key backup are all set up
-// for this account. Called after sync on first login (when we still have
-// the password for the UIA challenge cross-signing key upload requires).
-// On a new device with an existing account, this restores from secret
-// storage using the user's recovery key.
 async function ensureEncryptionSetUp({ userMxid, password }) {
   const crypto = client.getCrypto();
   if (!crypto) return;
 
   if (await crypto.isCrossSigningReady()) {
-    // Local cross-signing is already populated. Make sure backup is on.
     try { await crypto.checkKeyBackupAndEnable(); } catch (e) {
       progress(`Key backup check failed: ${e.message}`);
     }
@@ -197,9 +149,6 @@ async function ensureEncryptionSetUp({ userMxid, password }) {
   const accountHasCrossSigning = await crypto.userHasCrossSigningKeys(userMxid, true);
 
   if (accountHasCrossSigning) {
-    // New device on an existing account. Need the user's recovery key to
-    // unlock secret storage; bootstrapCrossSigning will call our
-    // getSecretStorageKey callback to fetch the private keys.
     progress('Restoring encryption keys from recovery…');
     await crypto.bootstrapCrossSigning({});
     try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (e) {
@@ -214,8 +163,6 @@ async function ensureEncryptionSetUp({ userMxid, password }) {
     return;
   }
 
-  // First-time setup for this account. Requires the password for the UIA
-  // challenge on /keys/device_signing/upload.
   if (!password) {
     progress('Skipping encryption setup: no password available (login again to enable history backup)');
     return;
@@ -250,12 +197,6 @@ async function ensureEncryptionSetUp({ userMxid, password }) {
   }
 }
 
-// ── Homeserver discovery ──
-
-// Resolve the actual client API URL via .well-known/matrix/client. Many
-// homeservers (matrix.org, EMS-hosted, etc.) advertise an API host that
-// differs from the server name. Without this discovery step, login POSTs
-// to the wrong origin and the request can hang or be CORS-blocked.
 async function discoverBaseUrl(rawHs, mxid) {
   const serverName = mxid && mxid.includes(':')
     ? mxid.split(':').slice(1).join(':')
@@ -279,6 +220,31 @@ async function discoverBaseUrl(rawHs, mxid) {
   return rawHs.replace(/\/+$/, '');
 }
 
+// ── Vault-encrypted session storage ──
+
+async function persistSession(userId, session) {
+  if (!vault.isUnlocked()) throw new Error('Vault locked — cannot persist session');
+  const blob = await vault.encryptJSON(session);
+  // localStorage can't store Uint8Array directly — base64 it.
+  let s = '';
+  for (let i = 0; i < blob.length; i++) s += String.fromCharCode(blob[i]);
+  localStorage.setItem(sessionKey(userId), btoa(s));
+}
+
+async function loadSession(userId) {
+  const raw = localStorage.getItem(sessionKey(userId));
+  if (!raw) return null;
+  if (!vault.isUnlocked()) throw new Error('Vault locked — cannot read session');
+  const bin = atob(raw);
+  const blob = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) blob[i] = bin.charCodeAt(i);
+  return vault.decryptJSON(blob);
+}
+
+function dropSession(userId) {
+  localStorage.removeItem(sessionKey(userId));
+}
+
 // ── Public API ──
 
 export async function login(homeserver, username, password) {
@@ -288,7 +254,6 @@ export async function login(homeserver, username, password) {
   const baseUrl = await discoverBaseUrl(homeserver, username);
   progress(`Using ${baseUrl}`);
 
-  // Step 1: authenticate. Wrap in a timeout so a hung network surfaces.
   progress('Authenticating…');
   const tmp = sdk.createClient({ baseUrl });
   const resp = await withTimeout(
@@ -302,23 +267,37 @@ export async function login(homeserver, username, password) {
   );
   progress(`Authenticated as ${resp.user_id}`);
 
-  // Step 2: persist credentials IMMEDIATELY. The access token + device id
-  // are valid the moment auth succeeds. Saving later (after sync, after
-  // the recovery-key modal) meant a reload mid-bootstrap dropped the
-  // session, forced a new device on the next login, and left the old
-  // crypto store orphaned — causing the "account in the store doesn't
-  // match" error on the next attempt.
-  localStorage.setItem(
-    'mx_session',
-    JSON.stringify({
-      baseUrl,
-      accessToken: resp.access_token,
-      userId: resp.user_id,
-      deviceId: resp.device_id,
-    })
-  );
+  // Bootstrap or unlock the vault using the Matrix password. The vault
+  // key never leaves memory; the password is only used here for KDF.
+  if (!vault.hasMeta(resp.user_id)) {
+    progress('Initializing local vault…');
+    await vault.initialize(resp.user_id, password);
+  } else if (!vault.isUnlocked() || vault.getUserId() !== resp.user_id) {
+    progress('Unlocking local vault…');
+    const ok = await vault.unlock(resp.user_id, password);
+    if (!ok) {
+      // Password changed on the server; reset the vault so the new
+      // password becomes the unlock. This loses access to any locally
+      // encrypted data — surface clearly to the caller.
+      progress('Vault password mismatch — rotating to current password (local data will be reset)');
+      vault.wipe(resp.user_id);
+      try { await wipeAllRoomData(); } catch {}
+      try { await clearOutbox(); } catch {}
+      await vault.initialize(resp.user_id, password);
+    }
+  }
 
-  // Step 3: real client with credentials.
+  rememberLastUser(resp.user_id);
+
+  // Persist session (encrypted) immediately so a reload mid-bootstrap
+  // doesn't drop us back to the login form with a new device id.
+  await persistSession(resp.user_id, {
+    baseUrl,
+    accessToken: resp.access_token,
+    userId: resp.user_id,
+    deviceId: resp.device_id,
+  });
+
   client = sdk.createClient({
     baseUrl,
     accessToken: resp.access_token,
@@ -327,92 +306,141 @@ export async function login(homeserver, username, password) {
     cryptoCallbacks: { getSecretStorageKey },
   });
 
-  // Step 4: crypto. Uses retry logic so a stale IndexedDB store from a
-  // previous device doesn't block login permanently.
   progress('Initializing encryption…');
   await initCryptoWithRetry(client);
 
-  // Step 5: sync.
   progress('Starting sync…');
   await client.startClient({ initialSyncLimit: 100 });
+  if (_watchSyncUnsub) _watchSyncUnsub();
+  _watchSyncUnsub = watchSync(client);
   await waitForSync(client);
   progress('Sync ready');
 
-  // Step 6: cross-signing + key backup.
   try {
     await ensureEncryptionSetUp({ userMxid: resp.user_id, password });
   } catch (e) {
     progress(`Encryption setup failed: ${e.message}`);
   }
 
-  return {
-    client,
-    userId: resp.user_id,
-    deviceId: resp.device_id,
-  };
-}
-
-export async function restoreSession() {
-  const raw = localStorage.getItem('mx_session');
-  if (!raw) return null;
-
-  try {
-    const { baseUrl, accessToken, userId, deviceId } = JSON.parse(raw);
-
-    client = sdk.createClient({
-      baseUrl,
-      accessToken,
-      userId,
-      deviceId,
-      cryptoCallbacks: { getSecretStorageKey },
-    });
-    progress('Restoring session…');
-    await initCryptoWithRetry(client);
-    await client.startClient({ initialSyncLimit: 100 });
-    await waitForSync(client);
-
-    // Restore-only path: no password, so first-time bootstrap is skipped.
-    try {
-      await ensureEncryptionSetUp({ userMxid: userId, password: null });
-    } catch (e) {
-      progress(`Encryption restore failed: ${e.message}`);
-    }
-
-    return client;
-  } catch (e) {
-    console.warn('[matrix] session restore failed:', e);
-    // Only wipe the saved session when the homeserver has actually
-    // rejected the token. Transient failures (sync timeout, slow wasm
-    // load, IndexedDB hiccup, recovery-key modal dismissed) leave the
-    // credentials intact so the next reload retries instead of forcing
-    // a fresh login and a new device id.
-    const msg = String(e && e.message || '');
-    const fatal = msg.includes('Session expired') ||
-                  msg.includes('Access token rejected') ||
-                  e?.httpStatus === 401 ||
-                  e?.errcode === 'M_UNKNOWN_TOKEN';
-    if (fatal) {
-      localStorage.removeItem('mx_session');
-    }
-    client = null;
-    return null;
-  }
+  return { client, userId: resp.user_id, deviceId: resp.device_id };
 }
 
 /**
- * Logout and clear session.
+ * Restore a previously saved session. Vault must already be unlocked
+ * for `userId`. Returns the client (online or offline-shimmed) or
+ * null if there is no saved session for this user.
+ *
+ * If the network is reachable, this brings up sync. If not, the
+ * client is left "offline" — startClient is still called but sync
+ * will be in RECONNECTING. The local store + outbox keep functioning.
  */
-export async function logout() {
+export async function restoreSession(userId) {
+  if (!vault.isUnlocked() || vault.getUserId() !== userId) {
+    return null;
+  }
+
+  let session;
+  try {
+    session = await loadSession(userId);
+  } catch (e) {
+    console.warn('[matrix] could not load session:', e);
+    return null;
+  }
+  if (!session) return null;
+
+  const { baseUrl, accessToken, userId: sid, deviceId } = session;
+
+  client = sdk.createClient({
+    baseUrl,
+    accessToken,
+    userId: sid,
+    deviceId,
+    cryptoCallbacks: { getSecretStorageKey },
+  });
+  progress('Restoring session…');
+  try {
+    await initCryptoWithRetry(client);
+  } catch (e) {
+    progress(`Crypto init failed (continuing offline): ${e.message}`);
+  }
+
+  try {
+    await client.startClient({ initialSyncLimit: 100 });
+    if (_watchSyncUnsub) _watchSyncUnsub();
+    _watchSyncUnsub = watchSync(client);
+    // Best-effort wait for sync — short timeout so offline boots fast.
+    try { await waitForSync(client, 12000); }
+    catch (e) { progress(`Sync deferred (${e.message}); local data available`); }
+  } catch (e) {
+    progress(`Sync start failed (continuing offline): ${e.message}`);
+  }
+
+  try {
+    await ensureEncryptionSetUp({ userMxid: sid, password: null });
+  } catch (e) {
+    progress(`Encryption restore failed: ${e.message}`);
+  }
+
+  return client;
+}
+
+/**
+ * Offline-capable unlock: derive the vault key from the password and
+ * (if we have a saved session) bring up the client without requiring
+ * network. Returns { userId, online } where online indicates whether
+ * sync reached a ready state.
+ */
+export async function unlock(userId, password) {
+  const ok = await vault.unlock(userId, password);
+  if (!ok) throw new Error('Invalid password');
+  rememberLastUser(userId);
+  const c = await restoreSession(userId);
+  if (!c) return { userId, online: false };
+  const state = c.getSyncState && c.getSyncState();
+  return { userId, online: state === 'PREPARED' || state === 'SYNCING' };
+}
+
+/**
+ * Lock the device: clear the in-memory key + stop the client, but
+ * keep the encrypted session token, OPFS data, and outbox on disk.
+ * The user can re-enter their password to resume.
+ */
+export async function lock() {
+  if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
   if (client) {
-    client.stopClient();
-    try {
-      await client.logout(true);
-    } catch {
-      // Server may reject — clear local state anyway
-    }
+    try { client.stopClient(); } catch {}
     client = null;
   }
-  localStorage.removeItem('mx_session');
-  // Also clear the crypto store so the next login starts clean
+  vault.lock();
+}
+
+/**
+ * Full logout: server-side logout, wipe encrypted session, wipe vault
+ * metadata, wipe OPFS room data, wipe outbox, drop the crypto store.
+ * Everything on disk for this user is gone after this resolves.
+ */
+export async function logout() {
+  const uid = vault.getUserId();
+  if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
+  if (client) {
+    try { client.stopClient(); } catch {}
+    try { await client.logout(true); } catch {}
+    client = null;
+  }
+  if (uid) {
+    dropSession(uid);
+    vault.wipe(uid);
+  }
+  try { await wipeAllRoomData(); } catch {}
+  try { await clearOutbox(); } catch {}
   try { await clearCryptoStore(); } catch {}
+  forgetLastUser();
+}
+
+/**
+ * Does the local device have a saved session + vault for this user?
+ * Used to decide between login form and unlock form on boot.
+ */
+export function hasLocalAccount(userId) {
+  return !!localStorage.getItem(sessionKey(userId)) && vault.hasMeta(userId);
 }
