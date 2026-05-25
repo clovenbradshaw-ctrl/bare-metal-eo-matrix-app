@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Matrix Events</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Fraunces:opsz,wght@9..144,300;9..144,500;9..144,700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0a0c;--surface:#111115;--surface-2:#1a1a20;--border:#2a2a32;--text:#e0ddd8;--text-dim:#7a7872;--text-bright:#f5f2ed;--accent:#c4956a;--accent-dim:#8a6a4a;--accent-glow:rgba(196,149,106,.15);--green:#6a9a6a;--green-dim:rgba(106,154,106,.15);--red:#b06060;--mono:'IBM Plex Mono',monospace;--serif:'Fraunces',serif;--radius:3px}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--mono);background:var(--bg);color:var(--text);min-height:100vh;font-size:13px;line-height:1.6}
+.app{max-width:720px;margin:0 auto;padding:24px 20px}
+.header{display:flex;align-items:baseline;gap:12px;padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:20px}
+.header h1{font-family:var(--serif);font-weight:700;font-size:20px;color:var(--accent)}
+.header .tag{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim)}
+.field{margin-bottom:12px}
+.field label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:4px}
+input{width:100%;padding:8px 10px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:var(--mono);font-size:13px;outline:none}
+input:focus{border-color:var(--accent-dim);box-shadow:0 0 0 2px var(--accent-glow)}
+button{padding:7px 16px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:var(--mono);font-size:12px;cursor:pointer}
+button:hover{border-color:var(--accent-dim);background:var(--accent-glow);color:var(--text-bright)}
+button.primary{background:var(--accent-dim);border-color:var(--accent);color:var(--text-bright)}
+.btn-row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+.panel h2{font-family:var(--serif);font-weight:500;font-size:15px;color:var(--accent);margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+#log{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;max-height:160px;overflow-y:auto;font-size:11px;line-height:1.7;color:var(--text-dim);margin-bottom:16px}
+#log .ok{color:var(--green)}
+#log .err{color:var(--red)}
+.room-item{padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:12px}
+.room-item:hover{background:var(--accent-glow)}
+.room-item.active{background:var(--accent-glow);border-left:2px solid var(--accent)}
+#stateView{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px;font-size:11px;max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--text-dim)}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <h1>Matrix Events</h1>
+    <span class="tag">rooms as database · operators as schema · fold as query</span>
+  </div>
+
+  <div id="log"></div>
+
+  <!-- LOGIN -->
+  <div id="authPanel" class="panel">
+    <h2>Connect</h2>
+    <div class="field"><label>Username</label><input id="inUser" placeholder="@user:homeserver.com" oninput="
+      const v=this.value.trim();
+      document.getElementById('hsField').classList.toggle('hidden',v.includes(':'));
+      if(v.includes(':'))document.getElementById('inHS').value='https://'+v.split(':').slice(1).join(':');
+    "></div>
+    <div class="field"><label>Password</label><input id="inPass" type="password"></div>
+    <div class="field" id="hsField"><label>Homeserver</label><input id="inHS" placeholder="https://matrix.org"></div>
+    <div class="btn-row"><button class="primary" id="loginBtn">Login</button></div>
+  </div>
+
+  <!-- APP -->
+  <div id="appPanel" class="hidden">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <span id="userDisplay" style="color:var(--accent);font-size:12px"></span>
+      <button id="logoutBtn" style="font-size:11px">Logout</button>
+    </div>
+
+    <!-- ROOMS -->
+    <div class="panel">
+      <h2>Rooms</h2>
+      <div id="roomList" style="margin-bottom:12px"></div>
+      <div style="display:flex;gap:8px">
+        <input id="newRoomName" placeholder="Room name" style="flex:1">
+        <input id="newRoomType" placeholder="Type" style="width:100px">
+        <button id="createRoomBtn">Create</button>
+      </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div class="panel hidden" id="roomControls">
+      <h2 id="currentRoomName">—</h2>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Members: <span id="memberList">—</span></div>
+      <div class="btn-row" style="margin-top:0">
+        <button id="emitInsBtn">+ INS (create entity)</button>
+        <button id="emitDefBtn">⊢ DEF (set value)</button>
+        <button id="inviteBtn">⋈ Invite user</button>
+      </div>
+    </div>
+
+    <!-- FOLD OUTPUT -->
+    <div class="panel">
+      <h2>Projected State (integral fold)</h2>
+      <pre id="stateView" style="min-height:60px">{ }</pre>
+    </div>
+  </div>
+</div>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
