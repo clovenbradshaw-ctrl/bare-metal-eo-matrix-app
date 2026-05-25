@@ -6,7 +6,7 @@
  * The foundation (client, operators, fold, rooms) stays the same.
  */
 
-import { login, restoreSession, logout, getClient } from './client.js';
+import { login, restoreSession, logout, getClient, setProgress } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, eva, rec } from './operators.js';
 import { fold, foldFrom, initial, entitiesOfType } from './fold.js';
 import { createRoom, discoverRooms, getTimeline, onTimeline, loadFullTimeline, invite, getMembers } from './rooms.js';
@@ -30,6 +30,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('emitInsBtn').addEventListener('click', handleEmitIns);
   $('emitDefBtn').addEventListener('click', handleEmitDef);
   $('inviteBtn').addEventListener('click', handleInvite);
+
+  // Surface per-step progress from client.js into the UI log so a stalled
+  // login shows which phase it's stuck in (auth / crypto / sync).
+  setProgress((msg) => log(msg));
 
   // Try session restore
   const client = await restoreSession();
