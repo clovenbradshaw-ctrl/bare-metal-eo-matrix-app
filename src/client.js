@@ -239,6 +239,23 @@ export async function login(homeserver, username, password) {
   );
   progress(`Authenticated as ${resp.user_id}`);
 
+  // Persist credentials immediately, before any step that can block or
+  // hang. The access token + device id are valid the moment auth
+  // succeeds; everything after this point is recoverable on next load.
+  // Saving later (after sync, after the recovery-key modal) meant a
+  // reload mid-bootstrap dropped the session and forced the homeserver
+  // to mint a new device on the next login — the duplicate-session-ID
+  // symptom we keep seeing.
+  localStorage.setItem(
+    'mx_session',
+    JSON.stringify({
+      baseUrl,
+      accessToken: resp.access_token,
+      userId: resp.user_id,
+      deviceId: resp.device_id,
+    })
+  );
+
   // Step 2: real client with credentials.
   client = sdk.createClient({
     baseUrl,
@@ -267,16 +284,6 @@ export async function login(homeserver, username, password) {
   } catch (e) {
     progress(`Encryption setup failed: ${e.message}`);
   }
-
-  localStorage.setItem(
-    'mx_session',
-    JSON.stringify({
-      baseUrl,
-      accessToken: resp.access_token,
-      userId: resp.user_id,
-      deviceId: resp.device_id,
-    })
-  );
 
   return {
     client,
@@ -316,7 +323,18 @@ export async function restoreSession() {
     return client;
   } catch (e) {
     console.warn('[matrix] session restore failed:', e);
-    localStorage.removeItem('mx_session');
+    // Only wipe the saved session when the homeserver has actually
+    // rejected the token. Transient failures (sync timeout, slow wasm
+    // load, IndexedDB hiccup, recovery-key modal dismissed) leave the
+    // credentials intact so the next reload tries again instead of
+    // forcing a fresh login and a new device id.
+    const msg = String(e && e.message || '');
+    const fatal = msg.includes('Access token rejected') ||
+                  e?.httpStatus === 401 ||
+                  e?.errcode === 'M_UNKNOWN_TOKEN';
+    if (fatal) {
+      localStorage.removeItem('mx_session');
+    }
     client = null;
     return null;
   }
