@@ -1,0 +1,19 @@
+{
+  "name": "Matrix Events",
+  "short_name": "MxEvents",
+  "description": "Rooms as database, operators as schema, fold as query. Works offline.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#0a0a0c",
+  "theme_color": "#0a0a0c",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

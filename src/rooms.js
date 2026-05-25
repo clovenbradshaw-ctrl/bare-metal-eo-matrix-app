@@ -12,7 +12,7 @@
 
 import { getClient } from './client.js';
 import { getNamespace } from './operators.js';
-import { ClientEvent, MatrixEventEvent, RoomEvent, RoomStateEvent } from 'matrix-js-sdk';
+import { ClientEvent, MatrixEventEvent, RoomEvent, RoomStateEvent, EventStatus } from 'matrix-js-sdk';
 
 const META_TYPE = () => `${getNamespace()}.meta`;
 
@@ -261,6 +261,30 @@ export function onDecrypted(roomId, handler) {
   client.on(MatrixEventEvent.Decrypted, listener);
   return () => client.removeListener(MatrixEventEvent.Decrypted, listener);
 }
+
+/**
+ * Listen for local-echo lifecycle changes on the given room: a sent
+ * event transitioning from SENDING → SENT, the SDK updating its
+ * placeholder event_id to the real server id, or a failure flipping
+ * to NOT_SENT. Handler receives (event, oldEventId, oldStatus).
+ *
+ * @param {string} roomId
+ * @param {function} handler
+ * @returns {function} Unsubscribe
+ */
+export function onLocalEchoUpdated(roomId, handler) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+  const room = client.getRoom(roomId);
+  if (!room) return () => {};
+  const listener = (event, _room, oldEventId, oldStatus) => {
+    handler(event, oldEventId, oldStatus);
+  };
+  room.on(RoomEvent.LocalEchoUpdated, listener);
+  return () => room.removeListener(RoomEvent.LocalEchoUpdated, listener);
+}
+
+export { EventStatus };
 
 /**
  * Load the full timeline, then return only events newer than `sinceTs`.
