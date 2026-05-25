@@ -12,7 +12,7 @@
 
 import { getClient } from './client.js';
 import { getNamespace } from './operators.js';
-import { ClientEvent, RoomEvent } from 'matrix-js-sdk';
+import { ClientEvent, MatrixEventEvent, RoomEvent } from 'matrix-js-sdk';
 
 const META_TYPE = () => `${getNamespace()}.meta`;
 
@@ -209,6 +209,31 @@ export function onTimeline(roomId, handler) {
 
   client.on(RoomEvent.Timeline, listener);
   return () => client.removeListener(RoomEvent.Timeline, listener);
+}
+
+/**
+ * Listen for events that were initially undecryptable (no Megolm session
+ * yet) becoming decrypted later, once keys arrive over `to_device`. Without
+ * this, the fold misses any event still encrypted at the moment the
+ * timeline loaded — it skips `m.room.encrypted` because that type isn't
+ * one of the app's operators.
+ *
+ * @param {string} roomId
+ * @param {function} handler - Called with (event) when a decrypt completes
+ * @returns {function} Unsubscribe
+ */
+export function onDecrypted(roomId, handler) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+
+  const listener = (event) => {
+    if (event.getRoomId() === roomId) {
+      handler(event);
+    }
+  };
+
+  client.on(MatrixEventEvent.Decrypted, listener);
+  return () => client.removeListener(MatrixEventEvent.Decrypted, listener);
 }
 
 /**

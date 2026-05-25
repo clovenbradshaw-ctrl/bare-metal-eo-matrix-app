@@ -9,7 +9,7 @@
 import { login, restoreSession, logout, getClient, setProgress } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, eva, rec } from './operators.js';
 import { fold, foldFrom, initial, entitiesOfType } from './fold.js';
-import { createRoom, discoverRooms, getTimeline, onTimeline, loadFullTimeline, invite, getMembers, acceptInvite, onRoomChanges } from './rooms.js';
+import { createRoom, discoverRooms, getTimeline, onTimeline, loadFullTimeline, invite, getMembers, acceptInvite, onRoomChanges, onDecrypted } from './rooms.js';
 
 // ── Configure namespace for your app ──
 setNamespace('io.matrix-events');
@@ -18,6 +18,7 @@ setNamespace('io.matrix-events');
 let currentRoomId = null;
 let currentState = initial();
 let unsubTimeline = null; // cleanup handle for room listener
+let unsubDecrypted = null; // cleanup handle for late-decryption listener
 let unsubRoomChanges = null; // cleanup handle for room-list listener
 
 // ── DOM helpers ──
@@ -69,6 +70,7 @@ async function handleLogin() {
 async function handleLogout() {
   if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
   if (unsubTimeline) { unsubTimeline(); unsubTimeline = null; }
+  if (unsubDecrypted) { unsubDecrypted(); unsubDecrypted = null; }
   await logout();
   $('authPanel').classList.remove('hidden');
   $('appPanel').classList.add('hidden');
@@ -150,8 +152,9 @@ async function handleCreateRoom() {
 }
 
 async function openRoom(roomId, name) {
-  // Clean up previous room listener
+  // Clean up previous room listeners
   if (unsubTimeline) { unsubTimeline(); unsubTimeline = null; }
+  if (unsubDecrypted) { unsubDecrypted(); unsubDecrypted = null; }
 
   currentRoomId = roomId;
   $('currentRoomName').textContent = name;
@@ -167,6 +170,10 @@ async function openRoom(roomId, name) {
 
   // Listen for new events — recompute state on each
   unsubTimeline = onTimeline(roomId, () => recomputeState());
+  // Re-fold when keys arrive later and previously-encrypted events
+  // become readable. Without this, the fold permanently ignores any
+  // event that was still encrypted at first load.
+  unsubDecrypted = onDecrypted(roomId, () => recomputeState());
 }
 
 // ── Emit ──
