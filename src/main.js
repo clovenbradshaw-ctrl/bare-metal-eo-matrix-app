@@ -6,7 +6,7 @@
  * The foundation (client, operators, fold, rooms) stays the same.
  */
 
-import { login, restoreSession, logout, getClient, setProgress } from './client.js';
+import { login, restoreSession, logout, getClient, setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, eva, rec } from './operators.js';
 import { fold, foldFrom, initial, entitiesOfType } from './fold.js';
 import { createRoom, discoverRooms, getTimeline, onTimeline, loadFullTimeline, invite, getMembers, acceptInvite, onRoomChanges, onDecrypted } from './rooms.js';
@@ -36,6 +36,38 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Surface per-step progress from client.js into the UI log so a stalled
   // login shows which phase it's stuck in (auth / crypto / sync).
   setProgress((msg) => log(msg));
+
+  // Recovery-key display: shown once, after first-time bootstrap.
+  setRecoveryKeyDisplayer((key) => new Promise((resolve) => {
+    $('recoveryKeyText').textContent = key;
+    $('recoveryDisplayModal').classList.remove('hidden');
+    const ack = () => {
+      $('recoveryDisplayModal').classList.add('hidden');
+      $('recoveryDisplayAck').removeEventListener('click', ack);
+      resolve();
+    };
+    $('recoveryDisplayAck').addEventListener('click', ack);
+  }));
+
+  // Recovery-key entry: shown on a new device that needs to unlock secret
+  // storage. Resolves to the entered key string or null if skipped.
+  setRecoveryKeyProvider(() => new Promise((resolve) => {
+    $('recoveryKeyInput').value = '';
+    $('recoveryEntryModal').classList.remove('hidden');
+    const cleanup = () => {
+      $('recoveryEntryModal').classList.add('hidden');
+      $('recoveryEntrySubmit').removeEventListener('click', submit);
+      $('recoveryEntrySkip').removeEventListener('click', skip);
+    };
+    const submit = () => {
+      const v = $('recoveryKeyInput').value.trim();
+      cleanup();
+      resolve(v || null);
+    };
+    const skip = () => { cleanup(); resolve(null); };
+    $('recoveryEntrySubmit').addEventListener('click', submit);
+    $('recoveryEntrySkip').addEventListener('click', skip);
+  }));
 
   // Try session restore
   const client = await restoreSession();

@@ -31,6 +31,11 @@ button.primary{background:var(--accent-dim);border-color:var(--accent);color:var
 .room-item.active{background:var(--accent-glow);border-left:2px solid var(--accent)}
 #stateView{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px;font-size:11px;max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--text-dim)}
 .hidden{display:none!important}
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:100}
+.modal{background:var(--surface);border:1px solid var(--accent-dim);border-radius:var(--radius);padding:24px;max-width:520px;width:90%}
+.modal h3{font-family:var(--serif);font-size:16px;color:var(--accent);margin-bottom:12px}
+.modal p{font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.7}
+.modal .key-display{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:12px;font-size:13px;color:var(--accent);word-break:break-all;margin-bottom:14px;user-select:all}
 </style>
 </head>
 <body>
@@ -91,6 +96,31 @@ button.primary{background:var(--accent-dim);border-color:var(--accent);color:var
     </div>
   </div>
 </div>
+<!-- Recovery-key display (shown once after first-time encryption setup) -->
+<div id="recoveryDisplayModal" class="modal-backdrop hidden">
+  <div class="modal">
+    <h3>Save your recovery key</h3>
+    <p>This key restores your message history on new browsers and devices. Save it somewhere safe — it cannot be shown again.</p>
+    <div class="key-display" id="recoveryKeyText"></div>
+    <div class="btn-row" style="margin-top:0">
+      <button class="primary" id="recoveryDisplayAck">I've saved it</button>
+    </div>
+  </div>
+</div>
+
+<!-- Recovery-key entry (shown on a new device with existing cross-signing) -->
+<div id="recoveryEntryModal" class="modal-backdrop hidden">
+  <div class="modal">
+    <h3>Enter your recovery key</h3>
+    <p>This device is new. Paste the recovery key from your first login to decrypt prior messages.</p>
+    <div class="field"><input id="recoveryKeyInput" placeholder="EsTb …" autocomplete="off"></div>
+    <div class="btn-row" style="margin-top:0">
+      <button class="primary" id="recoveryEntrySubmit">Unlock</button>
+      <button id="recoveryEntrySkip">Skip</button>
+    </div>
+  </div>
+</div>
+
 <script type="module" src="/src/main.js"></script>
 </body>
 </html>
