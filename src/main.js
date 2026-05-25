@@ -6,10 +6,10 @@
  * The foundation (client, operators, fold, rooms) stays the same.
  */
 
-import { login, restoreSession, logout, getClient, setProgress } from './client.js';
+import { login, restoreSession, logout, getClient, setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, eva, rec } from './operators.js';
 import { fold, foldFrom, initial, entitiesOfType } from './fold.js';
-import { createRoom, discoverRooms, getTimeline, onTimeline, loadFullTimeline, invite, getMembers } from './rooms.js';
+import { createRoom, discoverRooms, getTimeline, onTimeline, loadFullTimeline, invite, getMembers, acceptInvite, onRoomChanges, onDecrypted } from './rooms.js';
 
 // ── Configure namespace for your app ──
 setNamespace('io.matrix-events');
@@ -18,6 +18,8 @@ setNamespace('io.matrix-events');
 let currentRoomId = null;
 let currentState = initial();
 let unsubTimeline = null; // cleanup handle for room listener
+let unsubDecrypted = null; // cleanup handle for late-decryption listener
+let unsubRoomChanges = null; // cleanup handle for room-list listener
 
 // ── DOM helpers ──
 const $ = (id) => document.getElementById(id);
@@ -34,6 +36,38 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Surface per-step progress from client.js into the UI log so a stalled
   // login shows which phase it's stuck in (auth / crypto / sync).
   setProgress((msg) => log(msg));
+
+  // Recovery-key display: shown once, after first-time bootstrap.
+  setRecoveryKeyDisplayer((key) => new Promise((resolve) => {
+    $('recoveryKeyText').textContent = key;
+    $('recoveryDisplayModal').classList.remove('hidden');
+    const ack = () => {
+      $('recoveryDisplayModal').classList.add('hidden');
+      $('recoveryDisplayAck').removeEventListener('click', ack);
+      resolve();
+    };
+    $('recoveryDisplayAck').addEventListener('click', ack);
+  }));
+
+  // Recovery-key entry: shown on a new device that needs to unlock secret
+  // storage. Resolves to the entered key string or null if skipped.
+  setRecoveryKeyProvider(() => new Promise((resolve) => {
+    $('recoveryKeyInput').value = '';
+    $('recoveryEntryModal').classList.remove('hidden');
+    const cleanup = () => {
+      $('recoveryEntryModal').classList.add('hidden');
+      $('recoveryEntrySubmit').removeEventListener('click', submit);
+      $('recoveryEntrySkip').removeEventListener('click', skip);
+    };
+    const submit = () => {
+      const v = $('recoveryKeyInput').value.trim();
+      cleanup();
+      resolve(v || null);
+    };
+    const skip = () => { cleanup(); resolve(null); };
+    $('recoveryEntrySubmit').addEventListener('click', submit);
+    $('recoveryEntrySkip').addEventListener('click', skip);
+  }));
 
   // Try session restore
   const client = await restoreSession();
@@ -66,6 +100,9 @@ async function handleLogin() {
 }
 
 async function handleLogout() {
+  if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
+  if (unsubTimeline) { unsubTimeline(); unsubTimeline = null; }
+  if (unsubDecrypted) { unsubDecrypted(); unsubDecrypted = null; }
   await logout();
   $('authPanel').classList.remove('hidden');
   $('appPanel').classList.add('hidden');
@@ -77,6 +114,10 @@ function showApp(userId) {
   $('appPanel').classList.remove('hidden');
   $('userDisplay').textContent = userId;
   log('Connected as ' + userId, 'ok');
+
+  if (unsubRoomChanges) unsubRoomChanges();
+  unsubRoomChanges = onRoomChanges(() => refreshRooms());
+
   refreshRooms();
 }
 
@@ -94,10 +135,31 @@ async function refreshRooms() {
   rooms.forEach((r) => {
     const el = document.createElement('div');
     el.className = 'room-item' + (r.roomId === currentRoomId ? ' active' : '');
-    el.textContent = `${r.name} (${r.roomType})`;
-    el.addEventListener('click', () => openRoom(r.roomId, r.name));
+    if (r.membership === 'invite') {
+      const from = r.inviter ? ` from ${r.inviter}` : '';
+      el.textContent = `${r.name} (invite${from}) — click to accept`;
+      el.style.color = 'var(--accent)';
+      el.addEventListener('click', () => handleAcceptInvite(r.roomId, r.name));
+    } else {
+      el.textContent = `${r.name} (${r.roomType})`;
+      el.addEventListener('click', () => openRoom(r.roomId, r.name));
+    }
     list.appendChild(el);
   });
+}
+
+async function handleAcceptInvite(roomId, name) {
+  log(`Accepting invite to ${name}…`);
+  try {
+    await acceptInvite(roomId);
+    log(`Joined ${name}`, 'ok');
+    // refreshRooms fires automatically via onRoomChanges once membership flips,
+    // but call it directly so the click feels responsive.
+    refreshRooms();
+    openRoom(roomId, name);
+  } catch (e) {
+    log('Accept failed: ' + e.message, 'err');
+  }
 }
 
 async function handleCreateRoom() {
@@ -122,8 +184,9 @@ async function handleCreateRoom() {
 }
 
 async function openRoom(roomId, name) {
-  // Clean up previous room listener
+  // Clean up previous room listeners
   if (unsubTimeline) { unsubTimeline(); unsubTimeline = null; }
+  if (unsubDecrypted) { unsubDecrypted(); unsubDecrypted = null; }
 
   currentRoomId = roomId;
   $('currentRoomName').textContent = name;
@@ -139,6 +202,10 @@ async function openRoom(roomId, name) {
 
   // Listen for new events — recompute state on each
   unsubTimeline = onTimeline(roomId, () => recomputeState());
+  // Re-fold when keys arrive later and previously-encrypted events
+  // become readable. Without this, the fold permanently ignores any
+  // event that was still encrypted at first load.
+  unsubDecrypted = onDecrypted(roomId, () => recomputeState());
 }
 
 // ── Emit ──

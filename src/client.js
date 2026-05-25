@@ -6,6 +6,7 @@
  */
 
 import * as sdk from 'matrix-js-sdk';
+import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/index.js';
 
 let client = null;
 
@@ -15,6 +16,20 @@ let progress = (msg) => console.log('[matrix]', msg);
 
 export function setProgress(fn) {
   progress = (msg) => { console.log('[matrix]', msg); fn(msg); };
+}
+
+// UI callbacks for the recovery key flow. The UI registers these before
+// login so the client layer can request the key from the user (on a new
+// device) or hand back a newly-generated key for them to save.
+let recoveryKeyProvider = null; // async () => string (the user's recovery key)
+let recoveryKeyDisplayer = null; // async (string) => void (show + acknowledge)
+
+export function setRecoveryKeyProvider(fn) {
+  recoveryKeyProvider = fn;
+}
+
+export function setRecoveryKeyDisplayer(fn) {
+  recoveryKeyDisplayer = fn;
 }
 
 export function getClient() {
@@ -75,6 +90,106 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+// Cryptocallback bridging the SDK's secret-storage requests to the UI.
+// The SDK calls this whenever it needs to unlock secret storage (e.g. on
+// a new device that has cross-signing on the server but no local keys).
+// We ask the UI for the user's recovery key string, decode it, and hand
+// back [keyId, privateKey] for the first key the SDK lists.
+async function getSecretStorageKey({ keys }) {
+  if (!recoveryKeyProvider) {
+    progress('Recovery key required but no UI provider registered');
+    return null;
+  }
+  const keyId = Object.keys(keys)[0];
+  if (!keyId) return null;
+
+  // The provider may resolve to null/empty if the user cancels — surface
+  // that as "no key" rather than throwing inside the SDK.
+  const encoded = await recoveryKeyProvider();
+  if (!encoded) return null;
+
+  try {
+    const privateKey = decodeRecoveryKey(encoded.trim());
+    return [keyId, privateKey];
+  } catch (e) {
+    progress(`Recovery key invalid: ${e.message}`);
+    return null;
+  }
+}
+
+// Make sure cross-signing, secret storage, and key backup are all set up
+// for this account. Called after sync on first login (when we still have
+// the password for the UIA challenge cross-signing key upload requires).
+// On a new device with an existing account, this restores from secret
+// storage using the user's recovery key.
+async function ensureEncryptionSetUp({ userMxid, password }) {
+  const crypto = client.getCrypto();
+  if (!crypto) return;
+
+  if (await crypto.isCrossSigningReady()) {
+    // Local cross-signing is already populated. Make sure backup is on.
+    try { await crypto.checkKeyBackupAndEnable(); } catch (e) {
+      progress(`Key backup check failed: ${e.message}`);
+    }
+    return;
+  }
+
+  const accountHasCrossSigning = await crypto.userHasCrossSigningKeys(userMxid, true);
+
+  if (accountHasCrossSigning) {
+    // New device on an existing account. Need the user's recovery key to
+    // unlock secret storage; bootstrapCrossSigning will call our
+    // getSecretStorageKey callback to fetch the private keys.
+    progress('Restoring encryption keys from recovery…');
+    await crypto.bootstrapCrossSigning({});
+    try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (e) {
+      progress(`Could not load backup key: ${e.message}`);
+    }
+    try {
+      await crypto.restoreKeyBackup();
+    } catch (e) {
+      progress(`Key backup restore failed: ${e.message}`);
+    }
+    try { await crypto.checkKeyBackupAndEnable(); } catch {}
+    return;
+  }
+
+  // First-time setup for this account. Requires the password for the UIA
+  // challenge on /keys/device_signing/upload.
+  if (!password) {
+    progress('Skipping encryption setup: no password available (login again to enable history backup)');
+    return;
+  }
+
+  progress('Setting up encryption + recovery key…');
+  const localUser = userMxid.replace(/^@/, '').split(':')[0];
+  const generatedKey = await crypto.createRecoveryKeyFromPassphrase();
+
+  await crypto.bootstrapCrossSigning({
+    authUploadDeviceSigningKeys: async (makeRequest) => {
+      await makeRequest({
+        type: 'm.login.password',
+        identifier: { type: 'm.id.user', user: localUser },
+        password,
+      });
+    },
+  });
+
+  await crypto.bootstrapSecretStorage({
+    createSecretStorageKey: async () => generatedKey,
+    setupNewKeyBackup: true,
+    setupNewSecretStorage: true,
+  });
+
+  try { await crypto.checkKeyBackupAndEnable(); } catch {}
+
+  if (recoveryKeyDisplayer && generatedKey.encodedPrivateKey) {
+    await recoveryKeyDisplayer(generatedKey.encodedPrivateKey);
+  } else {
+    progress(`Recovery key: ${generatedKey.encodedPrivateKey}`);
+  }
+}
+
 // Resolve the actual client API URL via .well-known/matrix/client. Many
 // homeservers (matrix.org, EMS-hosted, etc.) advertise an API host that
 // differs from the server name. Without this discovery step, login POSTs
@@ -130,6 +245,7 @@ export async function login(homeserver, username, password) {
     accessToken: resp.access_token,
     userId: resp.user_id,
     deviceId: resp.device_id,
+    cryptoCallbacks: { getSecretStorageKey },
   });
 
   // Step 3: crypto. This loads wasm + opens IndexedDB; it can stall in
@@ -144,7 +260,15 @@ export async function login(homeserver, username, password) {
   await waitForSync(client);
   progress('Sync ready');
 
-  sessionStorage.setItem(
+  // Step 5: cross-signing + key backup. First login bootstraps a recovery
+  // key; new devices on the same account restore from one.
+  try {
+    await ensureEncryptionSetUp({ userMxid: resp.user_id, password });
+  } catch (e) {
+    progress(`Encryption setup failed: ${e.message}`);
+  }
+
+  localStorage.setItem(
     'mx_session',
     JSON.stringify({
       baseUrl,
@@ -162,22 +286,37 @@ export async function login(homeserver, username, password) {
 }
 
 export async function restoreSession() {
-  const raw = sessionStorage.getItem('mx_session');
+  const raw = localStorage.getItem('mx_session');
   if (!raw) return null;
 
   try {
     const { baseUrl, accessToken, userId, deviceId } = JSON.parse(raw);
 
-    client = sdk.createClient({ baseUrl, accessToken, userId, deviceId });
+    client = sdk.createClient({
+      baseUrl,
+      accessToken,
+      userId,
+      deviceId,
+      cryptoCallbacks: { getSecretStorageKey },
+    });
     progress('Restoring session…');
     await withTimeout(client.initRustCrypto(), 30000, 'Crypto init');
     await client.startClient({ initialSyncLimit: 100 });
     await waitForSync(client);
 
+    // Restore-only path: no password, so first-time bootstrap is skipped.
+    // If the account already has cross-signing on the server, this will
+    // prompt the UI for the recovery key to pull it down to this device.
+    try {
+      await ensureEncryptionSetUp({ userMxid: userId, password: null });
+    } catch (e) {
+      progress(`Encryption restore failed: ${e.message}`);
+    }
+
     return client;
   } catch (e) {
     console.warn('[matrix] session restore failed:', e);
-    sessionStorage.removeItem('mx_session');
+    localStorage.removeItem('mx_session');
     client = null;
     return null;
   }
@@ -196,5 +335,5 @@ export async function logout() {
     }
     client = null;
   }
-  sessionStorage.removeItem('mx_session');
+  localStorage.removeItem('mx_session');
 }
