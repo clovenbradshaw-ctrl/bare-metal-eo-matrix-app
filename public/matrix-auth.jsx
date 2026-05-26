@@ -264,6 +264,9 @@ function IdentityChip({ session, onSignOut }) {
   const [pw, setPw] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [displayName, setDisplayName] = useState(() =>
+    window.MatrixLive?.getMyDisplayName?.() || null
+  );
   const ref = useRef(null);
   const pwRef = useRef(null);
   useEffect(() => { if (reconnectOpen) pwRef.current?.focus(); }, [reconnectOpen]);
@@ -273,18 +276,39 @@ function IdentityChip({ session, onSignOut }) {
     document.addEventListener('mousedown', close);
     return () => document.removeEventListener('mousedown', close);
   }, [open]);
-  const u = session.mxid.replace(/^@/, '').split(':')[0];
-  const initial = u.slice(0,1).toUpperCase();
+  // The Matrix client populates profile data asynchronously; refresh when
+  // member/session events fire so the display name lands without a reload.
+  useEffect(() => {
+    const ML = window.MatrixLive;
+    if (!ML?.subscribe) return;
+    return ML.subscribe((reason) => {
+      if (reason === 'members' || reason === 'session' || reason === 'rooms') {
+        setDisplayName(ML.getMyDisplayName?.() || null);
+      }
+    });
+  }, []);
+
+  const localPart = session.mxid.replace(/^@/, '').split(':')[0];
   const demo = !!session.demo;
   const stale = !demo && !!session.stale;
+  const label = demo ? 'demo' : (displayName || localPart);
+  const initial = (label[0] || '?').toUpperCase();
   const avatarBg = demo ? 'var(--signal)' : stale ? 'var(--triad-significance)' : null;
+  const syncStatus = demo
+    ? 'demo · seed data only'
+    : stale ? 'local only · changes will sync when reconnected'
+            : 'synced';
   return (
     <div className="identity-chip" ref={ref}>
-      <button className="ic-btn" onClick={() => setOpen(o => !o)} title={stale ? `${session.mxid} · local-only (homeserver unreachable)` : session.mxid}>
+      <button
+        className="ic-btn"
+        onClick={() => setOpen(o => !o)}
+        title={demo ? 'demo mode' : stale ? `${session.mxid} · local only` : session.mxid}
+      >
         <span className="ic-avatar" style={avatarBg ? {background:avatarBg} : null}>{initial}</span>
         <span className="ic-mxid">
-          {demo ? 'demo · @you' : session.mxid}
-          {stale && <span className="muted" style={{marginLeft:6}}>· local-only</span>}
+          {label}
+          {stale && <span className="muted" style={{marginLeft:6}}>· local only</span>}
         </span>
         <span className="ic-caret">▾</span>
       </button>
@@ -293,13 +317,8 @@ function IdentityChip({ session, onSignOut }) {
           <div className="ic-panel-head">
             <div className="ic-panel-avatar" style={avatarBg ? {background:avatarBg} : null}>{initial}</div>
             <div>
-              <div className="ic-panel-mxid">{demo ? 'demo mode' : session.mxid}</div>
-              <div className="ic-panel-sub">
-                {demo ? 'no homeserver · seed data only' :
-                 stale ? `local-only · homeserver unreachable · sign out + back in to reconnect` :
-                  `homeserver · ${session.homeserver.replace(/^https?:\/\//,'')}`}
-              </div>
-              <div className="ic-panel-sub">device · {session.device_id || '—'}{session.sso ? ' · sso' : ''}</div>
+              <div className="ic-panel-mxid">{label}</div>
+              <div className="ic-panel-sub">{syncStatus}</div>
             </div>
           </div>
           {demo ? (
@@ -476,15 +495,15 @@ function MembersDialog({ space, mySession, onClose }) {
     } finally { setBusy(false); }
   }
 
-  async function doKick(userId) {
+  async function doKick(userId, label) {
     if (userId === myMxid) {
-      setErr("you can't kick yourself from here — sign out instead");
+      setErr("you can't remove yourself from here — sign out instead");
       return;
     }
-    if (!confirm(`Remove ${userId} from this space?`)) return;
+    if (!confirm(`Remove ${label || userId} from this workspace?`)) return;
     setErr(null); setBusy(true);
     try { await ML.kickUser(space.id, userId); }
-    catch (e) { setErr(e?.message || 'kick failed'); }
+    catch (e) { setErr(e?.message || 'remove failed'); }
     finally { setBusy(false); }
   }
 
@@ -500,25 +519,28 @@ function MembersDialog({ space, mySession, onClose }) {
     finally { setBusy(false); }
   }
 
+  const myRoleLabel = myPowerLevel >= 100 ? 'admin' : myPowerLevel >= 50 ? 'mod' : 'member';
+
   return (
     <div className="share-overlay" onClick={onClose}>
       <div className="share-card" onClick={e => e.stopPropagation()}>
         <div className="share-head">
           <div>
-            <div className="share-title">members of <span className="share-name">{space.title || space.id}</span></div>
-            <div className="share-sub">space · {space.id} · {members.length} members · your power level {myPowerLevel}</div>
+            <div className="share-title">members of <span className="share-name">{space.title || 'untitled workspace'}</span></div>
+            <div className="share-sub">{members.length} {members.length === 1 ? 'member' : 'members'} · your role: {myRoleLabel}</div>
           </div>
           <button className="share-close" onClick={onClose}>×</button>
         </div>
 
         <div className="share-section">
-          <div className="share-section-label">invite by matrix id</div>
+          <div className="share-section-label">invite member</div>
           <div className="share-invite-row">
             <input
               ref={inputRef}
               value={mxid}
               onChange={e => setMxid(e.target.value)}
-              placeholder="@username:homeserver"
+              placeholder="username"
+              title="full matrix id format: @username:homeserver"
               disabled={!canInvite || busy}
               onKeyDown={e => { if (e.key === 'Enter') doInvite(); }}
             />
@@ -536,10 +558,10 @@ function MembersDialog({ space, mySession, onClose }) {
             <button className="share-invite" onClick={doInvite} disabled={!canInvite || busy}>invite</button>
           </div>
           {!canInvite && (
-            <div className="share-hint">you need power level 50+ to invite. ask an admin.</div>
+            <div className="share-hint">you need to be a mod or admin to invite. ask an admin.</div>
           )}
           {canInvite && !canSetPL && (
-            <div className="share-hint">you can invite, but setting a non-zero initial power level needs admin (100).</div>
+            <div className="share-hint">you can invite, but assigning a non-zero role needs admin.</div>
           )}
           {err && <div className="login-err" style={{marginTop:6}}>{err}</div>}
         </div>
@@ -549,9 +571,9 @@ function MembersDialog({ space, mySession, onClose }) {
           <table className="dbgrid members-table">
             <thead>
               <tr>
-                <th>matrix id</th>
+                <th>member</th>
                 <th>status</th>
-                <th>power level</th>
+                <th>role</th>
                 <th></th>
               </tr>
             </thead>
@@ -559,17 +581,25 @@ function MembersDialog({ space, mySession, onClose }) {
               {members.map(m => {
                 const isMe = m.userId === myMxid;
                 const canKickThis = canKick && !isMe && m.powerLevel < myPowerLevel;
+                const nameLabel = m.displayName && m.displayName !== m.userId
+                  ? m.displayName
+                  : m.userId.replace(/^@/, '').split(':')[0];
+                const initial = (nameLabel[0] || '?').toUpperCase();
+                const statusLabel = m.membership === 'join' ? 'active'
+                                  : m.membership === 'invite' ? 'invited'
+                                  : m.membership;
+                const roleLabel = m.powerLevel >= 100 ? 'admin' : m.powerLevel >= 50 ? 'mod' : 'member';
                 return (
                   <tr key={m.userId}>
                     <td title={m.userId}>
                       <span className="share-member-avatar" style={{marginRight:8}}>
-                        {m.userId.replace(/^@/,'').slice(0,1).toUpperCase()}
+                        {initial}
                       </span>
-                      <span>{m.displayName}</span>
+                      <span>{nameLabel}</span>
                       {isMe && <span className="muted" style={{marginLeft:6}}>(you)</span>}
                     </td>
                     <td className={m.membership === 'invite' ? 'muted' : ''}>
-                      {m.membership}
+                      {statusLabel}
                     </td>
                     <td>
                       <input
@@ -580,22 +610,21 @@ function MembersDialog({ space, mySession, onClose }) {
                         step={1}
                         disabled={!canSetPL || busy || (m.powerLevel >= myPowerLevel && !isMe)}
                         style={{width:60,padding:'3px 6px',fontSize:12}}
+                        title="0 = member · 50 = mod · 100 = admin"
                         onBlur={(e) => {
                           const v = Number(e.target.value);
                           if (v !== m.powerLevel) doSetPL(m.userId, v);
                         }}
                         onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
                       />
-                      <span className="muted" style={{marginLeft:6,fontSize:11}}>
-                        {m.powerLevel >= 100 ? 'admin' : m.powerLevel >= 50 ? 'mod' : 'member'}
-                      </span>
+                      <span className="muted" style={{marginLeft:6,fontSize:11}}>{roleLabel}</span>
                     </td>
                     <td>
                       <button
                         className="share-member-remove"
                         disabled={!canKickThis || busy}
-                        title={isMe ? "can't kick yourself" : canKickThis ? 'remove from space' : 'insufficient power level'}
-                        onClick={() => doKick(m.userId)}
+                        title={isMe ? "can't remove yourself" : canKickThis ? 'remove from workspace' : 'you need a higher role to remove this member'}
+                        onClick={() => doKick(m.userId, nameLabel)}
                       >×</button>
                     </td>
                   </tr>

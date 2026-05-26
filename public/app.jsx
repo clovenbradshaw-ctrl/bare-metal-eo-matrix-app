@@ -69,7 +69,7 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
   }, [open]);
 
   const current = rooms.find(r => r.id === currentRoomId);
-  const label = current ? (current.title || current.id) : (rooms.length ? 'pick a space' : 'no spaces');
+  const label = current ? (current.title || 'untitled workspace') : (rooms.length ? 'pick a workspace' : 'no workspaces');
 
   return (
     <div className="room-picker" ref={ref}>
@@ -91,12 +91,12 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
               </button>
             </div>
           )}
-          <div className="panel-head">spaces · {rooms.length}</div>
+          <div className="panel-head">workspaces · {rooms.length}</div>
           {rooms.length === 0 && (
             <div style={{padding:'10px 12px',fontSize:11,color:'var(--text-dim)',fontStyle:'italic'}}>
               {isLive
-                ? 'no spaces yet — create one below.'
-                : 'no spaces yet.'}
+                ? 'no workspaces yet — create one below.'
+                : 'no workspaces yet.'}
             </div>
           )}
           {rooms.map(r => (
@@ -104,9 +104,10 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
               key={r.id}
               className={`room-row ${r.id === currentRoomId ? 'active' : ''}`}
               onClick={() => { setCurrentRoomId(r.id); setOpen(false); }}
+              title={r.id}
             >
               <span className="rname">
-                {r.title || r.id}
+                {r.title || 'untitled workspace'}
                 {r.membership === 'invite' && (
                   <span style={{marginLeft:6,color:'var(--signal)',fontSize:10,textTransform:'uppercase'}}>invite</span>
                 )}
@@ -125,7 +126,7 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
           <div className="new-room">
             <input
               value={newName}
-              placeholder={isLive ? 'new space name' : 'new room id'}
+              placeholder="new workspace name"
               onChange={e => setNewName(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter' && newName) { onCreateRoom(newName); setNewName(''); setOpen(false); } }}
             />
@@ -324,6 +325,9 @@ function App() {
   const [membersDialogRoomId, setMembersDialogRoomId] = useState(null);
 
   const [customSlices, setCustomSlices] = useState({});
+  // Demo mode has no homeserver to push room renames to, so we keep the
+  // user's chosen names in-memory and merge them into the rooms list.
+  const [demoTitleOverrides, setDemoTitleOverrides] = useState({});
 
   // Derived values needed by hooks below; computed before the auth gate so
   // the hook order is stable across signed-in / signed-out renders.
@@ -357,8 +361,22 @@ function App() {
         id,
         eventCount: byRoom[id].length,
         namespace: 'demo.tasks',
-        title: id.replace(/^!/, '').replace(/_/g, ' '),
+        title: demoTitleOverrides[id] || id.replace(/^!/, '').replace(/_/g, ' '),
       }));
+
+  const lastEventTs = allEvents.length
+    ? allEvents[allEvents.length - 1].origin_server_ts
+    : null;
+
+  async function onRenameCurrentRoom(name) {
+    if (!currentRoomId) return;
+    if (isLive && window.MatrixLive?.renameRoom) {
+      try { await window.MatrixLive.renameRoom(currentRoomId, name); }
+      catch (e) { alert('Rename failed: ' + (e?.message || e)); }
+    } else {
+      setDemoTitleOverrides(o => ({ ...o, [currentRoomId]: name }));
+    }
+  }
 
   async function onEmit(op, content) {
     if (!currentRoomId) return;
@@ -482,6 +500,8 @@ function App() {
           }}
           eventsTotal={total}
           ephemeralsCount={ephemerals.length}
+          onRenameRoom={onRenameCurrentRoom}
+          lastEventTs={lastEventTs}
         />
 
         <div className="view-area">

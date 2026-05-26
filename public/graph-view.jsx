@@ -323,7 +323,7 @@ function GraphView({ room, state, onEmit, scrubber }) {
   return (
     <div className="graph-view">
       <div className="tv-head">
-        <h2>{room.id.replace(/^!/, '').replace(/_/g, ' ')}</h2>
+        <h2>{room.title || 'untitled workspace'}</h2>
         <span className="crumb">{nodes.length} node{nodes.length!==1?'s':''} · {edges.length} edge{edges.length!==1?'s':''}</span>
         <div className="gv-toolbar">
           <button className={mode === 'select' ? 'active' : ''} onClick={() => { setMode('select'); cancelConnect(); }} title="select / drag">select</button>
