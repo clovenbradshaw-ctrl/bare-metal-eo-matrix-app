@@ -88,7 +88,7 @@ function EntityTimelineView({
             <div className="page-hero-eyebrow">
               <span className="page-hero-kind"><span className="page-hero-glyph">⏚</span> timeline</span>
               <span className="page-hero-sep">·</span>
-              <span className="page-hero-crumb">{room.id.replace('!','')}<span className="page-hero-slash">/</span>{entityType}</span>
+              <span className="page-hero-crumb">{room.title || 'workspace'}<span className="page-hero-slash">/</span>{entityType}</span>
             </div>
             <h1 className="page-hero-title">pick a row</h1>
             <div className="page-hero-sub">choose one of the {siblings.length} {entityType} row{siblings.length!==1?'s':''} below to see its event lifeline</div>
@@ -128,7 +128,7 @@ function EntityTimelineView({
           <div className="page-hero-eyebrow">
             <span className="page-hero-kind"><span className="page-hero-glyph">⏚</span> timeline</span>
             <span className="page-hero-sep">·</span>
-            <span className="page-hero-crumb">{room.id.replace('!','')}<span className="page-hero-slash">/</span>{entityType}<span className="page-hero-slash">/</span>{entity._anchor}</span>
+            <span className="page-hero-crumb">{room.title || 'workspace'}<span className="page-hero-slash">/</span>{entityType}<span className="page-hero-slash">/</span>{entity._anchor}</span>
             <button
               className="entity-back"
               onClick={() => setSelection({ kind: 'slice', sliceId: `${entityType}.table`, sliceKind: 'table', tableId: entityType })}

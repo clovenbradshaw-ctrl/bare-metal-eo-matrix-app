@@ -437,7 +437,7 @@ function DbView({ rooms, currentRoomId, setCurrentRoomId, createRoom, eventsUpTo
         <div className={`col ${subview !== 'timeline' ? 'hidden-sub' : ''}`}>
           <div className="col-head">
             <span className="label">Timeline</span>
-            <span className="muted">{room?.id}.timeline · append-only</span>
+            <span className="muted" title={room?.id}>append-only event log</span>
             <span className="meta">{allEvents.length} events</span>
           </div>
           <EphemeralLane ephemerals={ephemerals} />

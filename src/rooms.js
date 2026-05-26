@@ -401,6 +401,28 @@ export async function setMemberPowerLevel(roomId, userId, level) {
 }
 
 /**
+ * Set the human-readable name of a room (m.room.name state event).
+ * Other clients will see the new name on their next sync.
+ */
+export async function setName(roomId, name) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+  await client.setRoomName(roomId, name);
+}
+
+/**
+ * Resolve a user's display name from the SDK's profile cache. Returns
+ * null when no profile is known yet — the caller should fall back to
+ * something readable (e.g. the local part of the MXID).
+ */
+export function getDisplayName(userId) {
+  const client = getClient();
+  if (!client || !userId) return null;
+  const user = client.getUser(userId);
+  return user?.displayName || user?.rawDisplayName || null;
+}
+
+/**
  * Subscribe to membership / power-level changes in a room. The handler
  * is called (with no arguments) whenever m.room.member or
  * m.room.power_levels state events arrive for the given room.
