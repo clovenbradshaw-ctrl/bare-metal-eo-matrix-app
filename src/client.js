@@ -20,6 +20,8 @@ import { vault, sessionKey, rememberLastUser, forgetLastUser } from './vault.js'
 import { wipeAllRoomData } from './store.js';
 import { clearAll as clearOutbox } from './outbox.js';
 import { watchSync } from './network.js';
+import { wipeMediaCache } from './media.js';
+import { wipeManifest } from './roomManifest.js';
 
 let client = null;
 let _watchSyncUnsub = null;
@@ -281,7 +283,9 @@ export async function login(homeserver, username, password) {
       // encrypted data — surface clearly to the caller.
       progress('Vault password mismatch — rotating to current password (local data will be reset)');
       vault.wipe(resp.user_id);
+      wipeManifest(resp.user_id);
       try { await wipeAllRoomData(); } catch {}
+      try { await wipeMediaCache(); } catch {}
       try { await clearOutbox(); } catch {}
       await vault.initialize(resp.user_id, password);
     }
@@ -380,9 +384,10 @@ export async function restoreSession(userId) {
   }
 
   if (sessionExpired) {
-    // Homeserver rejected the saved access token. Drop the dead session
-    // and the (now-stale) client so the caller can do a fresh login
-    // without the user having to manually wipe local data.
+    // The homeserver rejected the saved access token. Drop the blob
+    // (it's dead bytes) but leave the vault, manifest, and OPFS data
+    // intact — caller can either mint a fresh token via mxLogin or
+    // fall back to local-only mode if the network is unreachable.
     try { client.stopClient(); } catch {}
     if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
     client = null;
@@ -410,14 +415,20 @@ export async function unlock(userId, password) {
   const ok = await vault.unlock(userId, password);
   if (!ok) throw new Error('Invalid password');
   rememberLastUser(userId);
-  const hadSavedSession = !!localStorage.getItem(sessionKey(userId));
+
+  // No session blob → vault is unlocked but we have no Matrix token.
+  // Caller must try a fresh online login (and may fall back to
+  // local-only mode if the homeserver is unreachable).
+  if (!localStorage.getItem(sessionKey(userId))) {
+    return { userId, online: false, needsLogin: true };
+  }
+
   const c = await restoreSession(userId);
   if (!c) {
-    // If we had a session blob and restoreSession dropped it, the saved
-    // credentials are no good — tell the caller so they can fall through
-    // to a full online login.
-    const needsLogin = hadSavedSession && !localStorage.getItem(sessionKey(userId));
-    return { userId, online: false, needsLogin };
+    // restoreSession either failed or dropped a rejected token — vault
+    // is still unlocked, so local data is accessible, but the caller
+    // needs to refresh credentials to talk to the server again.
+    return { userId, online: false, needsLogin: true };
   }
   const state = c.getSyncState && c.getSyncState();
   return { userId, online: state === 'PREPARED' || state === 'SYNCING', needsLogin: false };
@@ -452,18 +463,28 @@ export async function logout() {
   }
   if (uid) {
     dropSession(uid);
+    wipeManifest(uid);
     vault.wipe(uid);
   }
   try { await wipeAllRoomData(); } catch {}
+  try { await wipeMediaCache(); } catch {}
   try { await clearOutbox(); } catch {}
   try { await clearCryptoStore(); } catch {}
   forgetLastUser();
 }
 
 /**
- * Does the local device have a saved session + vault for this user?
- * Used to decide between login form and unlock form on boot.
+ * Does the local device have a vault for this user? If true, the
+ * Matrix password can unlock local data even when the homeserver is
+ * unreachable or the saved token has been revoked. The session blob
+ * may or may not still be present; that's the bridge's problem to
+ * sort out.
  */
 export function hasLocalAccount(userId) {
-  return !!localStorage.getItem(sessionKey(userId)) && vault.hasMeta(userId);
+  return vault.hasMeta(userId);
+}
+
+/** Does the user have a usable saved access token? */
+export function hasSavedSession(userId) {
+  return !!localStorage.getItem(sessionKey(userId));
 }

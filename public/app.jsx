@@ -446,12 +446,17 @@ function App() {
         {isLive && currentRoomId && (() => {
           const r = rooms.find(x => x.id === currentRoomId);
           if (!r || r.membership !== 'join') return null;
+          const stale = !!session?.stale;
           return (
-            <button
-              className="topbar-members"
-              onClick={() => setMembersDialogRoomId(currentRoomId)}
-              title="manage members of this space"
-            >members</button>
+            <>
+              <button
+                className="topbar-members"
+                onClick={() => setMembersDialogRoomId(currentRoomId)}
+                title={stale ? 'reconnect to the homeserver to manage members' : 'manage members of this space'}
+                disabled={stale}
+              >members</button>
+              <window.ImportButton roomId={currentRoomId} disabled={stale} />
+            </>
           );
         })()}
         <span className="spacer" />
@@ -565,8 +570,8 @@ function App() {
       <TweakControls
         t={tweaks}
         setTweak={setTweak}
-        onLoadSeed={() => { loadSeed(); setDemoOn(true); setCursor(Infinity); }}
-        onClearAll={() => { clearAll(); setDemoOn(false); setCursor(Infinity); }}
+        onLoadSeed={() => { demoStore.loadSeed(); setDemoOn(true); setCursor(Infinity); }}
+        onClearAll={() => { demoStore.clearAll(); setDemoOn(false); setCursor(Infinity); }}
       />
 
       {membersDialogRoomId && isLive && (() => {

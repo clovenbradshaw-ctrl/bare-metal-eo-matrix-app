@@ -1,32 +1,77 @@
 /**
- * media.js — Large-payload hoisting via Matrix media endpoint
+ * media.js — Encrypted attachments + offline media mirror
  *
- * Matrix room events cap out around 64KB on the wire; after Megolm
- * encryption the practical content budget is ~30KB. When a DEF (or any
- * operator content) carries a value larger than that — a screenshot, a
- * PDF, a long markdown blob — we upload it to the homeserver's media
- * store and replace the inline value with a small mxc:// reference.
+ * All blobs uploaded to the homeserver media store are end-to-end
+ * encrypted with the same trust boundary as the room itself:
  *
- * The reference format is intentionally tagged so the fold can
- * transparently dereference it later:
+ *   - A fresh 256-bit key + 128-bit IV (8 random bytes ‖ 8 counter bytes)
+ *     is generated per blob.
+ *   - The plaintext is AES-CTR encrypted.
+ *   - SHA-256 of the ciphertext is recorded for integrity.
+ *   - The ciphertext goes to /_matrix/media (server sees opaque bytes).
+ *   - The key + iv + hash live inside the room event content, which is
+ *     itself Megolm-encrypted when the event is sent into an E2EE room.
  *
- *   { __media: 1, mxc: "mxc://server/...", mime: "...", size: N, name: "..." }
+ * So: anyone with the room's Megolm session can decrypt the event and
+ * thereby decrypt the blob. The homeserver and any non-member cannot.
  *
- * Media uploads sit OUTSIDE the room E2EE envelope. This module does
- * not implement encrypted-media (m.encrypted file attachments) — that
- * is a follow-up. For now, mark sensitive rooms as such and avoid
- * hoisting confidential blobs into unencrypted media.
+ * The reference format embedded in event content is:
+ *
+ *   { __media: 2, mxc, mime, size, name, file: { v:'v2', key, iv, hashes } }
+ *
+ * Legacy `__media: 1` references (plaintext on the media store, from
+ * an earlier version) are still readable so old events keep working.
+ *
+ * Two layers of at-rest protection apply locally:
+ *   - The plaintext bytes are mirrored to OPFS, vault-encrypted, so
+ *     readers can resolve without contacting the server.
+ *   - The mirror is keyed by mxc URL hash; on logout it is wiped along
+ *     with the rest of the user's local data.
  */
 
 import { getClient } from './client.js';
+import { vault } from './vault.js';
 
-// Soft and hard limits chosen below the Matrix v1.0 cap (65,535 bytes
-// for the serialized event after encryption overhead).
-const HOIST_THRESHOLD = 16 * 1024;       // hoist any string >= 16KB
-const CONTENT_SIZE_LIMIT = 24 * 1024;    // total content target after hoist
+const HOIST_THRESHOLD = 16 * 1024;       // hoist string fields >= 16KB
+const CONTENT_SIZE_LIMIT = 24 * 1024;    // total target after hoist
 const MAX_HOIST_PER_EVENT = 8;
+const IV_BYTES = 16;
+const KEY_BYTES = 32;
+const CACHE_PREFIX = 'media_';
+const CACHE_SUFFIX = '.bin';
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+// ── Encoding helpers ──
+
+function b64Url(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64UrlDecode(str) {
+  const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
+  const bin = atob(str.replace(/-/g, '+').replace(/_/g, '/') + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function b64Unpadded(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/=+$/, '');
+}
+
+function b64UnpaddedDecode(str) {
+  const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
+  const bin = atob(str + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 
 function byteLength(str) {
   return encoder.encode(str).length;
@@ -36,10 +81,210 @@ export function contentSize(content) {
   return byteLength(JSON.stringify(content));
 }
 
+// ── Matrix encrypted attachments (v2) ──
+
+async function aesCtrEncrypt(keyBytes, iv, plaintext) {
+  const key = await crypto.subtle.importKey(
+    'raw', keyBytes, { name: 'AES-CTR' }, false, ['encrypt']
+  );
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-CTR', counter: iv, length: 64 },
+    key, plaintext
+  );
+  return new Uint8Array(ct);
+}
+
+async function aesCtrDecrypt(keyBytes, iv, ciphertext) {
+  const key = await crypto.subtle.importKey(
+    'raw', keyBytes, { name: 'AES-CTR' }, false, ['decrypt']
+  );
+  const pt = await crypto.subtle.decrypt(
+    { name: 'AES-CTR', counter: iv, length: 64 },
+    key, ciphertext
+  );
+  return new Uint8Array(pt);
+}
+
+async function sha256(bytes) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+}
+
 /**
- * Walk a content object; for every string field whose UTF-8 size is
- * above the hoist threshold, upload it to media and replace the value
- * with a media reference. Mutates a copy.
+ * Encrypt `plaintext` with a fresh AES-CTR key. Returns the
+ * ciphertext to upload and the file info envelope to embed in the
+ * Megolm-encrypted event content.
+ */
+export async function encryptAttachment(plaintext) {
+  const keyBytes = crypto.getRandomValues(new Uint8Array(KEY_BYTES));
+  const iv = new Uint8Array(IV_BYTES);
+  // Upper 8 bytes random, lower 8 zero — leaves the 64-bit block counter
+  // free to count up through ciphertext blocks. Matches the spec.
+  crypto.getRandomValues(iv.subarray(0, 8));
+  const ciphertext = await aesCtrEncrypt(keyBytes, iv, plaintext);
+  const digest = await sha256(ciphertext);
+  return {
+    data: ciphertext,
+    info: {
+      v: 'v2',
+      key: {
+        kty: 'oct',
+        alg: 'A256CTR',
+        ext: true,
+        k: b64Url(keyBytes),
+        key_ops: ['encrypt', 'decrypt'],
+      },
+      iv: b64Unpadded(iv),
+      hashes: { sha256: b64Unpadded(digest) },
+    },
+  };
+}
+
+/**
+ * Decrypt a file ciphertext blob using the `file` envelope from a
+ * `__media: 2` reference. Verifies SHA-256 before returning plaintext.
+ */
+export async function decryptAttachment(ciphertext, info) {
+  if (!info || !info.key || !info.key.k || !info.iv || !info.hashes?.sha256) {
+    throw new Error('Missing attachment envelope fields');
+  }
+  const keyBytes = b64UrlDecode(info.key.k);
+  const iv = b64UnpaddedDecode(info.iv);
+  const expected = b64UnpaddedDecode(info.hashes.sha256);
+  const actual = await sha256(ciphertext);
+  if (expected.length !== actual.length) throw new Error('Hash length mismatch');
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected[i] ^ actual[i];
+  if (diff !== 0) throw new Error('Hash mismatch — corrupt or tampered attachment');
+  return aesCtrDecrypt(keyBytes, iv, ciphertext);
+}
+
+// ── OPFS-backed local mirror (vault-encrypted) ──
+
+async function getOpfsRoot() {
+  try { return await navigator.storage.getDirectory(); }
+  catch { return null; }
+}
+
+async function mxcToFileName(mxc) {
+  const digest = await sha256(encoder.encode(mxc));
+  let hex = '';
+  for (let i = 0; i < 16; i++) hex += digest[i].toString(16).padStart(2, '0');
+  return `${CACHE_PREFIX}${hex}${CACHE_SUFFIX}`;
+}
+
+/**
+ * Stash `bytes` in OPFS keyed by `mxc`, encrypted with the vault key.
+ * No-op if OPFS is unavailable or the vault is locked.
+ */
+export async function cacheMediaBytes(mxc, bytes) {
+  if (!mxc || !bytes) return;
+  if (!vault.isUnlocked()) return;
+  const root = await getOpfsRoot();
+  if (!root) return;
+  try {
+    const name = await mxcToFileName(mxc);
+    const handle = await root.getFileHandle(name, { create: true });
+    const blob = await vault.encryptBytes(bytes);
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+  } catch (e) {
+    console.warn('[media] cache write failed:', e?.message || e);
+  }
+}
+
+/**
+ * Read previously-cached bytes for `mxc`. Returns null if absent or
+ * undecryptable. Pure-local — no network.
+ */
+export async function getCachedMediaBytes(mxc) {
+  if (!mxc) return null;
+  if (!vault.isUnlocked()) return null;
+  const root = await getOpfsRoot();
+  if (!root) return null;
+  try {
+    const name = await mxcToFileName(mxc);
+    const handle = await root.getFileHandle(name);
+    const file = await handle.getFile();
+    const blob = new Uint8Array(await file.arrayBuffer());
+    return await vault.decryptBytes(blob);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wipe every cached media blob from OPFS. Called on logout.
+ */
+export async function wipeMediaCache() {
+  const root = await getOpfsRoot();
+  if (!root) return;
+  const toRemove = [];
+  try {
+    for await (const [name] of root) {
+      if (name.startsWith(CACHE_PREFIX) && name.endsWith(CACHE_SUFFIX)) toRemove.push(name);
+    }
+    for (const n of toRemove) { try { await root.removeEntry(n); } catch {} }
+  } catch (e) {
+    console.warn('[media] cache wipe failed:', e?.message || e);
+  }
+}
+
+// ── Upload (encrypted) ──
+
+/**
+ * Encrypt `plaintext`, upload the ciphertext to the homeserver media
+ * store, and mirror the plaintext locally for offline reads. Returns
+ * a `__media: 2` reference suitable for embedding in event content.
+ */
+export async function uploadEncrypted(plaintext, { mime = 'application/octet-stream', name = 'file' } = {}) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected — cannot upload media');
+
+  const bytes = plaintext instanceof Uint8Array ? plaintext : new Uint8Array(plaintext);
+  const { data, info } = await encryptAttachment(bytes);
+
+  // The Matrix media endpoint accepts any MIME; we deliberately send
+  // application/octet-stream for the ciphertext so the server can't
+  // sniff structure.
+  const blob = new Blob([data], { type: 'application/octet-stream' });
+  const resp = await client.uploadContent(blob, {
+    type: 'application/octet-stream',
+    name,
+  });
+  const mxc = resp && resp.content_uri;
+  if (!mxc) throw new Error('Upload returned no content_uri');
+
+  await cacheMediaBytes(mxc, bytes);
+
+  return {
+    __media: 2,
+    mxc,
+    mime,
+    size: bytes.length,
+    name,
+    file: info,
+  };
+}
+
+/**
+ * Convenience: encrypt + upload + cache a user-supplied File / Blob,
+ * preserving its declared MIME type and filename.
+ */
+export async function uploadFile(file, opts = {}) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  return uploadEncrypted(bytes, {
+    mime: opts.mime || file.type || 'application/octet-stream',
+    name: opts.name || file.name || 'file',
+  });
+}
+
+// ── Hoist (sending side) ──
+
+/**
+ * For every string field above the hoist threshold, encrypt + upload
+ * it as an attachment and replace the value with a `__media: 2` ref.
+ * Largest fields first, capped at MAX_HOIST_PER_EVENT.
  */
 export async function hoistLargeFields(content) {
   if (!content || typeof content !== 'object') return { content, hoisted: 0 };
@@ -48,14 +293,11 @@ export async function hoistLargeFields(content) {
   const client = getClient();
   if (!client) return { content, hoisted: 0 };
 
-  // Deep-clone so we never mutate caller's object.
   const out = structuredClone(content);
   let hoisted = 0;
 
   const candidates = [];
   collectCandidates(out, [], candidates);
-
-  // Largest first — gives us the most relief per upload.
   candidates.sort((a, b) => b.size - a.size);
 
   for (const cand of candidates) {
@@ -64,25 +306,13 @@ export async function hoistLargeFields(content) {
 
     try {
       const bytes = encoder.encode(cand.value);
-      const blob = new Blob([bytes], { type: 'application/octet-stream' });
-      const resp = await client.uploadContent(blob, {
-        type: 'application/octet-stream',
+      const ref = await uploadEncrypted(bytes, {
+        mime: 'text/plain;charset=utf-8',
         name: cand.path.join('.') || 'value',
       });
-      const mxc = resp && resp.content_uri;
-      if (!mxc) continue;
-
-      setPath(out, cand.path, {
-        __media: 1,
-        mxc,
-        mime: 'text/plain;charset=utf-8',
-        size: bytes.length,
-        name: cand.path.join('.'),
-      });
+      setPath(out, cand.path, ref);
       hoisted++;
     } catch (e) {
-      // Swallow per-field upload failures and try the next — better to
-      // succeed with partial hoisting than block the whole send.
       console.warn('[media] hoist failed for', cand.path, e?.message || e);
     }
   }
@@ -90,16 +320,55 @@ export async function hoistLargeFields(content) {
   return { content: out, hoisted };
 }
 
+// ── Read (receiving side) ──
+
 /**
- * Resolve mxc media references back to their original strings. Called
- * by readers that want the inline data. Returns content unchanged if
- * nothing needs resolving.
+ * Fetch the plaintext bytes referenced by a `__media` envelope.
+ * Tries the local mirror first; falls back to the homeserver media
+ * store, decrypting if the envelope is v2.
+ *
+ * Returns null when the bytes cannot be obtained (offline + no cache,
+ * or fetch failure).
+ */
+export async function getMediaBytes(ref) {
+  if (!ref || !ref.mxc) return null;
+
+  const cached = await getCachedMediaBytes(ref.mxc);
+  if (cached) return cached;
+
+  const client = getClient();
+  if (!client) return null;
+
+  const url = client.mxcUrlToHttp(ref.mxc, undefined, undefined, undefined, true);
+  if (!url) return null;
+
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const downloaded = new Uint8Array(await resp.arrayBuffer());
+    let plaintext;
+    if (ref.__media === 2 && ref.file) {
+      plaintext = await decryptAttachment(downloaded, ref.file);
+    } else {
+      // Legacy plaintext upload.
+      plaintext = downloaded;
+    }
+    await cacheMediaBytes(ref.mxc, plaintext);
+    return plaintext;
+  } catch (e) {
+    console.warn('[media] download failed:', e?.message || e);
+    return null;
+  }
+}
+
+/**
+ * Walk `content`, replacing every `__media` ref with the dereferenced
+ * value. v2 refs are interpreted as text by default (matches the
+ * hoist source). Callers that need raw bytes for a specific ref
+ * should use `getMediaBytes` directly.
  */
 export async function resolveMediaReferences(content) {
   if (!content || typeof content !== 'object') return content;
-  const client = getClient();
-  if (!client) return content;
-
   const out = structuredClone(content);
   const refs = [];
   collectMediaRefs(out, [], refs);
@@ -107,12 +376,9 @@ export async function resolveMediaReferences(content) {
 
   for (const r of refs) {
     try {
-      const url = client.mxcUrlToHttp(r.ref.mxc, undefined, undefined, undefined, true);
-      if (!url) continue;
-      const resp = await fetch(url);
-      if (!resp.ok) continue;
-      const text = await resp.text();
-      setPath(out, r.path, text);
+      const bytes = await getMediaBytes(r.ref);
+      if (!bytes) continue;
+      setPath(out, r.path, decoder.decode(bytes));
     } catch (e) {
       console.warn('[media] resolve failed for', r.path, e?.message || e);
     }
@@ -127,21 +393,19 @@ function collectCandidates(node, path, out) {
     return;
   }
   if (node && typeof node === 'object') {
-    for (const k of Object.keys(node)) {
-      collectCandidates(node[k], [...path, k], out);
-    }
+    // Don't descend into existing media refs — they're already hoisted.
+    if (node.__media) return;
+    for (const k of Object.keys(node)) collectCandidates(node[k], [...path, k], out);
   }
 }
 
 function collectMediaRefs(node, path, out) {
   if (node && typeof node === 'object') {
-    if (node.__media === 1 && typeof node.mxc === 'string') {
+    if ((node.__media === 1 || node.__media === 2) && typeof node.mxc === 'string') {
       out.push({ path: [...path], ref: node });
       return;
     }
-    for (const k of Object.keys(node)) {
-      collectMediaRefs(node[k], [...path, k], out);
-    }
+    for (const k of Object.keys(node)) collectMediaRefs(node[k], [...path, k], out);
   }
 }
 

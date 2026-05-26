@@ -16,7 +16,7 @@
  * rooms with `room_type === 'eo.workspace'` — the user's other Matrix
  * rooms (DMs, etc.) are hidden by design.
  */
-import { login as mxLogin, unlock as mxUnlock, lock as lockSession,
+import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
          setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, getNamespace,
@@ -31,6 +31,8 @@ import { vault, getLastUser } from './vault.js';
 import { OutboxFlusher, listAll as outboxListAll, pendingCount,
          onChange as onOutboxChange, remove as outboxRemove } from './outbox.js';
 import { onNetworkChange, getNetworkState } from './network.js';
+import { uploadFile as mediaUploadFile, getMediaBytes } from './media.js';
+import { loadManifest, saveManifest } from './roomManifest.js';
 
 const NAMESPACE = 'io.matrix-events';
 const ROOM_TYPE = 'eo.workspace';
@@ -50,6 +52,14 @@ let unsubRoomChanges = null;
 let netState = 'offline';
 let activeSession = null;               // { mxid, homeserver, device_id, ... }
 let progressLog = [];                   // ring buffer of recent log lines
+
+// In-memory mirror of the persisted room manifest. Lets `listRooms`
+// return something useful when the SDK hasn't synced yet (offline boot,
+// stale token). Refreshed from live data whenever the SDK delivers
+// rooms, and persisted on change.
+let roomManifest = [];
+let roomManifestKey = '';
+let manifestSaveTimer = null;
 
 function logProgress(msg) {
   progressLog.push({ ts: Date.now(), msg });
@@ -143,10 +153,15 @@ async function loginWithMatrix({ homeserver, username, password }) {
   }
 
   logProgress('Signing in…');
-  // If we already have a local account for this user, prefer offline-capable unlock.
+
+  // If we already have a vault for this user, prefer offline-capable unlock.
+  // After this attempt, `vaultUnlockedForUser` tells us whether the password
+  // was correct against local data — even if the server can't be reached.
+  let vaultUnlockedForUser = false;
   if (hasLocalAccount(user)) {
     try {
       const { online, needsLogin } = await mxUnlock(user, password);
+      vaultUnlockedForUser = vault.isUnlocked() && vault.getUserId() === user;
       if (!needsLogin) {
         logProgress(online ? 'Unlocked (online)' : 'Unlocked (offline)');
         return await afterAuth(user, hs);
@@ -157,20 +172,24 @@ async function loginWithMatrix({ homeserver, username, password }) {
     }
   }
 
-  const { userId } = await mxLogin(hs, user, password);
-  return await afterAuth(userId, hs);
+  try {
+    const { userId } = await mxLogin(hs, user, password);
+    return await afterAuth(userId, hs);
+  } catch (e) {
+    // Couldn't reach the homeserver (or it refused). If the vault is
+    // already unlocked for this user, the password is correct against
+    // local data — enter local-only mode so they can read what's on
+    // disk and queue edits until the homeserver is reachable.
+    if (vaultUnlockedForUser) {
+      logProgress(`Couldn't reach homeserver (${e.message}); continuing in local-only mode`);
+      return await afterAuthStale(user, hs);
+    }
+    throw e;
+  }
 }
 
-async function afterAuth(userId, homeserver) {
-  activeSession = {
-    mxid: userId,
-    homeserver,
-    device_id: getClient()?.getDeviceId?.() || null,
-    signed_in_at: Date.now(),
-  };
-
-  if (outboxFlusher) outboxFlusher.stop();
-  outboxFlusher = new OutboxFlusher({
+function makeOutboxFlusher() {
+  return new OutboxFlusher({
     getClient,
     onAck: ({ localId, eventId }) => { sentEventToLocalId.set(eventId, localId); },
     onProgress: (e) => {
@@ -185,14 +204,88 @@ async function afterAuth(userId, homeserver) {
       }
     },
   });
+}
+
+async function afterAuth(userId, homeserver) {
+  const liveClient = getClient();
+  activeSession = {
+    mxid: userId,
+    homeserver: liveClient?.getHomeserverUrl?.() || homeserver,
+    device_id: liveClient?.getDeviceId?.() || null,
+    signed_in_at: Date.now(),
+    stale: false,
+  };
+
+  if (outboxFlusher) outboxFlusher.stop();
+  outboxFlusher = makeOutboxFlusher();
   outboxFlusher.start();
 
   if (unsubRoomChanges) unsubRoomChanges();
-  unsubRoomChanges = onRoomChanges(() => notify('rooms'));
+  unsubRoomChanges = onRoomChanges(() => {
+    refreshManifestFromLive();
+    notify('rooms');
+  });
+
+  // Prime the manifest cache from disk so listRooms() has something to
+  // return immediately, even before the first sync completes.
+  roomManifest = await loadManifest(userId);
+  roomManifestKey = JSON.stringify(roomManifest);
+  refreshManifestFromLive();
 
   await hydratePendingFromOutbox();
   notify('session');
   return activeSession;
+}
+
+/**
+ * "Stale" session: vault is unlocked for `userId`, but the Matrix
+ * client is not connected (no token, or homeserver unreachable). The
+ * user can read OPFS-cached events + media and queue edits to the
+ * outbox; the flusher will drain when a fresh login restores the
+ * client.
+ */
+async function afterAuthStale(userId, homeserver) {
+  activeSession = {
+    mxid: userId,
+    homeserver,
+    device_id: null,
+    signed_in_at: Date.now(),
+    stale: true,
+  };
+
+  if (outboxFlusher) outboxFlusher.stop();
+  outboxFlusher = makeOutboxFlusher();
+  outboxFlusher.start();  // kick() is a no-op until getClient() comes back
+
+  if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
+
+  roomManifest = await loadManifest(userId);
+  roomManifestKey = JSON.stringify(roomManifest);
+
+  await hydratePendingFromOutbox();
+  notify('session');
+  return activeSession;
+}
+
+function refreshManifestFromLive() {
+  const userId = activeSession?.mxid;
+  if (!userId) return;
+  const live = discoverRooms(ROOM_TYPE);
+  if (live.length === 0) return;
+  const snapshot = live.map(r => ({
+    roomId: r.roomId,
+    name: r.name || null,
+    roomType: r.roomType || null,
+    membership: r.membership || 'join',
+  }));
+  const key = JSON.stringify(snapshot);
+  if (key === roomManifestKey) return;
+  roomManifest = snapshot;
+  roomManifestKey = key;
+  if (manifestSaveTimer) clearTimeout(manifestSaveTimer);
+  manifestSaveTimer = setTimeout(() => {
+    saveManifest(userId, snapshot).catch(e => console.warn('[bridge] manifest save failed:', e));
+  }, 500);
 }
 
 async function hydratePendingFromOutbox() {
@@ -219,42 +312,79 @@ async function hydratePendingFromOutbox() {
   }
 }
 
-async function unlockOnly(userId, password) {
-  await mxUnlock(userId, password);
-  const hs = getClient()?.getHomeserverUrl?.() || '';
-  return afterAuth(userId, hs);
+/**
+ * Re-attempt a full online login from local-only mode. Preserves the
+ * vault, manifest, OPFS data, and outbox — just mints a fresh access
+ * token and restarts sync. Throws if the password is wrong or the
+ * homeserver still can't be reached.
+ */
+async function reconnect(password) {
+  if (!activeSession || !activeSession.stale) {
+    throw new Error('Not in local-only mode');
+  }
+  const userId = activeSession.mxid;
+  const hs = activeSession.homeserver || '';
+  if (!hs) throw new Error('No saved homeserver — sign out and back in');
+  logProgress('Reconnecting…');
+  const { userId: refreshedId } = await mxLogin(hs, userId, password);
+  return await afterAuth(refreshedId, hs);
 }
 
 async function logout() {
   if (outboxFlusher) { outboxFlusher.stop(); outboxFlusher = null; }
   if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
+  if (manifestSaveTimer) { clearTimeout(manifestSaveTimer); manifestSaveTimer = null; }
   for (const [, fns] of roomUnsubs) fns.forEach(fn => { try { fn(); } catch {} });
   roomUnsubs.clear();
   roomStores.clear();
   roomEvents.clear();
   pendingByLocalId.clear();
   sentEventToLocalId.clear();
+  roomManifest = [];
+  roomManifestKey = '';
   await mxLogout();
   activeSession = null;
   notify('session');
 }
 
 // ── Rooms — filtered to ROOM_TYPE only ──
+//
+// When the SDK has rooms (sync ran), they're the source of truth and
+// the manifest is refreshed from them. When the SDK is empty (cold
+// offline boot, stale token), the manifest fills in so the user can
+// still see the rooms they had before.
 function listRooms() {
-  const rooms = discoverRooms(ROOM_TYPE);
-  return rooms.map(r => ({
+  const live = discoverRooms(ROOM_TYPE);
+  if (live.length > 0) {
+    refreshManifestFromLive();
+    return live.map(r => ({
+      id: r.roomId,
+      name: r.name,
+      eventCount: roomEvents.get(r.roomId)?.length || 0,
+      namespace: NAMESPACE,
+      title: r.name,
+      membership: r.membership,
+      roomType: r.roomType,
+      inviter: r.inviter,
+    }));
+  }
+  return roomManifest.map(r => ({
     id: r.roomId,
     name: r.name,
     eventCount: roomEvents.get(r.roomId)?.length || 0,
     namespace: NAMESPACE,
     title: r.name,
-    membership: r.membership,
+    membership: r.membership || 'join',
     roomType: r.roomType,
-    inviter: r.inviter,
+    inviter: null,
+    offlineCache: true,
   }));
 }
 
 async function createWorkspace(name) {
+  if (!getClient()) {
+    throw new Error('Local-only mode — connect to the homeserver to create spaces');
+  }
   const cleanName = String(name || '').trim() || 'space';
   const roomId = await mxCreateRoom(cleanName, ROOM_TYPE);
   logProgress(`Created space: ${cleanName}`);
@@ -303,40 +433,49 @@ async function openRoom(roomId) {
     }
   }
 
+  // Without a Matrix client (local-only mode) we can't subscribe to
+  // live events. The OPFS-loaded history above is still served to the
+  // UI; new edits queue in the outbox and flush when the client returns.
   const fns = [];
-  fns.push(onTimeline(roomId, async (event) => {
-    if (isOwnLocalEcho(event)) return;
-    const added = await store.append([event]);
-    if (added.length > 0) {
-      const plain = added.map(toPlain).filter(isOpEvent);
-      const cur = roomEvents.get(roomId) || [];
-      roomEvents.set(roomId, cur.concat(plain));
-      notify('events');
+  if (client) {
+    try {
+      fns.push(onTimeline(roomId, async (event) => {
+        if (isOwnLocalEcho(event)) return;
+        const added = await store.append([event]);
+        if (added.length > 0) {
+          const plain = added.map(toPlain).filter(isOpEvent);
+          const cur = roomEvents.get(roomId) || [];
+          roomEvents.set(roomId, cur.concat(plain));
+          notify('events');
+        }
+      }));
+      fns.push(onDecrypted(roomId, async (event) => {
+        if (isOwnLocalEcho(event)) return;
+        const added = await store.append([event]);
+        if (added.length > 0) {
+          const plain = added.map(toPlain).filter(isOpEvent);
+          const cur = roomEvents.get(roomId) || [];
+          roomEvents.set(roomId, cur.concat(plain));
+          notify('events');
+        }
+      }));
+      fns.push(onLocalEchoUpdated(roomId, async (event) => {
+        if (event.status === EventStatus.SENT) {
+          const added = await store.append([event]);
+          if (added.length > 0) {
+            const plain = added.map(toPlain).filter(isOpEvent);
+            const cur = roomEvents.get(roomId) || [];
+            roomEvents.set(roomId, cur.concat(plain));
+          }
+          reconcilePendingByTxn(event);
+          notify('events');
+        }
+      }));
+      fns.push(onMembersChange(roomId, () => notify('members')));
+    } catch (e) {
+      logProgress(`Subscribe ${roomId}: ${e.message}`);
     }
-  }));
-  fns.push(onDecrypted(roomId, async (event) => {
-    if (isOwnLocalEcho(event)) return;
-    const added = await store.append([event]);
-    if (added.length > 0) {
-      const plain = added.map(toPlain).filter(isOpEvent);
-      const cur = roomEvents.get(roomId) || [];
-      roomEvents.set(roomId, cur.concat(plain));
-      notify('events');
-    }
-  }));
-  fns.push(onLocalEchoUpdated(roomId, async (event) => {
-    if (event.status === EventStatus.SENT) {
-      const added = await store.append([event]);
-      if (added.length > 0) {
-        const plain = added.map(toPlain).filter(isOpEvent);
-        const cur = roomEvents.get(roomId) || [];
-        roomEvents.set(roomId, cur.concat(plain));
-      }
-      reconcilePendingByTxn(event);
-      notify('events');
-    }
-  }));
-  fns.push(onMembersChange(roomId, () => notify('members')));
+  }
   roomUnsubs.set(roomId, fns);
 }
 
@@ -390,6 +529,53 @@ async function emit(roomId, op, content) {
   }
 }
 
+// ── File import ──
+//
+// Encrypt the file in the browser, upload the ciphertext to the
+// homeserver's media store, mirror the plaintext locally for offline
+// reads, and emit timeline events that point to the blob. The
+// decryption key travels inside the Megolm-encrypted event content,
+// so the homeserver only ever sees opaque bytes.
+//
+// Default layout: an `import` entity with the file ref + metadata.
+// Callers can override the entity type and add extra DEFs via opts.
+async function importFileToRoom(roomId, file, opts = {}) {
+  if (!roomId) throw new Error('importFileToRoom needs a roomId');
+  if (!file) throw new Error('importFileToRoom needs a file');
+  if (!getClient()) {
+    throw new Error('Offline — file imports need a live homeserver connection');
+  }
+
+  const entityType = opts.entityType || 'import';
+  const displayName = opts.name || file.name || 'file';
+
+  logProgress(`Uploading ${displayName} (${file.size} bytes)…`);
+  const ref = await mediaUploadFile(file, { name: displayName });
+  logProgress(`Uploaded ${displayName} → ${ref.mxc}`);
+
+  const payload = {
+    name: displayName,
+    size: ref.size,
+    mime: ref.mime,
+    ...(opts.payload || {}),
+  };
+  const anchor = await ins(roomId, entityType, payload);
+  await def(roomId, anchor, 'file', ref);
+  await def(roomId, anchor, 'imported_at', new Date().toISOString());
+
+  notify('events');
+  return { anchor, ref };
+}
+
+/**
+ * Read the bytes referenced by a `__media` envelope. Tries the local
+ * (vault-encrypted) mirror first, then falls back to the homeserver
+ * media store (decrypting if needed). Returns null when unavailable.
+ */
+async function readMedia(ref) {
+  return await getMediaBytes(ref);
+}
+
 async function inviteUser(roomId, userId) {
   await invite(roomId, userId);
   notify('members');
@@ -432,23 +618,28 @@ window.MatrixLive = {
   NAMESPACE, ROOM_TYPE,
   // Auth
   login: loginWithMatrix,
-  unlock: unlockOnly,
+  reconnect,
   logout,
   hasLocalAccount,
   getLastUser,
   getSession: () => activeSession,
   isAuthed: () => !!activeSession,
+  isStale: () => !!(activeSession && activeSession.stale),
   // Rooms
   listRooms,
   createRoom: createWorkspace,
   joinRoom,
   openRoom,
   getEventsForRoom,
+  emit,
   inviteUser,
   kickUser,
   setUserPowerLevel,
   membersOf,
   myPowerLevelIn,
+  // File import / media
+  importFile: importFileToRoom,
+  readMedia,
   // Net status
   getNetwork: () => netState,
   getSyncState: () => getClient()?.getSyncState?.() || null,
