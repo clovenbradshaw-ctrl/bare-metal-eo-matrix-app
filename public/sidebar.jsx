@@ -413,11 +413,6 @@ function Sidebar({
         </button>
       </div>
 
-      <div className="sb-foot">
-        <div className="sb-foot-line">events · <b>{eventsTotal}</b></div>
-        <div className="sb-foot-line muted">projections are views of the same log</div>
-      </div>
-
       {projectionFor && (
         <NewProjectionModal
           set={projectionFor}
