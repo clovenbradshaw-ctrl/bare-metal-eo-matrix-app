@@ -13,7 +13,7 @@
  * for older sessions.
  */
 
-const CACHE_NAME = 'matrix-events-shell-v1';
+const CACHE_NAME = 'matrix-events-shell-v2';
 const CORE_ASSETS = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (event) => {

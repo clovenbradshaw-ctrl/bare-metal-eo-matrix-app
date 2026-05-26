@@ -247,6 +247,104 @@ function dropSession(userId) {
 
 // ── Public API ──
 
+/**
+ * Register a new account on the homeserver, then complete login.
+ * Uses the m.login.dummy stage (open registration). Servers that
+ * require recaptcha/email/sso reject this with a 401 listing the
+ * required flows — we surface that as an error so the user can
+ * try a different server.
+ */
+export async function register(homeserver, username, password) {
+  const user = username.replace(/^@/, '').split(':')[0];
+
+  progress('Resolving homeserver…');
+  const baseUrl = await discoverBaseUrl(homeserver, username);
+  progress(`Using ${baseUrl}`);
+
+  const tmp = sdk.createClient({ baseUrl });
+
+  progress('Requesting registration flows…');
+  let session;
+  try {
+    await withTimeout(tmp.registerRequest({
+      username: user,
+      password,
+      auth: {},
+      initial_device_display_name: 'Matrix Events',
+    }), 30000, 'Register flow probe');
+  } catch (e) {
+    const data = e.data || {};
+    session = data.session;
+    const flows = data.flows || [];
+    const allStages = new Set(flows.flatMap(f => f.stages || []));
+    const dummyOnly = flows.some(f =>
+      (f.stages || []).every(s => s === 'm.login.dummy'));
+    if (!dummyOnly) {
+      const stageList = [...allStages].join(', ') || 'unknown';
+      throw new Error(`This homeserver requires extra signup steps (${stageList}) — try a different server or sign in instead.`);
+    }
+  }
+
+  progress('Creating account…');
+  let resp;
+  try {
+    resp = await withTimeout(tmp.registerRequest({
+      username: user,
+      password,
+      auth: { type: 'm.login.dummy', session },
+      initial_device_display_name: 'Matrix Events',
+    }), 30000, 'Register');
+  } catch (e) {
+    const code = e.errcode || (e.data && e.data.errcode);
+    if (code === 'M_USER_IN_USE') throw new Error('That username is already taken on this server.');
+    if (code === 'M_INVALID_USERNAME') throw new Error('Invalid username — lowercase letters, digits, and ._=- only.');
+    if (code === 'M_WEAK_PASSWORD') throw new Error('Password too weak — try at least 12 characters.');
+    if (code === 'M_FORBIDDEN') throw new Error('This server does not allow new registrations.');
+    throw new Error(e.message || 'Registration failed');
+  }
+
+  progress(`Registered ${resp.user_id}`);
+
+  if (!vault.hasMeta(resp.user_id)) {
+    progress('Initializing local vault…');
+    await vault.initialize(resp.user_id, password);
+  }
+  rememberLastUser(resp.user_id);
+
+  await persistSession(resp.user_id, {
+    baseUrl,
+    accessToken: resp.access_token,
+    userId: resp.user_id,
+    deviceId: resp.device_id,
+  });
+
+  client = sdk.createClient({
+    baseUrl,
+    accessToken: resp.access_token,
+    userId: resp.user_id,
+    deviceId: resp.device_id,
+    cryptoCallbacks: { getSecretStorageKey },
+  });
+
+  progress('Initializing encryption…');
+  await initCryptoWithRetry(client);
+
+  progress('Starting sync…');
+  await client.startClient({ initialSyncLimit: 100 });
+  if (_watchSyncUnsub) _watchSyncUnsub();
+  _watchSyncUnsub = watchSync(client);
+  await waitForSync(client);
+  progress('Sync ready');
+
+  try {
+    await ensureEncryptionSetUp({ userMxid: resp.user_id, password });
+  } catch (e) {
+    progress(`Encryption setup failed: ${e.message}`);
+  }
+
+  return { client, userId: resp.user_id, deviceId: resp.device_id };
+}
+
 export async function login(homeserver, username, password) {
   const user = username.replace(/^@/, '').split(':')[0];
 
