@@ -5,8 +5,12 @@ const { useState, useMemo, useEffect, useRef } = React;
 const ME = window.MatrixEngine;
 
 // ─────────────────────────────────────────────────────────────────────────
-// In-memory event store
+// In-memory event store · persisted for the demo session so spaces and
+// edits survive a reload (the real Matrix path persists on its own via
+// OPFS + the homeserver).
 // ─────────────────────────────────────────────────────────────────────────
+
+const DEMO_STORE_KEY = 'matrix-events.demo.store.v1';
 
 function buildSeedMap() {
   const seed = ME.seedData();
@@ -20,8 +24,32 @@ function buildSeedMap() {
   return map;
 }
 
+function loadDemoStore() {
+  try {
+    const raw = localStorage.getItem(DEMO_STORE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || !parsed.byRoom) return null;
+    return parsed;
+  } catch { return null; }
+}
+
+function saveDemoStore(byRoom, titleOverrides) {
+  try {
+    localStorage.setItem(DEMO_STORE_KEY, JSON.stringify({ byRoom, titleOverrides }));
+  } catch {}
+}
+
+function clearDemoStore() {
+  try { localStorage.removeItem(DEMO_STORE_KEY); } catch {}
+}
+
 function useEventStore(initialDemo) {
-  const [byRoom, setByRoom] = useState(() => initialDemo ? buildSeedMap() : { '!scratch': [] });
+  const [byRoom, setByRoom] = useState(() => {
+    const saved = loadDemoStore();
+    if (saved) return saved.byRoom;
+    return initialDemo ? buildSeedMap() : { '!scratch': [] };
+  });
   const counterRef = useRef(1000);
 
   function emit(roomId, op, content, sender) {
@@ -47,9 +75,153 @@ function useEventStore(initialDemo) {
 
   function clearAll() {
     setByRoom({ '!scratch': [] });
+    clearDemoStore();
   }
 
   return { byRoom, setByRoom, emit, createRoom, loadSeed, clearAll };
+}
+
+// Title overrides for demo spaces (rename in demo mode has no homeserver
+// to write to, so we keep the user's chosen name locally and persist it).
+function useDemoTitleOverrides() {
+  const [overrides, setOverrides] = useState(() => {
+    const saved = loadDemoStore();
+    return (saved && saved.titleOverrides) || {};
+  });
+  return [overrides, setOverrides];
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Workspaces home — what you see right after signing in. Lists every
+// space as a card; you pick one to enter, or create a new one. No data
+// editing happens here, by design: this is the launchpad.
+// ─────────────────────────────────────────────────────────────────────────
+
+function WorkspacesHome({
+  session, rooms, isLive, syncReady,
+  onEnter, onCreate, onSignOut, onAcceptInvite,
+}) {
+  const [newName, setNewName] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [err, setErr] = useState(null);
+  const inputRef = useRef(null);
+
+  const demo = !!session?.demo;
+  const stale = !demo && !!session?.stale;
+  const myLocal = (session?.mxid || '').replace(/^@/, '').split(':')[0];
+
+  // Show a "loading" placeholder while a real Matrix sync is still warming
+  // up — otherwise we briefly flash "no spaces yet" before rooms arrive.
+  const loading = isLive && !syncReady && rooms.length === 0;
+
+  async function handleCreate() {
+    const name = newName.trim();
+    if (!name) return;
+    setErr(null);
+    setCreating(true);
+    try {
+      await onCreate(name);
+      setNewName('');
+    } catch (e) {
+      setErr(e?.message || 'could not create space');
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <div className="wh-shell">
+      <div className="wh-topbar">
+        <div className="wh-brand">
+          <span className="wh-brand-mark">▦</span>
+          <span>workspace</span>
+        </div>
+        <span className="wh-spacer" />
+        <window.IdentityChip session={session} onSignOut={onSignOut} />
+      </div>
+
+      <div className="wh-body">
+        <div className="wh-hero">
+          <div className="wh-greeting">
+            welcome{myLocal ? `, ${myLocal}` : ''}
+          </div>
+          <div className="wh-tagline">
+            {loading
+              ? 'loading your spaces from the homeserver…'
+              : rooms.length > 0
+                ? 'pick a space to enter, or start a new one.'
+                : demo
+                  ? 'create your first space — it will be saved locally in this browser.'
+                  : stale
+                    ? 'local-only mode — these are the spaces cached on this device.'
+                    : 'create your first space to get started.'}
+          </div>
+          {stale && (
+            <div className="wh-stale-hint">
+              you are offline / local-only. reconnect from the menu above to sync changes.
+            </div>
+          )}
+        </div>
+
+        {loading ? (
+          <div className="wh-loading">…</div>
+        ) : (
+          <div className="wh-grid">
+            {rooms.map(r => {
+              const title = r.title || 'untitled space';
+              const initial = (title[0] || '?').toUpperCase();
+              const isInvite = r.membership === 'invite';
+              return (
+                <button
+                  key={r.id}
+                  className={`wh-card ${isInvite ? 'wh-card-invite' : ''}`}
+                  onClick={() => isInvite ? onAcceptInvite?.(r.id) : onEnter(r.id)}
+                  title={r.id}
+                >
+                  <span className="wh-card-sigil">{initial}</span>
+                  <span className="wh-card-name">{title}</span>
+                  <span className="wh-card-meta">
+                    {isInvite
+                      ? `invite${r.inviter ? ` from ${r.inviter}` : ''}`
+                      : r.eventCount > 0
+                        ? `${r.eventCount} events`
+                        : 'empty'}
+                  </span>
+                  {isInvite && <span className="wh-card-action">accept →</span>}
+                </button>
+              );
+            })}
+
+            <div className="wh-card wh-card-new">
+              <span className="wh-card-sigil wh-card-sigil-new">+</span>
+              <div className="wh-new-form">
+                <input
+                  ref={inputRef}
+                  className="wh-new-input"
+                  value={newName}
+                  placeholder="name a new space"
+                  onChange={e => setNewName(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') handleCreate(); }}
+                  disabled={creating || stale}
+                />
+                <button
+                  className="wh-new-btn"
+                  onClick={handleCreate}
+                  disabled={!newName.trim() || creating || stale}
+                >
+                  {creating ? 'creating…' : 'create'}
+                </button>
+              </div>
+              {stale && (
+                <span className="wh-card-meta">reconnect to create new spaces</span>
+              )}
+              {err && <span className="wh-card-err">{err}</span>}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -272,48 +444,20 @@ function App() {
   const byRoom = dataSource.byRoom;
   const roomIds = Object.keys(byRoom);
 
-  // Initialise/repair currentRoomId when the source changes.
+  // Drop a stale currentRoomId if the underlying source no longer has
+  // that room (e.g. demo data cleared, room deleted on another device).
+  // We deliberately do NOT auto-select a room — landing on the welcome
+  // screen is the desired flow.
   useEffect(() => {
     if (!session) return;
-    if (!currentRoomId || !byRoom[currentRoomId]) {
-      setCurrentRoomId(roomIds[0] || null);
+    if (currentRoomId && !byRoom[currentRoomId]) {
+      setCurrentRoomId(null);
     }
   }, [session, isLive, roomIds.join('|')]);
 
-  // For a freshly signed-in real Matrix user with no spaces, auto-create
-  // a starter "new space" so the workbench has somewhere to land. We
-  // wait for the sync to actually be PREPARED/SYNCING before declaring
-  // "no spaces" — otherwise we race the homeserver delivering rooms the
-  // user already created on another device.
-  const bootstrapAttemptedRef = useRef(false);
   const syncReady = isLive && window.MatrixLive
     ? ['PREPARED', 'SYNCING'].includes(window.MatrixLive.getSyncState?.())
     : false;
-  useEffect(() => {
-    if (!isLive || !session || !window.MatrixLive) return;
-    if (bootstrapAttemptedRef.current) return;
-    if (!syncReady) return;
-    if (roomIds.length > 0) {
-      bootstrapAttemptedRef.current = true;
-      return;
-    }
-    bootstrapAttemptedRef.current = true;
-    (async () => {
-      try {
-        const id = await liveStore.createRoom('new space');
-        setCurrentRoomId(id);
-      } catch (e) {
-        console.warn('[app] auto-create new space failed:', e);
-        bootstrapAttemptedRef.current = false; // allow another attempt
-      }
-    })();
-  }, [isLive, session, roomIds.length, syncReady]);
-
-  // Drop the auto-create guard when the user signs out so the next sign-in
-  // can bootstrap again if needed.
-  useEffect(() => {
-    if (!session) bootstrapAttemptedRef.current = false;
-  }, [session]);
 
   const [selection, setSelection] = useState({ kind: 'slice', sliceId: 'task.table', tableId: 'task', sliceKind: 'table' });
   const [cursor, setCursor] = useState(Infinity);
@@ -327,7 +471,14 @@ function App() {
   const [customSlices, setCustomSlices] = useState({});
   // Demo mode has no homeserver to push room renames to, so we keep the
   // user's chosen names in-memory and merge them into the rooms list.
-  const [demoTitleOverrides, setDemoTitleOverrides] = useState({});
+  const [demoTitleOverrides, setDemoTitleOverrides] = useDemoTitleOverrides();
+
+  // Persist demo edits — the in-memory event store and title overrides —
+  // so signing back in later still shows the spaces you made.
+  useEffect(() => {
+    if (isLive) return; // real Matrix persists on its own (OPFS + server)
+    saveDemoStore(demoStore.byRoom, demoTitleOverrides);
+  }, [isLive, demoStore.byRoom, demoTitleOverrides]);
 
   // Derived values needed by hooks below; computed before the auth gate so
   // the hook order is stable across signed-in / signed-out renders.
@@ -349,8 +500,21 @@ function App() {
     if (isLive && window.MatrixLive) {
       try { await window.MatrixLive.logout(); } catch (e) { console.warn('[app] logout failed:', e); }
     }
+    // Demo data is kept on disk on sign-out — the user can come back to
+    // their spaces later. Use the "Clear all" tweak to nuke it explicitly.
     setSession(null);
     setCurrentRoomId(null);
+  }
+
+  async function handleAcceptInvite(roomId) {
+    if (!isLive || !window.MatrixLive?.joinRoom) return;
+    try {
+      await window.MatrixLive.joinRoom(roomId);
+      setCurrentRoomId(roomId);
+    } catch (e) {
+      console.warn('[app] accept invite failed:', e);
+      alert('Accept invite failed: ' + (e?.message || e));
+    }
   }
 
   const ts = effectiveCursor > 0 ? allEvents[effectiveCursor - 1].origin_server_ts : null;
@@ -398,18 +562,20 @@ function App() {
 
   async function onCreateRoom(name) {
     if (isLive) {
-      try {
-        const roomId = await liveStore.createRoom(name);
-        setCurrentRoomId(roomId);
-      } catch (e) {
-        console.warn('[app] create room failed:', e);
-        alert('Create space failed: ' + (e?.message || e));
-      }
-    } else {
-      const id = name.startsWith('!') ? name : `!${name}`;
-      demoStore.createRoom(id);
-      setCurrentRoomId(id);
+      const roomId = await liveStore.createRoom(name);
+      setCurrentRoomId(roomId);
+      return roomId;
     }
+    // Demo: derive a room id from the name, dedupe against existing rooms,
+    // and stash the user's chosen display name as a title override.
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'space';
+    let id = `!${slug}`;
+    let n = 2;
+    while (demoStore.byRoom[id]) { id = `!${slug}_${n++}`; }
+    demoStore.createRoom(id);
+    setDemoTitleOverrides(o => ({ ...o, [id]: name }));
+    setCurrentRoomId(id);
+    return id;
   }
 
   function toggleDemo() {
@@ -440,6 +606,23 @@ function App() {
     />
   );
 
+  // No room selected → show the launchpad. This is the post-login default,
+  // and the place users return to when they click "← spaces" inside a space.
+  if (!currentRoomId) {
+    return (
+      <WorkspacesHome
+        session={session}
+        rooms={rooms}
+        isLive={isLive}
+        syncReady={syncReady}
+        onEnter={(id) => setCurrentRoomId(id)}
+        onCreate={onCreateRoom}
+        onSignOut={handleSignOut}
+        onAcceptInvite={handleAcceptInvite}
+      />
+    );
+  }
+
   return (
     <div className="shell">
       <div className="topbar">
@@ -447,6 +630,11 @@ function App() {
           session={session}
           onSignOut={handleSignOut}
         />
+        <button
+          className="topbar-spaces"
+          onClick={() => setCurrentRoomId(null)}
+          title="back to your spaces"
+        >← spaces</button>
         <RoomPicker
           rooms={rooms}
           currentRoomId={currentRoomId}
@@ -601,7 +789,13 @@ function App() {
         t={tweaks}
         setTweak={setTweak}
         onLoadSeed={() => { demoStore.loadSeed(); setDemoOn(true); setCursor(Infinity); }}
-        onClearAll={() => { demoStore.clearAll(); setDemoOn(false); setCursor(Infinity); }}
+        onClearAll={() => {
+          demoStore.clearAll();
+          setDemoTitleOverrides({});
+          setDemoOn(false);
+          setCursor(Infinity);
+          setCurrentRoomId(null);
+        }}
       />
 
       {membersDialogRoomId && isLive && (() => {
