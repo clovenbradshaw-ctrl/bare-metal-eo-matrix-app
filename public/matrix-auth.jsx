@@ -260,7 +260,13 @@ function LoginScreen({ onSignIn }) {
 
 function IdentityChip({ session, onSignOut }) {
   const [open, setOpen] = useState(false);
+  const [reconnectOpen, setReconnectOpen] = useState(false);
+  const [pw, setPw] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
   const ref = useRef(null);
+  const pwRef = useRef(null);
+  useEffect(() => { if (reconnectOpen) pwRef.current?.focus(); }, [reconnectOpen]);
   useEffect(() => {
     if (!open) return;
     function close(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false); }
@@ -270,30 +276,45 @@ function IdentityChip({ session, onSignOut }) {
   const u = session.mxid.replace(/^@/, '').split(':')[0];
   const initial = u.slice(0,1).toUpperCase();
   const demo = !!session.demo;
+  const stale = !demo && !!session.stale;
+  const avatarBg = demo ? 'var(--signal)' : stale ? 'var(--triad-significance)' : null;
   return (
     <div className="identity-chip" ref={ref}>
-      <button className="ic-btn" onClick={() => setOpen(o => !o)} title={session.mxid}>
-        <span className="ic-avatar" style={demo ? {background:'var(--signal)'} : null}>{initial}</span>
-        <span className="ic-mxid">{demo ? 'demo · @you' : session.mxid}</span>
+      <button className="ic-btn" onClick={() => setOpen(o => !o)} title={stale ? `${session.mxid} · local-only (homeserver unreachable)` : session.mxid}>
+        <span className="ic-avatar" style={avatarBg ? {background:avatarBg} : null}>{initial}</span>
+        <span className="ic-mxid">
+          {demo ? 'demo · @you' : session.mxid}
+          {stale && <span className="muted" style={{marginLeft:6}}>· local-only</span>}
+        </span>
         <span className="ic-caret">▾</span>
       </button>
       {open && (
         <div className="ic-panel">
           <div className="ic-panel-head">
-            <div className="ic-panel-avatar" style={demo ? {background:'var(--signal)'} : null}>{initial}</div>
+            <div className="ic-panel-avatar" style={avatarBg ? {background:avatarBg} : null}>{initial}</div>
             <div>
               <div className="ic-panel-mxid">{demo ? 'demo mode' : session.mxid}</div>
               <div className="ic-panel-sub">
                 {demo ? 'no homeserver · seed data only' :
+                 stale ? `local-only · homeserver unreachable · sign out + back in to reconnect` :
                   `homeserver · ${session.homeserver.replace(/^https?:\/\//,'')}`}
               </div>
-              <div className="ic-panel-sub">device · {session.device_id}{session.sso ? ' · sso' : ''}</div>
+              <div className="ic-panel-sub">device · {session.device_id || '—'}{session.sso ? ' · sso' : ''}</div>
             </div>
           </div>
           {demo ? (
             <button className="ic-panel-item" onClick={() => { setOpen(false); onSignOut(); }}>
               sign in to a real homeserver
             </button>
+          ) : stale ? (
+            <>
+              <button className="ic-panel-item" onClick={() => { setReconnectOpen(true); setOpen(false); }}>
+                reconnect to homeserver
+              </button>
+              <button className="ic-panel-item danger" onClick={() => { setOpen(false); onSignOut(); }}>
+                sign out (wipes local data)
+              </button>
+            </>
           ) : (
             <>
               <button className="ic-panel-item" onClick={() => setOpen(false)}>account settings</button>
@@ -303,7 +324,111 @@ function IdentityChip({ session, onSignOut }) {
           )}
         </div>
       )}
+      {reconnectOpen && (
+        <div className="share-overlay" onClick={() => !busy && setReconnectOpen(false)}>
+          <div className="share-card" style={{maxWidth:360}} onClick={e => e.stopPropagation()}>
+            <div className="share-head">
+              <div>
+                <div className="share-title">reconnect</div>
+                <div className="share-sub">re-enter your password to refresh the matrix session</div>
+              </div>
+              <button className="share-close" onClick={() => !busy && setReconnectOpen(false)}>×</button>
+            </div>
+            <div className="share-section">
+              <label className="login-field">
+                <span className="login-label">password</span>
+                <div className="login-input-wrap">
+                  <input
+                    ref={pwRef}
+                    type="password"
+                    value={pw}
+                    onChange={e => setPw(e.target.value)}
+                    placeholder="••••••••"
+                    disabled={busy}
+                    onKeyDown={async (e) => {
+                      if (e.key !== 'Enter' || busy) return;
+                      setBusy(true); setErr(null);
+                      try {
+                        await window.MatrixLive.reconnect(pw);
+                        setReconnectOpen(false);
+                        setPw('');
+                      } catch (ex) {
+                        setErr(ex?.message || 'reconnect failed');
+                      } finally { setBusy(false); }
+                    }}
+                  />
+                </div>
+              </label>
+              {err && <div className="login-err" style={{marginTop:6}}>{err}</div>}
+              <div className="login-actions" style={{marginTop:10}}>
+                <button
+                  className="login-primary"
+                  disabled={busy || !pw}
+                  onClick={async () => {
+                    setBusy(true); setErr(null);
+                    try {
+                      await window.MatrixLive.reconnect(pw);
+                      setReconnectOpen(false);
+                      setPw('');
+                    } catch (ex) {
+                      setErr(ex?.message || 'reconnect failed');
+                    } finally { setBusy(false); }
+                  }}
+                >{busy ? 'reconnecting…' : 'reconnect'}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ImportButton — pick a file, encrypt it client-side, upload as a blob to
+// the homeserver media store, and emit an `import` entity into the room.
+// The decryption key rides inside the Megolm-encrypted event content, so
+// the homeserver only stores ciphertext.
+// ─────────────────────────────────────────────────────────────────────────
+
+function ImportButton({ roomId, disabled }) {
+  const inputRef = useRef(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const ML = window.MatrixLive;
+
+  async function handleFile(file) {
+    if (!file || !ML?.importFile) return;
+    setErr(null);
+    setBusy(true);
+    try {
+      await ML.importFile(roomId, file);
+    } catch (e) {
+      console.warn('[import] failed:', e);
+      setErr(e?.message || 'import failed');
+      setTimeout(() => setErr(null), 4000);
+    } finally {
+      setBusy(false);
+      if (inputRef.current) inputRef.current.value = '';
+    }
+  }
+
+  return (
+    <>
+      <button
+        className="topbar-members"
+        onClick={() => inputRef.current?.click()}
+        disabled={disabled || busy}
+        title={disabled ? 'sign in to a homeserver to import files'
+                        : 'import a CSV / JSON / binary file into this space'}
+      >{busy ? 'uploading…' : err ? `failed: ${err}` : 'import'}</button>
+      <input
+        type="file"
+        ref={inputRef}
+        style={{display:'none'}}
+        onChange={(e) => handleFile(e.target.files?.[0])}
+      />
+    </>
   );
 }
 
@@ -494,6 +619,7 @@ Object.assign(window, {
   LoginScreen,
   IdentityChip,
   MembersDialog,
+  ImportButton,
 });
 
 })();
