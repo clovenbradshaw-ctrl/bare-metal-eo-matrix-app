@@ -321,10 +321,10 @@ export async function invite(roomId, userId) {
 }
 
 /**
- * Get current room members.
+ * Get current room members (joined + invited) with their power levels.
  *
  * @param {string} roomId
- * @returns {Array<{ userId, displayName, membership }>}
+ * @returns {Array<{ userId, displayName, membership, powerLevel }>}
  */
 export function getMembers(roomId) {
   const client = getClient();
@@ -333,9 +333,90 @@ export function getMembers(roomId) {
   const room = client.getRoom(roomId);
   if (!room) return [];
 
-  return room.getJoinedMembers().map((m) => ({
+  const plEvent = room.currentState.getStateEvents('m.room.power_levels', '');
+  const plContent = plEvent?.getContent() || {};
+  const usersPL = plContent.users || {};
+  const defaultPL = typeof plContent.users_default === 'number' ? plContent.users_default : 0;
+
+  const members = room.getMembers().filter(m =>
+    m.membership === 'join' || m.membership === 'invite'
+  );
+
+  return members.map(m => ({
     userId: m.userId,
     displayName: m.name || m.userId,
-    membership: 'join',
+    membership: m.membership,
+    powerLevel: typeof usersPL[m.userId] === 'number' ? usersPL[m.userId] : defaultPL,
   }));
+}
+
+/**
+ * Get the current user's power level in a room.
+ *
+ * @param {string} roomId
+ * @returns {number}
+ */
+export function myPowerLevel(roomId) {
+  const client = getClient();
+  if (!client) return 0;
+  const room = client.getRoom(roomId);
+  if (!room) return 0;
+  const me = client.getUserId();
+  const plEvent = room.currentState.getStateEvents('m.room.power_levels', '');
+  const c = plEvent?.getContent() || {};
+  const u = c.users || {};
+  const def = typeof c.users_default === 'number' ? c.users_default : 0;
+  return typeof u[me] === 'number' ? u[me] : def;
+}
+
+/**
+ * Kick a user out of the room.
+ *
+ * @param {string} roomId
+ * @param {string} userId
+ * @param {string} [reason]
+ */
+export async function kickMember(roomId, userId, reason) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+  await client.kick(roomId, userId, reason);
+}
+
+/**
+ * Set a user's power level in the room. Pass `null` or `undefined` to
+ * reset them to the room's default (effectively "demote to default").
+ *
+ * @param {string} roomId
+ * @param {string} userId
+ * @param {number} level
+ */
+export async function setMemberPowerLevel(roomId, userId, level) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+  const room = client.getRoom(roomId);
+  if (!room) throw new Error('Room not found: ' + roomId);
+  const plEvent = room.currentState.getStateEvents('m.room.power_levels', '');
+  if (!plEvent) throw new Error('No power_levels state event');
+  await client.setPowerLevel(roomId, userId, level, plEvent);
+}
+
+/**
+ * Subscribe to membership / power-level changes in a room. The handler
+ * is called (with no arguments) whenever m.room.member or
+ * m.room.power_levels state events arrive for the given room.
+ *
+ * @param {string} roomId
+ * @param {function} handler
+ * @returns {function} Unsubscribe
+ */
+export function onMembersChange(roomId, handler) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+  const listener = (event, state) => {
+    if (state.roomId !== roomId) return;
+    const type = event.getType();
+    if (type === 'm.room.member' || type === 'm.room.power_levels') handler();
+  };
+  client.on(RoomStateEvent.Events, listener);
+  return () => client.removeListener(RoomStateEvent.Events, listener);
 }

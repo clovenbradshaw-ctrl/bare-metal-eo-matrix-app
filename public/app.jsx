@@ -56,7 +56,7 @@ function useEventStore(initialDemo) {
 // Room picker dropdown — replaces the rooms column
 // ─────────────────────────────────────────────────────────────────────────
 
-function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demoOn, onToggleDemo, isLive }) {
+function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demoOn, onToggleDemo, isLive, onManageMembers }) {
   const [open, setOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const ref = useRef(null);
@@ -69,7 +69,7 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
   }, [open]);
 
   const current = rooms.find(r => r.id === currentRoomId);
-  const label = current ? (current.title || current.id) : (rooms.length ? 'pick a workspace' : 'no workspaces');
+  const label = current ? (current.title || current.id) : (rooms.length ? 'pick a space' : 'no spaces');
 
   return (
     <div className="room-picker" ref={ref}>
@@ -91,12 +91,12 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
               </button>
             </div>
           )}
-          <div className="panel-head">workspaces · {rooms.length}</div>
+          <div className="panel-head">spaces · {rooms.length}</div>
           {rooms.length === 0 && (
             <div style={{padding:'10px 12px',fontSize:11,color:'var(--text-dim)',fontStyle:'italic'}}>
               {isLive
-                ? 'no eo.workspace rooms yet — create one below.'
-                : 'no workspaces yet.'}
+                ? 'no spaces yet — create one below.'
+                : 'no spaces yet.'}
             </div>
           )}
           {rooms.map(r => (
@@ -112,12 +112,20 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
                 )}
               </span>
               <span className="rmeta">{r.eventCount} ev</span>
+              {isLive && r.membership === 'join' && onManageMembers && (
+                <button
+                  className="sp-row-share"
+                  style={{marginLeft:8}}
+                  onClick={(e) => { e.stopPropagation(); setOpen(false); onManageMembers(r.id); }}
+                  title="manage members of this space"
+                >members</button>
+              )}
             </div>
           ))}
           <div className="new-room">
             <input
               value={newName}
-              placeholder={isLive ? 'new workspace name' : 'new room id'}
+              placeholder={isLive ? 'new space name' : 'new room id'}
               onChange={e => setNewName(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter' && newName) { onCreateRoom(newName); setNewName(''); setOpen(false); } }}
             />
@@ -278,9 +286,7 @@ function App() {
   const ephCounterRef = useRef(0);
   const [demoOn, setDemoOn] = useState(tweaks.demoOnStart);
 
-  const [spaces, setSpaces] = window.useSpaces(session?.mxid || '@you:demo');
-  const [currentSpaceId, setCurrentSpaceId] = useState(() => spaces[0]?.id);
-  const [shareSpaceId, setShareSpaceId] = useState(null);
+  const [membersDialogRoomId, setMembersDialogRoomId] = useState(null);
 
   const [customSlices, setCustomSlices] = useState({});
 
@@ -344,7 +350,7 @@ function App() {
         setCurrentRoomId(roomId);
       } catch (e) {
         console.warn('[app] create room failed:', e);
-        alert('Create workspace failed: ' + (e?.message || e));
+        alert('Create space failed: ' + (e?.message || e));
       }
     } else {
       const id = name.startsWith('!') ? name : `!${name}`;
@@ -392,38 +398,15 @@ function App() {
           session={session}
           onSignOut={handleSignOut}
         />
-        <window.SpacesPicker
-          spaces={spaces}
-          currentSpaceId={currentSpaceId}
-          setCurrentSpaceId={setCurrentSpaceId}
-          onShare={(id) => setShareSpaceId(id)}
-          onCreateSpace={(name) => {
-            const slug = name.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-            const sp = {
-              id: `#${slug}:${session.mxid.split(':')[1]}`,
-              name: slug,
-              sigil: slug.slice(0,1).toUpperCase(),
-              rooms: [],
-              members: [{ mxid: session.mxid, role: 'admin' }],
-            };
-            setSpaces(arr => [...arr, sp]);
-            setCurrentSpaceId(sp.id);
-          }}
-        />
         <RoomPicker
           rooms={rooms}
           currentRoomId={currentRoomId}
           setCurrentRoomId={setCurrentRoomId}
-          onCreateRoom={(name) => {
-            onCreateRoom(name);
-            if (currentSpaceId && !isLive) {
-              const id = name.startsWith('!') ? name : `!${name}`;
-              setSpaces(arr => arr.map(s => s.id === currentSpaceId ? { ...s, rooms: [...new Set([...s.rooms, id])] } : s));
-            }
-          }}
+          onCreateRoom={onCreateRoom}
           demoOn={isLive ? false : demoOn}
           onToggleDemo={toggleDemo}
           isLive={isLive}
+          onManageMembers={isLive ? (id) => setMembersDialogRoomId(id) : null}
         />
         <span className="spacer" />
       </div>
@@ -540,25 +523,14 @@ function App() {
         onClearAll={() => { clearAll(); setDemoOn(false); setCursor(Infinity); }}
       />
 
-      {shareSpaceId && (() => {
-        const sp = spaces.find(s => s.id === shareSpaceId);
-        if (!sp) return null;
+      {membersDialogRoomId && isLive && (() => {
+        const r = rooms.find(x => x.id === membersDialogRoomId);
+        if (!r) return null;
         return (
-          <window.ShareSpaceDialog
-            space={sp}
-            onClose={() => setShareSpaceId(null)}
-            onInvite={(mxid, role) => {
-              setSpaces(arr => arr.map(s => s.id === shareSpaceId
-                ? { ...s, members: [...s.members, { mxid, role }] } : s));
-            }}
-            onChangeRole={(mxid, role) => {
-              setSpaces(arr => arr.map(s => s.id === shareSpaceId
-                ? { ...s, members: s.members.map(m => m.mxid === mxid ? { ...m, role } : m) } : s));
-            }}
-            onRemove={(mxid) => {
-              setSpaces(arr => arr.map(s => s.id === shareSpaceId
-                ? { ...s, members: s.members.filter(m => m.mxid !== mxid) } : s));
-            }}
+          <window.MembersDialog
+            space={r}
+            mySession={session}
+            onClose={() => setMembersDialogRoomId(null)}
           />
         );
       })()}

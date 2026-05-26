@@ -23,7 +23,8 @@ import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
 import { fold, foldFrom, initial, stateHash } from './fold.js';
 import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
-         loadTimelineSince, invite, getMembers, acceptInvite, onRoomChanges,
+         loadTimelineSince, invite, getMembers, myPowerLevel, kickMember,
+         setMemberPowerLevel, onMembersChange, acceptInvite, onRoomChanges,
          onDecrypted, onLocalEchoUpdated, EventStatus } from './rooms.js';
 import { EventStore } from './store.js';
 import { vault, getLastUser } from './vault.js';
@@ -251,9 +252,9 @@ function listRooms() {
 }
 
 async function createWorkspace(name) {
-  const cleanName = String(name || '').trim() || 'workspace';
+  const cleanName = String(name || '').trim() || 'space';
   const roomId = await mxCreateRoom(cleanName, ROOM_TYPE);
-  logProgress(`Created workspace: ${cleanName}`);
+  logProgress(`Created space: ${cleanName}`);
   notify('rooms');
   return roomId;
 }
@@ -332,6 +333,7 @@ async function openRoom(roomId) {
       notify('events');
     }
   }));
+  fns.push(onMembersChange(roomId, () => notify('members')));
   roomUnsubs.set(roomId, fns);
 }
 
@@ -390,7 +392,18 @@ async function inviteUser(roomId, userId) {
   notify('members');
 }
 
+async function kickUser(roomId, userId, reason) {
+  await kickMember(roomId, userId, reason);
+  notify('members');
+}
+
+async function setUserPowerLevel(roomId, userId, level) {
+  await setMemberPowerLevel(roomId, userId, level);
+  notify('members');
+}
+
 function membersOf(roomId) { return getMembers(roomId); }
+function myPowerLevelIn(roomId) { return myPowerLevel(roomId); }
 
 // ── Recovery key prompts: relay to React via a window slot ──
 setRecoveryKeyDisplayer((key) => new Promise((resolve) => {
@@ -429,7 +442,10 @@ window.MatrixLive = {
   openRoom,
   getEventsForRoom,
   inviteUser,
+  kickUser,
+  setUserPowerLevel,
   membersOf,
+  myPowerLevelIn,
   // Net status
   getNetwork: () => netState,
   getPendingCount: pendingCount,

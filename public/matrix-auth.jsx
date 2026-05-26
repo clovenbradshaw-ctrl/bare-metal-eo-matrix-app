@@ -1,16 +1,20 @@
 /* matrix-auth.jsx — Matrix-style login screen, identity chip in topbar,
- * spaces dropdown, and share-space invite dialog.
+ * and the members management dialog for a space.
  *
- * Entirely client-side / localStorage-backed; no real homeserver call.
- * Captures the *shape* of the flow: pick a homeserver, sign in, group rooms
- * into spaces, share a space with another mxid.
+ * Login UI is client-side until submit. Member management operates on the
+ * real Matrix room when signed in (invite / kick / set power level via the
+ * live bridge); in demo mode it's hidden because there's no homeserver.
  */
 
 (function () {
 const { useState, useEffect, useRef, useMemo } = React;
 
 const SESSION_KEY = 'matrix-events.session.v1';
-const SPACES_KEY  = 'matrix-events.spaces.v1';
+const LEGACY_SPACES_KEY  = 'matrix-events.spaces.v1';
+
+// One-time migration: wipe the now-removed demo spaces blob so it stops
+// taking up localStorage for users upgrading from the old UI.
+try { localStorage.removeItem(LEGACY_SPACES_KEY); } catch {}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Session
@@ -42,41 +46,25 @@ function useSession() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Spaces — { id, name, sigil, members: [{mxid, role}], rooms: [roomId] }
+// Members — live view of a Matrix room's join + invite + power levels
 // ─────────────────────────────────────────────────────────────────────────
 
-function defaultSpaces(mxid) {
-  return [
-    { id: '#engineering:matrix.org', name: 'engineering', sigil: 'E', rooms: ['!proj_alpha','!infra_log'],
-      members: [
-        { mxid, role: 'admin' },
-        { mxid: '@alice:matrix.org', role: 'member' },
-        { mxid: '@bo:matrix.org', role: 'member' },
-        { mxid: '@kit:fosdem.im', role: 'viewer' },
-      ] },
-    { id: '#research:matrix.org', name: 'research', sigil: 'R', rooms: ['!hypotheses','!observations'],
-      members: [
-        { mxid, role: 'admin' },
-        { mxid: '@nat:matrix.org', role: 'member' },
-      ] },
-    { id: '#personal:matrix.org', name: 'personal', sigil: 'P', rooms: ['!scratch'],
-      members: [{ mxid, role: 'admin' }] },
-  ];
-}
-
-function loadSpaces(mxid) {
-  try {
-    const raw = localStorage.getItem(SPACES_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  return defaultSpaces(mxid);
-}
-function saveSpaces(s) { localStorage.setItem(SPACES_KEY, JSON.stringify(s)); }
-
-function useSpaces(mxid) {
-  const [spaces, setSpaces] = useState(() => loadSpaces(mxid));
-  useEffect(() => { saveSpaces(spaces); }, [spaces]);
-  return [spaces, setSpaces];
+function useMembers(roomId) {
+  const ML = window.MatrixLive;
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!ML || !roomId) return;
+    return ML.subscribe((reason) => {
+      if (reason === 'members' || reason === 'rooms') setTick(t => t + 1);
+    });
+  }, [ML, roomId]);
+  return useMemo(() => {
+    if (!ML || !roomId) return { members: [], myPowerLevel: 0 };
+    return {
+      members: ML.membersOf(roomId) || [],
+      myPowerLevel: ML.myPowerLevelIn ? ML.myPowerLevelIn(roomId) : 0,
+    };
+  }, [ML, roomId, tick]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -225,7 +213,7 @@ function LoginScreen({ onSignIn }) {
                 explore demo data without signing in
               </button>
               <div className="login-hint" style={{textAlign:'center'}}>
-                demo loads seed workspaces locally — nothing leaves the browser.
+                demo loads seed spaces locally — nothing leaves the browser.
               </div>
             </div>
           </div>
@@ -320,92 +308,71 @@ function IdentityChip({ session, onSignOut }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// SpacesPicker — sits in the topbar before the room picker
+// MembersDialog — manage members of a space (Matrix room).
+//
+// Renders the current room's members as a table: mxid, membership state,
+// power level (editable inline), and a remove (kick) action. An invite
+// row at the top adds new members. All actions are gated on the signed-in
+// user's own power level — buttons disable when the action would fail.
 // ─────────────────────────────────────────────────────────────────────────
 
-function SpacesPicker({ spaces, currentSpaceId, setCurrentSpaceId, onShare, onCreateSpace }) {
-  const [open, setOpen] = useState(false);
-  const [newName, setNewName] = useState('');
-  const ref = useRef(null);
-  useEffect(() => {
-    if (!open) return;
-    function close(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false); }
-    document.addEventListener('mousedown', close);
-    return () => document.removeEventListener('mousedown', close);
-  }, [open]);
-
-  const current = spaces.find(s => s.id === currentSpaceId) || spaces[0];
-
-  return (
-    <div className="spaces-picker" ref={ref}>
-      <button className="sp-btn" onClick={() => setOpen(o => !o)} title={current?.id}>
-        <span className="sp-sigil">{current?.sigil || '·'}</span>
-        <span className="sp-name">{current?.name || 'no space'}</span>
-        <span className="sp-meta">{current?.rooms.length || 0} rooms · {current?.members.length || 0}</span>
-        <span className="sp-caret">▾</span>
-      </button>
-      {open && (
-        <div className="sp-panel">
-          <div className="sp-panel-head">spaces · {spaces.length}</div>
-          {spaces.map(s => (
-            <div
-              key={s.id}
-              className={`sp-row ${s.id === currentSpaceId ? 'active' : ''}`}
-              onClick={() => { setCurrentSpaceId(s.id); setOpen(false); }}
-            >
-              <span className="sp-row-sigil">{s.sigil}</span>
-              <div className="sp-row-body">
-                <div className="sp-row-name">#{s.name}</div>
-                <div className="sp-row-meta">{s.rooms.length} rooms · {s.members.length} members</div>
-              </div>
-              <button
-                className="sp-row-share"
-                onClick={(e) => { e.stopPropagation(); onShare(s.id); setOpen(false); }}
-                title="invite somebody to this space"
-              >share</button>
-            </div>
-          ))}
-          <div className="sp-new">
-            <input
-              value={newName}
-              placeholder="new space name"
-              onChange={e => setNewName(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && newName) { onCreateSpace(newName); setNewName(''); setOpen(false); } }}
-            />
-            <button onClick={() => { if (newName) { onCreateSpace(newName); setNewName(''); setOpen(false); } }}>+ space</button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// ShareSpaceDialog — invite a mxid, copy link, list members
-// ─────────────────────────────────────────────────────────────────────────
-
-function ShareSpaceDialog({ space, onClose, onInvite, onChangeRole, onRemove }) {
-  const [mxid, setMxid]   = useState('@');
-  const [role, setRole]   = useState('member');
-  const [copied, setCopied] = useState(false);
+function MembersDialog({ space, mySession, onClose }) {
+  const ML = window.MatrixLive;
+  const { members, myPowerLevel } = useMembers(space?.id);
+  const [mxid, setMxid] = useState('@');
+  const [level, setLevel] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
   const inputRef = useRef(null);
   useEffect(() => { inputRef.current?.focus(); }, []);
 
-  const link = `https://matrix.to/#/${encodeURIComponent(space.id)}`;
+  if (!space) return null;
+  const myMxid = mySession?.mxid;
+  const canInvite = myPowerLevel >= 50;
+  const canKick   = myPowerLevel >= 50;
+  const canSetPL  = myPowerLevel >= 100;
 
-  function invite() {
+  async function doInvite() {
     const id = mxid.trim();
-    if (!id.startsWith('@') || !id.includes(':')) return;
-    if (space.members.some(m => m.mxid === id)) return;
-    onInvite(id, role);
-    setMxid('@');
+    if (!id.startsWith('@') || !id.includes(':')) {
+      setErr('matrix id must look like @user:server');
+      return;
+    }
+    setErr(null); setBusy(true);
+    try {
+      await ML.inviteUser(space.id, id);
+      if (typeof level === 'number' && level !== 0 && canSetPL) {
+        await ML.setUserPowerLevel(space.id, id, level);
+      }
+      setMxid('@');
+      setLevel(0);
+    } catch (e) {
+      setErr(e?.message || 'invite failed');
+    } finally { setBusy(false); }
   }
 
-  function copyLink() {
-    navigator.clipboard?.writeText(link).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
-    });
+  async function doKick(userId) {
+    if (userId === myMxid) {
+      setErr("you can't kick yourself from here — sign out instead");
+      return;
+    }
+    if (!confirm(`Remove ${userId} from this space?`)) return;
+    setErr(null); setBusy(true);
+    try { await ML.kickUser(space.id, userId); }
+    catch (e) { setErr(e?.message || 'kick failed'); }
+    finally { setBusy(false); }
+  }
+
+  async function doSetPL(userId, newLevel) {
+    const n = Number(newLevel);
+    if (!Number.isFinite(n)) return;
+    if (userId === myMxid && n < myPowerLevel) {
+      if (!confirm('Lowering your own power level may lock you out of admin actions. Continue?')) return;
+    }
+    setErr(null); setBusy(true);
+    try { await ML.setUserPowerLevel(space.id, userId, n); }
+    catch (e) { setErr(e?.message || 'set power level failed'); }
+    finally { setBusy(false); }
   }
 
   return (
@@ -413,8 +380,8 @@ function ShareSpaceDialog({ space, onClose, onInvite, onChangeRole, onRemove }) 
       <div className="share-card" onClick={e => e.stopPropagation()}>
         <div className="share-head">
           <div>
-            <div className="share-title">share <span className="share-name">#{space.name}</span></div>
-            <div className="share-sub">space · {space.id} · {space.rooms.length} rooms · {space.members.length} members</div>
+            <div className="share-title">members of <span className="share-name">{space.title || space.id}</span></div>
+            <div className="share-sub">space · {space.id} · {members.length} members · your power level {myPowerLevel}</div>
           </div>
           <button className="share-close" onClick={onClose}>×</button>
         </div>
@@ -427,47 +394,90 @@ function ShareSpaceDialog({ space, onClose, onInvite, onChangeRole, onRemove }) 
               value={mxid}
               onChange={e => setMxid(e.target.value)}
               placeholder="@username:homeserver"
-              onKeyDown={e => { if (e.key === 'Enter') invite(); }}
+              disabled={!canInvite || busy}
+              onKeyDown={e => { if (e.key === 'Enter') doInvite(); }}
             />
-            <select value={role} onChange={e => setRole(e.target.value)}>
-              <option value="viewer">viewer</option>
-              <option value="member">member</option>
-              <option value="admin">admin</option>
-            </select>
-            <button className="share-invite" onClick={invite}>invite</button>
+            <input
+              type="number"
+              value={level}
+              onChange={e => setLevel(Number(e.target.value))}
+              title="initial power level (0 = default, 50 = moderator, 100 = admin)"
+              min={0}
+              max={100}
+              step={1}
+              style={{width:64,padding:'6px 8px',fontSize:12}}
+              disabled={!canInvite || !canSetPL || busy}
+            />
+            <button className="share-invite" onClick={doInvite} disabled={!canInvite || busy}>invite</button>
           </div>
-          <div className="share-hint">they receive an invitation event in their feed of the space.</div>
+          {!canInvite && (
+            <div className="share-hint">you need power level 50+ to invite. ask an admin.</div>
+          )}
+          {canInvite && !canSetPL && (
+            <div className="share-hint">you can invite, but setting a non-zero initial power level needs admin (100).</div>
+          )}
+          {err && <div className="login-err" style={{marginTop:6}}>{err}</div>}
         </div>
 
         <div className="share-section">
-          <div className="share-section-label">share link</div>
-          <div className="share-link-row">
-            <code className="share-link">{link}</code>
-            <button className="share-copy" onClick={copyLink}>{copied ? 'copied' : 'copy'}</button>
-          </div>
-          <div className="share-hint">anyone with the link can request to join (if space is public).</div>
-        </div>
-
-        <div className="share-section">
-          <div className="share-section-label">members · {space.members.length}</div>
-          <div className="share-members">
-            {space.members.map(m => (
-              <div className="share-member" key={m.mxid}>
-                <span className="share-member-avatar">{m.mxid.replace(/^@/,'').slice(0,1).toUpperCase()}</span>
-                <span className="share-member-mxid">{m.mxid}</span>
-                <select
-                  value={m.role}
-                  onChange={e => onChangeRole(m.mxid, e.target.value)}
-                  className={`share-member-role role-${m.role}`}
-                >
-                  <option value="viewer">viewer</option>
-                  <option value="member">member</option>
-                  <option value="admin">admin</option>
-                </select>
-                <button className="share-member-remove" onClick={() => onRemove(m.mxid)} title="remove from space">×</button>
-              </div>
-            ))}
-          </div>
+          <div className="share-section-label">members · {members.length}</div>
+          <table className="dbgrid members-table">
+            <thead>
+              <tr>
+                <th>matrix id</th>
+                <th>status</th>
+                <th>power level</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {members.map(m => {
+                const isMe = m.userId === myMxid;
+                const canKickThis = canKick && !isMe && m.powerLevel < myPowerLevel;
+                return (
+                  <tr key={m.userId}>
+                    <td title={m.userId}>
+                      <span className="share-member-avatar" style={{marginRight:8}}>
+                        {m.userId.replace(/^@/,'').slice(0,1).toUpperCase()}
+                      </span>
+                      <span>{m.displayName}</span>
+                      {isMe && <span className="muted" style={{marginLeft:6}}>(you)</span>}
+                    </td>
+                    <td className={m.membership === 'invite' ? 'muted' : ''}>
+                      {m.membership}
+                    </td>
+                    <td>
+                      <input
+                        type="number"
+                        defaultValue={m.powerLevel}
+                        min={0}
+                        max={100}
+                        step={1}
+                        disabled={!canSetPL || busy || (m.powerLevel >= myPowerLevel && !isMe)}
+                        style={{width:60,padding:'3px 6px',fontSize:12}}
+                        onBlur={(e) => {
+                          const v = Number(e.target.value);
+                          if (v !== m.powerLevel) doSetPL(m.userId, v);
+                        }}
+                        onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
+                      />
+                      <span className="muted" style={{marginLeft:6,fontSize:11}}>
+                        {m.powerLevel >= 100 ? 'admin' : m.powerLevel >= 50 ? 'mod' : 'member'}
+                      </span>
+                    </td>
+                    <td>
+                      <button
+                        className="share-member-remove"
+                        disabled={!canKickThis || busy}
+                        title={isMe ? "can't kick yourself" : canKickThis ? 'remove from space' : 'insufficient power level'}
+                        onClick={() => doKick(m.userId)}
+                      >×</button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -480,11 +490,10 @@ function ShareSpaceDialog({ space, onClose, onInvite, onChangeRole, onRemove }) 
 
 Object.assign(window, {
   useSession,
-  useSpaces,
+  useMembers,
   LoginScreen,
   IdentityChip,
-  SpacesPicker,
-  ShareSpaceDialog,
+  MembersDialog,
 });
 
 })();
