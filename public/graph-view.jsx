@@ -127,7 +127,7 @@ function GraphView({ room, state, onEmit, scrubber }) {
       const prev = positionsRef.current[e._anchor];
       return {
         id: e._anchor,
-        label: e.title || e.body || e.claim || e.what || e._anchor.slice(-8),
+        label: e.Name || e.title || e.body || e.claim || e.what || e._anchor.slice(-8),
         type: e._type,
         partition: state.partitions[e._anchor],
         entity: e,

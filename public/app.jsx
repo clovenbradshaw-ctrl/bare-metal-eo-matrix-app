@@ -487,11 +487,25 @@ function App() {
             setCustomSlices(s => ({ ...s, [tableId]: [...(s[tableId] || []), slice] }));
           }}
           onCreateTable={(name) => {
-            // Declare a new (empty) table by writing _schema.tables
+            const ME = window.MatrixEngine;
             const existing = state.schema?.tables || [];
-            if (existing.includes(name)) return;
-            onEmit(window.MatrixEngine.OP.DEF, { anchor: null, path: '_schema.tables', value: [...existing, name] });
-            onEmit(window.MatrixEngine.OP.DEF, { anchor: null, path: `_schema.fields.${name}`, value: [{ name: 'title', type: 'text' }] });
+            if (existing.includes(name)) {
+              setSelection({ kind: 'slice', sliceId: `${name}.table`, tableId: name, sliceKind: 'table' });
+              return;
+            }
+            onEmit(ME.OP.DEF, { anchor: null, path: '_schema.tables', value: [...existing, name] });
+            onEmit(ME.OP.DEF, {
+              anchor: null,
+              path: `_schema.fields.${name}`,
+              value: [
+                { name: 'Name', type: 'text' },
+                { name: 'Field 1', type: 'text' },
+              ],
+            });
+            // Seed one empty row so the user lands on a typeable grid, not an empty state.
+            const ts = Date.now();
+            const anchor = ME.makeAnchor(name, {}, '@you:demo', ts);
+            onEmit(ME.OP.INS, { anchor, entity_type: name, payload: {} });
             setSelection({ kind: 'slice', sliceId: `${name}.table`, tableId: name, sliceKind: 'table' });
           }}
           eventsTotal={total}
