@@ -1,46 +1,43 @@
 /* sidebar.jsx — Airtable/EODB-style left rail.
  *
- * Each room contains a set of TABLES (entity types in the room's schema +
- * meta tables: _synthesis, _connections, _schema, _violations).
- * Each table has a list of SLICES — projections of that table.
- * Slice kinds:
- *   grid       — Airtable-style spreadsheet (default)
- *   kanban     — partitioned columns; only available if the table declares partitions
- *   graph      — node-link view of CONs touching this table
- *   notebook   — chronological narrative (observations / hypotheses)
- *   synthesis  — SYN-rollup view
+ * Each room contains a collection of SETS (entity types in the room's schema +
+ * meta sets: _synthesis, _connections, _schema, _violations).
+ * Each set has a list of SLICES — projections of that set. A slice is one of
+ * four view types:
+ *   table    — Airtable-style spreadsheet (default)
+ *   graph    — node-link view of CONs touching this set
+ *   kanban   — partitioned columns; only available if the set declares partitions
+ *   timeline — chronological event history for entities in this set
  *
- * A "raw / log" entry sits below tables — it's not a slice but the underlying
- * timeline (the event log itself).
+ * A "raw / log" entry sits below the sets — it's not a slice but the
+ * underlying event log itself.
  */
 
 (function () {
 const { useState, useMemo } = React;
 
 const SLICE_KINDS = {
-  grid:      { icon: '⊞', label: 'grid'      },
-  kanban:    { icon: '▦', label: 'kanban'    },
-  graph:     { icon: '△', label: 'graph'     },
-  notebook:  { icon: '▤', label: 'notebook'  },
-  synthesis: { icon: '⊛', label: 'synthesis' },
-  schema:    { icon: '⊢', label: 'schema'    },
-  timeline:  { icon: '⏚', label: 'timeline'  },
+  table:    { icon: '⊞', label: 'table'    },
+  graph:    { icon: '△', label: 'graph'    },
+  kanban:   { icon: '▦', label: 'kanban'   },
+  timeline: { icon: '⏚', label: 'timeline' },
+  schema:   { icon: '⊢', label: 'schema'   },
 };
 
 // ─────────────────────────────────────────────────────────────────────────
-// Derive the tables + their auto-slices from state.
+// Derive the sets + their auto-slices from state.
 // ─────────────────────────────────────────────────────────────────────────
 
-function buildTables(state) {
+function buildSets(state) {
   const declared = state.schema?.tables || [];
   const observed = Array.from(new Set(
     Object.values(state.entities)
       .map(e => e._type)
       .filter(t => t && !t.startsWith('_'))
   ));
-  const userTables = Array.from(new Set([...declared, ...observed]));
+  const userSets = Array.from(new Set([...declared, ...observed]));
 
-  const tables = userTables.map(name => {
+  const sets = userSets.map(name => {
     const rows = Object.values(state.entities).filter(e => e._type === name);
     const hasPartitions = !!(state.schema?.partitions?.[name]) || rows.some(r => state.partitions[r._anchor]);
     const hasConnections = state.connections.some(c => {
@@ -48,11 +45,10 @@ function buildTables(state) {
       return (s?._type === name) || (t?._type === name);
     });
     const slices = [
-      { id: `${name}.grid`, kind: 'grid', name: 'grid', tableId: name },
+      { id: `${name}.table`, kind: 'table', name: 'table', tableId: name },
       ...(hasPartitions ? [{ id: `${name}.kanban`, kind: 'kanban', name: 'kanban', tableId: name }] : []),
       ...(hasConnections ? [{ id: `${name}.graph`, kind: 'graph', name: 'graph', tableId: name }] : []),
-      ...(name === 'observation' || name === 'hypothesis'
-        ? [{ id: `${name}.notebook`, kind: 'notebook', name: 'notebook', tableId: name }] : []),
+      { id: `${name}.timeline`, kind: 'timeline', name: 'timeline', tableId: name },
     ];
     return {
       id: name, name, kind: 'entity', rows: rows.length,
@@ -61,14 +57,14 @@ function buildTables(state) {
     };
   });
 
-  // Meta tables — surfaced as plain rows with a single grid slice each
+  // Meta sets — surfaced as plain rows with a single table slice each
   const meta = [];
   if (Object.values(state.entities).some(e => e._type === '_synthesis')) {
     meta.push({
       id: '_synthesis', name: '_synthesis', kind: 'meta',
       rows: Object.values(state.entities).filter(e => e._type === '_synthesis').length,
       declared: false,
-      slices: [{ id: '_synthesis.grid', kind: 'grid', name: 'grid', tableId: '_synthesis' }],
+      slices: [{ id: '_synthesis.table', kind: 'table', name: 'table', tableId: '_synthesis' }],
     });
   }
   if (state.connections.length > 0) {
@@ -76,7 +72,7 @@ function buildTables(state) {
       id: '_connections', name: '_connections', kind: 'meta',
       rows: state.connections.length, declared: !!state.schema?.links,
       slices: [
-        { id: '_connections.grid',  kind: 'grid',  name: 'grid',  tableId: '_connections' },
+        { id: '_connections.table', kind: 'table', name: 'table', tableId: '_connections' },
         { id: '_connections.graph', kind: 'graph', name: 'graph', tableId: '_connections' },
       ],
     });
@@ -85,18 +81,18 @@ function buildTables(state) {
     meta.push({
       id: '_schema', name: '_schema', kind: 'meta',
       rows: Object.keys(state.schema).length, declared: true,
-      slices: [{ id: '_schema.grid', kind: 'grid', name: 'grid', tableId: '_schema' }],
+      slices: [{ id: '_schema.table', kind: 'table', name: 'table', tableId: '_schema' }],
     });
   }
   if (state._violations && state._violations.length > 0) {
     meta.push({
       id: '_violations', name: '_violations', kind: 'meta',
       rows: state._violations.length, declared: false,
-      slices: [{ id: '_violations.grid', kind: 'grid', name: 'grid', tableId: '_violations' }],
+      slices: [{ id: '_violations.table', kind: 'table', name: 'table', tableId: '_violations' }],
     });
   }
 
-  return { tables, meta };
+  return { sets, meta };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -106,9 +102,9 @@ function buildTables(state) {
 function Sidebar({
   room, state, selection, setSelection, onCreateTable, customSlices, onCreateSlice, eventsTotal, ephemeralsCount,
 }) {
-  const { tables, meta } = useMemo(() => buildTables(state), [state]);
-  // Merge any user-created slices onto their host tables
-  const allTables = [...tables, ...meta].map(t => {
+  const { sets, meta } = useMemo(() => buildSets(state), [state]);
+  // Merge any user-created slices onto their host sets
+  const allSets = [...sets, ...meta].map(t => {
     const extras = (customSlices?.[t.id] || []).map(s => ({
       id: `${t.id}.${s.name}`,
       kind: s.kind,
@@ -120,13 +116,13 @@ function Sidebar({
   });
   const [expanded, setExpanded] = useState(() => {
     const m = {};
-    allTables.forEach(t => { m[t.id] = true; });
+    allSets.forEach(t => { m[t.id] = true; });
     return m;
   });
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
-  const [newSlice, setNewSlice] = useState(null); // tableId currently authoring a new slice
-  const [newSliceDraft, setNewSliceDraft] = useState({ name: '', kind: 'grid' });
+  const [newSlice, setNewSlice] = useState(null); // setId currently authoring a new slice
+  const [newSliceDraft, setNewSliceDraft] = useState({ name: '', kind: 'table' });
 
   function toggle(id) { setExpanded(s => ({ ...s, [id]: !s[id] })); }
 
@@ -142,14 +138,14 @@ function Sidebar({
     onCreateSlice(t.id, { name: slug, kind: newSliceDraft.kind });
     setSelection({ kind: 'slice', sliceId: `${t.id}.${slug}`, tableId: t.id, sliceKind: newSliceDraft.kind });
     setNewSlice(null);
-    setNewSliceDraft({ name: '', kind: 'grid' });
+    setNewSliceDraft({ name: '', kind: 'table' });
   }
   function cancelNewSlice() {
     setNewSlice(null);
-    setNewSliceDraft({ name: '', kind: 'grid' });
+    setNewSliceDraft({ name: '', kind: 'table' });
   }
 
-  function renderTable(t) {
+  function renderSet(t) {
     const open = !!expanded[t.id];
     const isSchemaActive = selection.kind === 'slice' && selection.tableId === t.id && selection.sliceKind === 'schema';
     return (
@@ -205,7 +201,7 @@ function Sidebar({
                 />
                 <div className="sb-slice-form-label">kind</div>
                 <div className="sb-slice-kinds">
-                  {Object.entries(SLICE_KINDS).filter(([k]) => k !== 'schema' && k !== 'timeline').map(([k, info]) => (
+                  {Object.entries(SLICE_KINDS).filter(([k]) => k !== 'schema').map(([k, info]) => (
                     <button
                       key={k}
                       className={`sb-kind-tile ${newSliceDraft.kind === k ? 'on' : ''} kind-${k}`}
@@ -225,8 +221,8 @@ function Sidebar({
             ) : t.kind !== 'meta' ? (
               <button
                 className="sb-slice add"
-                title="add a new slice (projection) of this table"
-                onClick={() => { setNewSlice(t.id); setNewSliceDraft({ name: '', kind: 'grid' }); }}
+                title="add a new slice (projection) of this set"
+                onClick={() => { setNewSlice(t.id); setNewSliceDraft({ name: '', kind: 'table' }); }}
               >
                 <span className="sb-slice-icon">+</span>
                 <span className="sb-slice-name">new view…</span>
@@ -247,12 +243,12 @@ function Sidebar({
 
       <div className="sb-section">
         <div className="sb-section-head">
-          <span>tables</span>
-          <span className="sb-section-count">{allTables.length}</span>
+          <span>sets</span>
+          <span className="sb-section-count">{allSets.length}</span>
         </div>
-        {allTables.map(renderTable)}
-        {allTables.length === 0 && (
-          <div className="sb-empty">no tables yet</div>
+        {allSets.map(renderSet)}
+        {allSets.length === 0 && (
+          <div className="sb-empty">no sets yet</div>
         )}
         {creating ? (
           <div className="sb-new-table">
@@ -260,7 +256,7 @@ function Sidebar({
               autoFocus
               value={newName}
               onChange={e => setNewName(e.target.value)}
-              placeholder="table name"
+              placeholder="set name"
               onKeyDown={e => {
                 if (e.key === 'Enter' && newName) { onCreateTable(newName); setNewName(''); setCreating(false); }
                 if (e.key === 'Escape') { setCreating(false); setNewName(''); }
@@ -269,7 +265,7 @@ function Sidebar({
             <button onClick={() => { if (newName) { onCreateTable(newName); setNewName(''); setCreating(false); } }}>+</button>
           </div>
         ) : (
-          <button className="sb-add-table" onClick={() => setCreating(true)}>+ new table</button>
+          <button className="sb-add-table" onClick={() => setCreating(true)}>+ new set</button>
         )}
       </div>
 
@@ -300,6 +296,7 @@ function Sidebar({
       <div className="sb-foot">
         <div className="sb-foot-line">events · <b>{eventsTotal}</b></div>
         <div className="sb-foot-line muted">slices are projections of the same log</div>
+        <div className="sb-foot-line muted">a set has four slice types: table · graph · kanban · timeline</div>
       </div>
     </aside>
   );
