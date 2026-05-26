@@ -272,48 +272,15 @@ function App() {
   const byRoom = dataSource.byRoom;
   const roomIds = Object.keys(byRoom);
 
-  // Initialise/repair currentRoomId when the source changes.
+  // If the active room disappears (left, lost from sync, demo cleared),
+  // drop back to the picker. We never auto-pick a room here — entry to a
+  // workspace is always an explicit user action on the WorkspacePicker.
   useEffect(() => {
     if (!session) return;
-    if (!currentRoomId || !byRoom[currentRoomId]) {
-      setCurrentRoomId(roomIds[0] || null);
+    if (currentRoomId && !byRoom[currentRoomId]) {
+      setCurrentRoomId(null);
     }
   }, [session, isLive, roomIds.join('|')]);
-
-  // For a freshly signed-in real Matrix user with no spaces, auto-create
-  // a starter "new space" so the workbench has somewhere to land. We
-  // wait for the sync to actually be PREPARED/SYNCING before declaring
-  // "no spaces" — otherwise we race the homeserver delivering rooms the
-  // user already created on another device.
-  const bootstrapAttemptedRef = useRef(false);
-  const syncReady = isLive && window.MatrixLive
-    ? ['PREPARED', 'SYNCING'].includes(window.MatrixLive.getSyncState?.())
-    : false;
-  useEffect(() => {
-    if (!isLive || !session || !window.MatrixLive) return;
-    if (bootstrapAttemptedRef.current) return;
-    if (!syncReady) return;
-    if (roomIds.length > 0) {
-      bootstrapAttemptedRef.current = true;
-      return;
-    }
-    bootstrapAttemptedRef.current = true;
-    (async () => {
-      try {
-        const id = await liveStore.createRoom('new space');
-        setCurrentRoomId(id);
-      } catch (e) {
-        console.warn('[app] auto-create new space failed:', e);
-        bootstrapAttemptedRef.current = false; // allow another attempt
-      }
-    })();
-  }, [isLive, session, roomIds.length, syncReady]);
-
-  // Drop the auto-create guard when the user signs out so the next sign-in
-  // can bootstrap again if needed.
-  useEffect(() => {
-    if (!session) bootstrapAttemptedRef.current = false;
-  }, [session]);
 
   const [selection, setSelection] = useState({ kind: 'slice', sliceId: 'task.table', tableId: 'task', sliceKind: 'table' });
   const [cursor, setCursor] = useState(Infinity);
@@ -363,6 +330,54 @@ function App() {
         namespace: 'demo.tasks',
         title: demoTitleOverrides[id] || id.replace(/^!/, '').replace(/_/g, ' '),
       }));
+
+  // Create a workspace (real Matrix room in live mode; in-memory room in
+  // demo mode), optionally seed it from a template, then enter it.
+  async function onCreateWorkspace(name, template) {
+    let newRoomId;
+    if (isLive) {
+      newRoomId = await liveStore.createRoom(name);
+    } else {
+      newRoomId = name.startsWith('!')
+        ? name
+        : `!${String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g, '_') || 'workspace'}`;
+      demoStore.createRoom(newRoomId);
+      setDemoTitleOverrides(o => ({ ...o, [newRoomId]: name }));
+    }
+    if (template?.seed) {
+      const emitTo = isLive
+        ? (op, content) => liveStore.emit(newRoomId, op, content)
+        : (op, content) => { demoStore.emit(newRoomId, op, content, session.mxid); };
+      try { await template.seed(emitTo); }
+      catch (e) { console.warn('[app] template seed failed:', e); }
+    }
+    setCurrentRoomId(newRoomId);
+    setCursor(Infinity);
+    return newRoomId;
+  }
+
+  async function onAcceptInvite(roomId) {
+    if (isLive && window.MatrixLive?.joinRoom) {
+      await window.MatrixLive.joinRoom(roomId);
+    }
+    setCurrentRoomId(roomId);
+    setCursor(Infinity);
+  }
+
+  // No active workspace → show the Airtable-style landing.
+  if (!currentRoomId) {
+    return (
+      <window.WorkspacePicker
+        session={session}
+        rooms={rooms}
+        isLive={isLive}
+        onPick={(id) => setCurrentRoomId(id)}
+        onCreate={onCreateWorkspace}
+        onAcceptInvite={onAcceptInvite}
+        onSignOut={handleSignOut}
+      />
+    );
+  }
 
   const lastEventTs = allEvents.length
     ? allEvents[allEvents.length - 1].origin_server_ts
@@ -451,6 +466,11 @@ function App() {
           session={session}
           onSignOut={handleSignOut}
         />
+        <button
+          className="topbar-members"
+          onClick={() => setCurrentRoomId(null)}
+          title="back to workspaces"
+        >← workspaces</button>
         <RoomPicker
           rooms={rooms}
           currentRoomId={currentRoomId}
