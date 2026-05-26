@@ -237,8 +237,7 @@ async function logout() {
 
 // ── Rooms — filtered to ROOM_TYPE only ──
 function listRooms() {
-  const rooms = discoverRooms().filter(r =>
-    r.membership === 'invite' || r.roomType === ROOM_TYPE || r.roomType === '…');
+  const rooms = discoverRooms(ROOM_TYPE);
   return rooms.map(r => ({
     id: r.roomId,
     name: r.name,

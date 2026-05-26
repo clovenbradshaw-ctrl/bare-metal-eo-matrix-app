@@ -56,73 +56,51 @@ export async function createRoom(name, roomType, meta = {}) {
 
 /**
  * Discover all rooms belonging to this app.
- * Scans joined rooms for the app metadata state event. Pending invites are
- * included unconditionally — their stripped state typically does not carry
- * custom state events, so we can't tell whether the invite is to an app room
- * until the user accepts and the full state syncs.
+ * Only rooms carrying the app's meta state event (set at createRoom time)
+ * are returned. Untagged rooms — DMs, rooms from other apps, rooms whose
+ * state hasn't fully synced — are filtered out.
  *
- * Joined rooms whose state hasn't fully synced yet (no meta event) are
- * included with roomType '…' so they remain visible rather than vanishing
- * from the list.
+ * Pending invites are included only when their stripped state advertises
+ * the app's meta event. Homeservers that don't forward custom state on
+ * invites will hide such invites until they're joined elsewhere; this is
+ * the cost of strict app-scoping.
  *
- * @param {string} [roomType] - Optional filter by room type (joined rooms only)
+ * @param {string} [roomType] - Optional filter by room type
  * @returns {Array<{ roomId, name, roomType, membership, meta, inviter }>}
  */
 export function discoverRooms(roomType = null) {
   const client = getClient();
   if (!client) return [];
 
+  const ns = getNamespace();
+  const metaType = META_TYPE();
   const rooms = client.getRooms();
   const appRooms = [];
 
   for (const room of rooms) {
     const membership = room.getMyMembership();
+    if (membership !== 'join' && membership !== 'invite') continue;
 
+    const metaEvent = room.currentState.getStateEvents(metaType, '');
+    if (!metaEvent) continue;
+
+    const content = metaEvent.getContent();
+    if (content.app !== ns) continue;
+    if (roomType && content.room_type !== roomType) continue;
+
+    let inviter = null;
     if (membership === 'invite') {
       const myUserId = client.getUserId();
       const myMember = room.getMember(myUserId);
-      appRooms.push({
-        roomId: room.roomId,
-        name: room.name,
-        roomType: 'invite',
-        membership,
-        inviter: myMember?.events?.member?.getSender() || null,
-        meta: {},
-      });
-      continue;
+      inviter = myMember?.events?.member?.getSender() || null;
     }
-
-    if (membership !== 'join') continue;
-
-    const metaEvent = room.currentState.getStateEvents(META_TYPE(), '');
-    if (!metaEvent) {
-      // Room was just joined — full state hasn't synced yet, or this
-      // isn't an app room. Show it so it doesn't vanish from the list
-      // after accepting an invite. Once state arrives the onRoomChanges
-      // listener will refresh and pick up the real type.
-      if (!roomType) {
-        appRooms.push({
-          roomId: room.roomId,
-          name: room.name,
-          roomType: '…',
-          membership,
-          inviter: null,
-          meta: {},
-        });
-      }
-      continue;
-    }
-
-    const content = metaEvent.getContent();
-    if (content.app !== getNamespace()) continue;
-    if (roomType && content.room_type !== roomType) continue;
 
     appRooms.push({
       roomId: room.roomId,
       name: room.name,
       roomType: content.room_type,
       membership,
-      inviter: null,
+      inviter,
       meta: content,
     });
   }
