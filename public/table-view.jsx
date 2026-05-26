@@ -220,9 +220,8 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   const declaredInSchema = !!state.schema?.fields?.[entityType] || (state.schema?.tables || []).includes(entityType);
   const [heatOn, setHeatOn] = useState(false);
   const [showFormula, setShowFormula] = useState(false);
-  const [addingField, setAddingField] = useState(false);
-  const [newField, setNewField] = useState({ name: '', type: 'text' });
-  const addFieldRef = useRef(null);
+  // Header-rename mode for one column at a time. {oldName, draft}.
+  const [renamingField, setRenamingField] = useState(null);
 
   // Cell-focus coordination for the airtable-style flow: a cell whose
   // {anchor, field} matches pendingFocus opens in edit mode on the next render.
@@ -249,25 +248,34 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     setPendingFocus({ anchor: r._anchor, field: cols[0].name });
   }, [entityType, rows, cols]);
 
-  useEffect(() => {
-    if (!addingField) return;
-    function onDoc(e) {
-      if (addFieldRef.current && !addFieldRef.current.contains(e.target)) setAddingField(false);
-    }
-    document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
-  }, [addingField]);
-
-  function commitNewField() {
-    const name = newField.name.trim();
-    if (!name) return;
+  function addNewField() {
     const existing = state.schema?.fields?.[entityType] || [];
-    if (existing.some(f => f.name === name)) { setAddingField(false); return; }
-    const f = { name, type: newField.type };
-    if (newField.type === 'select' || newField.type === 'multiselect') f.options = [];
-    onEmit(TV_OP.DEF, { anchor: null, path: `_schema.fields.${entityType}`, value: [...existing, f] });
-    setNewField({ name: '', type: 'text' });
-    setAddingField(false);
+    const used = new Set(existing.map(f => f.name));
+    let n = existing.length;
+    let placeholder;
+    do {
+      n += 1;
+      placeholder = `Field ${n}`;
+    } while (used.has(placeholder));
+    onEmit(TV_OP.DEF, {
+      anchor: null,
+      path: `_schema.fields.${entityType}`,
+      value: [...existing, { name: placeholder, type: 'text' }],
+    });
+    setRenamingField({ oldName: placeholder, draft: placeholder });
+  }
+
+  function commitRename() {
+    if (!renamingField) return;
+    const { oldName, draft } = renamingField;
+    setRenamingField(null);
+    const trimmed = draft.trim();
+    if (!trimmed || trimmed === oldName) return;
+    const existing = state.schema?.fields?.[entityType] || [];
+    // Reject collisions with another existing field.
+    if (existing.some(f => f.name === trimmed && f.name !== oldName)) return;
+    const updated = existing.map(f => f.name === oldName ? { ...f, name: trimmed } : f);
+    onEmit(TV_OP.DEF, { anchor: null, path: `_schema.fields.${entityType}`, value: updated });
   }
 
   // Per-column average writes for the summary row
@@ -398,11 +406,31 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             <tr>
               {allCols.map(c => {
                 const cs = colStats[c.name];
+                const renameable = !c.isPk && c.type !== 'linked' && c.type !== 'partition';
+                // Only allow dblclick-rename on fields with no row data — renaming a
+                // populated field would orphan its values under the old key.
+                const empty = rows.every(r => r[c.name] === undefined || r[c.name] === null || r[c.name] === '');
+                const dblRenameable = renameable && empty;
+                const isRenaming = renameable && renamingField?.oldName === c.name;
                 return (
-                  <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''} ${c.isPk ? 'formula' : ''}`}
-                      title={c.isPk ? '_anchor · formula field, derived from INS payload' : (c.schematized === false ? 'in data but not in _schema' : '')}>
+                  <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''} ${c.isPk ? 'formula' : ''} ${isRenaming ? 'renaming' : ''}`}
+                      title={c.isPk ? '_anchor · formula field, derived from INS payload' : (c.schematized === false ? 'in data but not in _schema' : (dblRenameable ? 'double-click to rename' : ''))}
+                      onDoubleClick={dblRenameable ? () => setRenamingField({ oldName: c.name, draft: c.name }) : undefined}>
                     {c.isPk && <span className="formula-glyph" title="formula field">ƒ </span>}
-                    {c.name}
+                    {isRenaming ? (
+                      <input
+                        autoFocus
+                        className="col-rename-input"
+                        value={renamingField.draft}
+                        onFocus={e => e.target.select()}
+                        onChange={e => setRenamingField(r => ({ ...r, draft: e.target.value }))}
+                        onBlur={commitRename}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
+                          else if (e.key === 'Escape') { e.preventDefault(); setRenamingField(null); }
+                        }}
+                      />
+                    ) : c.name}
                     {c.type !== 'pk' && c.type !== 'linked' && c.type !== 'partition' && <span className="ty">{sqlType(c.type)}</span>}
                     {c.type === 'linked' && <span className="ty">LINK</span>}
                     {c.type === 'partition' && <span className="ty">TEXT</span>}
@@ -412,30 +440,8 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                   </th>
                 );
               })}
-              <th className="add-col" title="add a new field to this set's schema">
-                {addingField ? (
-                  <div className="add-col-pop" ref={addFieldRef} onMouseDown={e => e.stopPropagation()}>
-                    <input
-                      autoFocus
-                      placeholder="field name"
-                      value={newField.name}
-                      onChange={e => setNewField(f => ({ ...f, name: e.target.value }))}
-                      onKeyDown={e => {
-                        if (e.key === 'Enter') commitNewField();
-                        else if (e.key === 'Escape') setAddingField(false);
-                      }}
-                    />
-                    <select
-                      value={newField.type}
-                      onChange={e => setNewField(f => ({ ...f, type: e.target.value }))}
-                    >
-                      {FIELD_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
-                    </select>
-                    <button onClick={commitNewField} disabled={!newField.name.trim()}>add</button>
-                  </div>
-                ) : (
-                  <button className="add-col-btn" onClick={() => setAddingField(true)} title="add field · emits DEF _schema.fields">+</button>
-                )}
+              <th className="add-col" title="add a text field · double-click any header to rename">
+                <button className="add-col-btn" onClick={addNewField} title="add a text field · double-click the header to rename">+</button>
               </th>
             </tr>
           </thead>
