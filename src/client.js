@@ -58,13 +58,13 @@ async function initCryptoWithRetry(c, timeoutMs = 30000) {
   try {
     await withTimeout(c.initRustCrypto(), timeoutMs, 'Crypto init');
   } catch (err) {
-    if (isCryptoStoreMismatch(err)) {
-      progress('Device ID changed — clearing old crypto store and retrying…');
-      await clearCryptoStore();
-      await withTimeout(c.initRustCrypto(), timeoutMs, 'Crypto init (retry)');
-    } else {
-      throw err;
-    }
+    // Any failure here — known mismatch, corrupted indexed DB, or partial
+    // wipe from a previous session — recovers the same way: drop the
+    // crypto store and let the SDK rebuild it from the server. Without
+    // this fallback, users hit "wipe local data to log in" loops.
+    progress('Crypto init failed — clearing crypto store and retrying: ' + err.message);
+    try { await clearCryptoStore(); } catch {}
+    await withTimeout(c.initRustCrypto(), timeoutMs, 'Crypto init (retry)');
   }
 }
 
@@ -364,15 +364,31 @@ export async function restoreSession(userId) {
     progress(`Crypto init failed (continuing offline): ${e.message}`);
   }
 
+  let sessionExpired = false;
   try {
     await client.startClient({ initialSyncLimit: 100 });
     if (_watchSyncUnsub) _watchSyncUnsub();
     _watchSyncUnsub = watchSync(client);
     // Best-effort wait for sync — short timeout so offline boots fast.
     try { await waitForSync(client, 12000); }
-    catch (e) { progress(`Sync deferred (${e.message}); local data available`); }
+    catch (e) {
+      if (/Session expired/i.test(e.message)) sessionExpired = true;
+      progress(`Sync deferred (${e.message}); local data available`);
+    }
   } catch (e) {
     progress(`Sync start failed (continuing offline): ${e.message}`);
+  }
+
+  if (sessionExpired) {
+    // Homeserver rejected the saved access token. Drop the dead session
+    // and the (now-stale) client so the caller can do a fresh login
+    // without the user having to manually wipe local data.
+    try { client.stopClient(); } catch {}
+    if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
+    client = null;
+    dropSession(userId);
+    progress('Saved session was rejected by the server — log in again to refresh credentials.');
+    return null;
   }
 
   try {
@@ -394,10 +410,17 @@ export async function unlock(userId, password) {
   const ok = await vault.unlock(userId, password);
   if (!ok) throw new Error('Invalid password');
   rememberLastUser(userId);
+  const hadSavedSession = !!localStorage.getItem(sessionKey(userId));
   const c = await restoreSession(userId);
-  if (!c) return { userId, online: false };
+  if (!c) {
+    // If we had a session blob and restoreSession dropped it, the saved
+    // credentials are no good — tell the caller so they can fall through
+    // to a full online login.
+    const needsLogin = hadSavedSession && !localStorage.getItem(sessionKey(userId));
+    return { userId, online: false, needsLogin };
+  }
   const state = c.getSyncState && c.getSyncState();
-  return { userId, online: state === 'PREPARED' || state === 'SYNCING' };
+  return { userId, online: state === 'PREPARED' || state === 'SYNCING', needsLogin: false };
 }
 
 /**
