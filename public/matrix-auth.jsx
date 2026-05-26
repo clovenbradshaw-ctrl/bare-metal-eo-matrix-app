@@ -136,9 +136,9 @@ function LoginScreen({ onSignIn }) {
         <div className="login-head">
           <div className="login-brand">
             <span className="login-brand-mark">▦</span>
-            <span>matrix-events</span>
+            <span>workspace</span>
           </div>
-          <div className="login-sub">bare metal · sign in to your homeserver</div>
+          <div className="login-sub">sign in to your homeserver</div>
         </div>
 
         <div className="login-tabs">
