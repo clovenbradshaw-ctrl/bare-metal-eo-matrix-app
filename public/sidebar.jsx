@@ -205,8 +205,20 @@ function NewProjectionModal({ set, onCreate, onClose }) {
 // Sidebar component
 // ─────────────────────────────────────────────────────────────────────────
 
+function relativeTime(ts) {
+  if (!ts) return null;
+  const diff = Date.now() - ts;
+  if (diff < 0) return 'just now';
+  if (diff < 30_000) return 'just now';
+  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
 function Sidebar({
-  room, state, selection, setSelection, onCreateTable, customSlices, onCreateSlice, eventsTotal, ephemeralsCount,
+  room, state, selection, setSelection, onCreateTable, customSlices, onCreateSlice,
+  eventsTotal, ephemeralsCount, onRenameRoom, lastEventTs,
 }) {
   const { sets, meta } = useMemo(() => buildSets(state), [state]);
   const allSets = [...sets, ...meta].map(t => {
@@ -227,6 +239,30 @@ function Sidebar({
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
   const [projectionFor, setProjectionFor] = useState(null); // set object for new-projection modal
+
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
+  // Re-render every 30s so the "last edit X ago" string stays fresh.
+  const [, setNowTick] = useState(0);
+  useEffect(() => {
+    if (!lastEventTs) return;
+    const t = setInterval(() => setNowTick(n => n + 1), 30_000);
+    return () => clearInterval(t);
+  }, [lastEventTs]);
+
+  const canRename = !!onRenameRoom && !!room;
+  function startEditName() {
+    if (!canRename) return;
+    setNameDraft(room?.title || '');
+    setEditingName(true);
+  }
+  function commitName() {
+    const trimmed = nameDraft.trim();
+    setEditingName(false);
+    if (!canRename) return;
+    if (!trimmed || trimmed === room?.title) return;
+    onRenameRoom(trimmed);
+  }
 
   function toggle(id) { setCollapsed(s => ({ ...s, [id]: !s[id] })); }
 
@@ -291,11 +327,38 @@ function Sidebar({
     );
   }
 
+  const setsCount = allSets.length;
+  const lastEditLabel = relativeTime(lastEventTs);
+  const headerName = room?.title || 'untitled workspace';
+
   return (
     <aside className="sidebar">
       <div className="sb-room-head">
-        <div className="sb-room-name">{room?.title || room?.id.replace(/^!/, '').replace(/_/g, ' ')}</div>
-        <div className="sb-room-sub">{room?.id}</div>
+        {editingName ? (
+          <input
+            autoFocus
+            className="sb-room-name-input"
+            value={nameDraft}
+            onChange={e => setNameDraft(e.target.value)}
+            onBlur={commitName}
+            onKeyDown={e => {
+              if (e.key === 'Enter') commitName();
+              else if (e.key === 'Escape') setEditingName(false);
+            }}
+          />
+        ) : (
+          <button
+            type="button"
+            className="sb-room-name"
+            onClick={startEditName}
+            disabled={!canRename}
+            title={canRename ? 'click to rename' : ''}
+          >{headerName}</button>
+        )}
+        <div className="sb-room-sub">
+          {setsCount} {setsCount === 1 ? 'set' : 'sets'} · {eventsTotal} {eventsTotal === 1 ? 'event' : 'events'}
+          {lastEditLabel ? <> · last edit {lastEditLabel}</> : null}
+        </div>
       </div>
 
       <div className="sb-section">

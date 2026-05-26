@@ -300,7 +300,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
       {showDDL && <div className="ddl" dangerouslySetInnerHTML={{ __html: ddl }} />}
       <div className="dbtable-head">
         <div className="name">
-          <span className="schema">{room.id.replace('!','')}</span><span className="dot">.</span>{entityType}
+          <span className="schema">{room.title || 'workspace'}</span><span className="dot">.</span>{entityType}
           {!declaredInSchema && <span style={{color:'var(--signal)',marginLeft:8,fontWeight:400}}>? unschematized</span>}
         </div>
         <div className="meta">
@@ -666,7 +666,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
           <div className="page-hero-eyebrow">
             <span className="page-hero-kind"><span className="page-hero-glyph">⊢</span> schema</span>
             <span className="page-hero-sep">·</span>
-            <span className="page-hero-crumb">{room.id.replace('!','')}<span className="page-hero-slash">/</span>{entityType}</span>
+            <span className="page-hero-crumb">{room.title || 'workspace'}<span className="page-hero-slash">/</span>{entityType}</span>
             {!declared && <span className="page-hero-warn">? not declared in _schema.tables</span>}
           </div>
           <h1 className="page-hero-title">{entityType}</h1>
@@ -694,7 +694,9 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
             <div className="schema-stat">
               <div className="schema-stat-label">last updated</div>
               <div className="schema-stat-value">{stats.lastUpdated ? fmtAbsDate(stats.lastUpdated) : <span className="muted">—</span>}</div>
-              <div className="schema-stat-sub">{stats.lastSender?.mxid ? `by ${stats.lastSender.mxid}` : '—'}</div>
+              <div className="schema-stat-sub" title={stats.lastSender?.mxid || ''}>
+                {stats.lastSender?.mxid ? `by ${stats.lastSender.mxid.replace(/^@/, '').split(':')[0]}` : '—'}
+              </div>
             </div>
             <div className="schema-stat">
               <div className="schema-stat-label">edges</div>
@@ -1038,7 +1040,7 @@ function SynthesisTable({ state, room, showDDL }) {
 );  <span class="cmt">-- one row per SYN event</span>` }} />}
       <div className="dbtable-head">
         <div className="name">
-          <span className="schema">{room.id.replace('!','')}</span><span className="dot">.</span>_synthesis
+          <span className="schema">{room.title || 'workspace'}</span><span className="dot">.</span>_synthesis
         </div>
         <div className="meta">{rows.length} row{rows.length!==1?'s':''}</div>
       </div>
@@ -1079,7 +1081,7 @@ function ConnectionsTable({ state, room, onJump, showDDL }) {
 );  <span class="cmt">-- one row per CON event</span>` }} />}
       <div className="dbtable-head">
         <div className="name">
-          <span className="schema">{room.id.replace('!','')}</span><span className="dot">.</span>_connections
+          <span className="schema">{room.title || 'workspace'}</span><span className="dot">.</span>_connections
         </div>
         <div className="meta">{state.connections.length} edge{state.connections.length!==1?'s':''}</div>
       </div>
@@ -1125,7 +1127,7 @@ function SchemaTable({ state, room, showDDL }) {
 );  <span class="cmt">-- one row per DEF event with anchor=null path=_schema.*</span>` }} />}
       <div className="dbtable-head">
         <div className="name">
-          <span className="schema">{room.id.replace('!','')}</span><span className="dot">.</span>_schema
+          <span className="schema">{room.title || 'workspace'}</span><span className="dot">.</span>_schema
         </div>
         <div className="meta">{entries.length} entr{entries.length!==1?'ies':'y'}</div>
       </div>
@@ -1273,7 +1275,7 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
     <div className="table-view">
       {!forceTable && !hideHead && (
         <div className="tv-head">
-          <h2>{room.id.replace(/^!/, '').replace(/_/g, ' ')}</h2>
+          <h2>{room.title || 'untitled workspace'}</h2>
           <span className="crumb">projection · {tables.length} set{tables.length!==1?'s':''} · {Object.keys(state.entities).length} rows · {state.connections.length} edges</span>
           <div className="right">
             one set at a time — like airtable.

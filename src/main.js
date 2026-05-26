@@ -25,7 +25,8 @@ import { fold, foldFrom, initial, stateHash } from './fold.js';
 import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          loadTimelineSince, invite, getMembers, myPowerLevel, kickMember,
          setMemberPowerLevel, onMembersChange, acceptInvite, onRoomChanges,
-         onDecrypted, onLocalEchoUpdated, EventStatus } from './rooms.js';
+         onDecrypted, onLocalEchoUpdated, EventStatus,
+         setName as mxSetRoomName, getDisplayName as mxGetDisplayName } from './rooms.js';
 import { EventStore } from './store.js';
 import { vault, getLastUser } from './vault.js';
 import { OutboxFlusher, listAll as outboxListAll, pendingCount,
@@ -594,6 +595,19 @@ async function setUserPowerLevel(roomId, userId, level) {
 function membersOf(roomId) { return getMembers(roomId); }
 function myPowerLevelIn(roomId) { return myPowerLevel(roomId); }
 
+async function renameRoom(roomId, name) {
+  const clean = String(name || '').trim();
+  if (!clean) throw new Error('Name required');
+  await mxSetRoomName(roomId, clean);
+  refreshManifestFromLive();
+  notify('rooms');
+}
+
+function getMyDisplayName() {
+  if (!activeSession) return null;
+  return mxGetDisplayName(activeSession.mxid);
+}
+
 // ── Recovery key prompts: relay to React via a window slot ──
 setRecoveryKeyDisplayer((key) => new Promise((resolve) => {
   if (typeof window.__matrixLiveRecoveryDisplay === 'function') {
@@ -635,8 +649,10 @@ window.MatrixLive = {
   inviteUser,
   kickUser,
   setUserPowerLevel,
+  renameRoom,
   membersOf,
   myPowerLevelIn,
+  getMyDisplayName,
   // File import / media
   importFile: importFileToRoom,
   readMedia,

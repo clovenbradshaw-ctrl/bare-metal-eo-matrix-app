@@ -321,10 +321,10 @@ function AppView({ room, state, onEmit, scrubber, forceTable, forceMode }) {
     <div className="app-view">
       {!forceTable && (
         <div className="app-head">
-          <h2>{room.title || room.id.replace(/^!/, '')}</h2>
+          <h2>{room.title || 'untitled workspace'}</h2>
           <span className="crumb">projection · {creating ? 'create board' : kind.kind}{kind.kanbanType ? ` · ${kind.kanbanType}` : ''} · {Object.keys(state.entities).length} entities</span>
           <div className="right">
-            built on top of <b>{room.id}</b>. add a card → emits <b>INS</b> + <b>DEF</b>. drag → <b>SEG</b>.
+            add a card → emits <b>INS</b> + <b>DEF</b>. drag → <b>SEG</b>.
             switch to <b>log</b> to see them land.
           </div>
         </div>
