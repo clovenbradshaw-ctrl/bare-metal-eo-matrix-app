@@ -146,9 +146,12 @@ async function loginWithMatrix({ homeserver, username, password }) {
   // If we already have a local account for this user, prefer offline-capable unlock.
   if (hasLocalAccount(user)) {
     try {
-      const { online } = await mxUnlock(user, password);
-      logProgress(online ? 'Unlocked (online)' : 'Unlocked (offline)');
-      return await afterAuth(user, hs);
+      const { online, needsLogin } = await mxUnlock(user, password);
+      if (!needsLogin) {
+        logProgress(online ? 'Unlocked (online)' : 'Unlocked (offline)');
+        return await afterAuth(user, hs);
+      }
+      logProgress('Saved session expired — refreshing credentials…');
     } catch (e) {
       logProgress('Unlock failed, attempting full login: ' + e.message);
     }
@@ -448,6 +451,7 @@ window.MatrixLive = {
   myPowerLevelIn,
   // Net status
   getNetwork: () => netState,
+  getSyncState: () => getClient()?.getSyncState?.() || null,
   getPendingCount: pendingCount,
   outboxList: outboxListAll,
   outboxRemove,

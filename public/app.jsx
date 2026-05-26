@@ -279,6 +279,41 @@ function App() {
     }
   }, [session, isLive, roomIds.join('|')]);
 
+  // For a freshly signed-in real Matrix user with no spaces, auto-create
+  // a starter "new space" so the workbench has somewhere to land. We
+  // wait for the sync to actually be PREPARED/SYNCING before declaring
+  // "no spaces" — otherwise we race the homeserver delivering rooms the
+  // user already created on another device.
+  const bootstrapAttemptedRef = useRef(false);
+  const syncReady = isLive && window.MatrixLive
+    ? ['PREPARED', 'SYNCING'].includes(window.MatrixLive.getSyncState?.())
+    : false;
+  useEffect(() => {
+    if (!isLive || !session || !window.MatrixLive) return;
+    if (bootstrapAttemptedRef.current) return;
+    if (!syncReady) return;
+    if (roomIds.length > 0) {
+      bootstrapAttemptedRef.current = true;
+      return;
+    }
+    bootstrapAttemptedRef.current = true;
+    (async () => {
+      try {
+        const id = await liveStore.createRoom('new space');
+        setCurrentRoomId(id);
+      } catch (e) {
+        console.warn('[app] auto-create new space failed:', e);
+        bootstrapAttemptedRef.current = false; // allow another attempt
+      }
+    })();
+  }, [isLive, session, roomIds.length, syncReady]);
+
+  // Drop the auto-create guard when the user signs out so the next sign-in
+  // can bootstrap again if needed.
+  useEffect(() => {
+    if (!session) bootstrapAttemptedRef.current = false;
+  }, [session]);
+
   const [selection, setSelection] = useState({ kind: 'slice', sliceId: 'task.schema', tableId: 'task', sliceKind: 'schema' });
   const [cursor, setCursor] = useState(Infinity);
   const [highlight, setHighlight] = useState(null);
@@ -408,6 +443,17 @@ function App() {
           isLive={isLive}
           onManageMembers={isLive ? (id) => setMembersDialogRoomId(id) : null}
         />
+        {isLive && currentRoomId && (() => {
+          const r = rooms.find(x => x.id === currentRoomId);
+          if (!r || r.membership !== 'join') return null;
+          return (
+            <button
+              className="topbar-members"
+              onClick={() => setMembersDialogRoomId(currentRoomId)}
+              title="manage members of this space"
+            >members</button>
+          );
+        })()}
         <span className="spacer" />
       </div>
 
