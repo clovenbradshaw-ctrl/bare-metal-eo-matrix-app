@@ -203,6 +203,31 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   const declaredInSchema = !!state.schema?.fields?.[entityType] || (state.schema?.tables || []).includes(entityType);
   const [newRowTitle, setNewRowTitle] = useState('');
   const [heatOn, setHeatOn] = useState(false);
+  const [showFormula, setShowFormula] = useState(false);
+  const [addingField, setAddingField] = useState(false);
+  const [newField, setNewField] = useState({ name: '', type: 'text' });
+  const addFieldRef = useRef(null);
+
+  useEffect(() => {
+    if (!addingField) return;
+    function onDoc(e) {
+      if (addFieldRef.current && !addFieldRef.current.contains(e.target)) setAddingField(false);
+    }
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [addingField]);
+
+  function commitNewField() {
+    const name = newField.name.trim();
+    if (!name) return;
+    const existing = state.schema?.fields?.[entityType] || [];
+    if (existing.some(f => f.name === name)) { setAddingField(false); return; }
+    const f = { name, type: newField.type };
+    if (newField.type === 'select' || newField.type === 'multiselect') f.options = [];
+    onEmit(TV_OP.DEF, { anchor: null, path: `_schema.fields.${entityType}`, value: [...existing, f] });
+    setNewField({ name: '', type: 'text' });
+    setAddingField(false);
+  }
 
   // Per-column average writes for the summary row
   const colStats = useMemo(() => {
@@ -241,7 +266,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   }
 
   const allCols = [
-    { name: '_anchor', type: 'pk', isPk: true, schematized: true },
+    ...(showFormula ? [{ name: '_anchor', type: 'pk', isPk: true, schematized: true }] : []),
     ...cols,
     ...(partitioned ? [{ name: '_partition', type: 'partition', schematized: partitionFromSchema }] : []),
     ...linkedTypes.map(t => ({ name: t, type: 'linked', schematized: true })),
@@ -283,6 +308,11 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
           <span className="pill">{cols.length} col{cols.length!==1?'s':''}</span>
           {linkedTypes.length > 0 && <span className="pill">{linkedTypes.length} linked</span>}
           <button
+            className={`heat-toggle ${showFormula ? 'on' : ''}`}
+            onClick={() => setShowFormula(o => !o)}
+            title="reveal _anchor — the content-addressed primary key, computed from INS payload"
+          >ƒ formula fields</button>
+          <button
             className={`heat-toggle ${heatOn ? 'on' : ''}`}
             onClick={() => setHeatOn(o => !o)}
             title="color cells by number of DEF writes per path"
@@ -296,8 +326,9 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
               {allCols.map(c => {
                 const cs = colStats[c.name];
                 return (
-                  <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''}`}
-                      title={c.schematized === false ? 'in data but not in _schema' : ''}>
+                  <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''} ${c.isPk ? 'formula' : ''}`}
+                      title={c.isPk ? '_anchor · formula field, derived from INS payload' : (c.schematized === false ? 'in data but not in _schema' : '')}>
+                    {c.isPk && <span className="formula-glyph" title="formula field">ƒ </span>}
                     {c.name}
                     {c.type !== 'pk' && c.type !== 'linked' && c.type !== 'partition' && <span className="ty">{sqlType(c.type)}</span>}
                     {c.type === 'linked' && <span className="ty">LINK</span>}
@@ -308,29 +339,56 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                   </th>
                 );
               })}
+              <th className="add-col" title="add a new field to this set's schema">
+                {addingField ? (
+                  <div className="add-col-pop" ref={addFieldRef} onMouseDown={e => e.stopPropagation()}>
+                    <input
+                      autoFocus
+                      placeholder="field name"
+                      value={newField.name}
+                      onChange={e => setNewField(f => ({ ...f, name: e.target.value }))}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') commitNewField();
+                        else if (e.key === 'Escape') setAddingField(false);
+                      }}
+                    />
+                    <select
+                      value={newField.type}
+                      onChange={e => setNewField(f => ({ ...f, type: e.target.value }))}
+                    >
+                      {FIELD_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+                    </select>
+                    <button onClick={commitNewField} disabled={!newField.name.trim()}>add</button>
+                  </div>
+                ) : (
+                  <button className="add-col-btn" onClick={() => setAddingField(true)} title="add field · emits DEF _schema.fields">+</button>
+                )}
+              </th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td className="cell" colSpan={allCols.length} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
+                <td className="cell" colSpan={allCols.length + 1} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
                   0 rows · schema is defined, no INS events yet
                 </td>
               </tr>
             )}
             {rows.map(r => (
               <tr key={r._anchor}>
-                <td
-                  className="cell anchor anchor-link"
-                  onClick={() => setSelection && setSelection({
-                    kind: 'slice',
-                    sliceId: `${entityType}.timeline.${r._anchor}`,
-                    sliceKind: 'timeline',
-                    tableId: entityType,
-                    entityAnchor: r._anchor,
-                  })}
-                  title="view this entity's timeline"
-                >{r._anchor}</td>
+                {showFormula && (
+                  <td
+                    className="cell anchor anchor-link formula"
+                    onClick={() => setSelection && setSelection({
+                      kind: 'slice',
+                      sliceId: `${entityType}.timeline.${r._anchor}`,
+                      sliceKind: 'timeline',
+                      tableId: entityType,
+                      entityAnchor: r._anchor,
+                    })}
+                    title="view this entity's timeline"
+                  >{r._anchor}</td>
+                )}
                 {cols.map(c => (
                   <EditableCell
                     key={c.name}
@@ -355,19 +413,28 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     onJump={onJump}
                   />
                 ))}
+                <td className="cell add-col-spacer" title="open this row's timeline" onClick={() => setSelection && setSelection({
+                  kind: 'slice',
+                  sliceId: `${entityType}.timeline.${r._anchor}`,
+                  sliceKind: 'timeline',
+                  tableId: entityType,
+                  entityAnchor: r._anchor,
+                })}>⏚</td>
               </tr>
             ))}
 
             {/* Heat-map summary row */}
             {heatOn && rows.length > 0 && (
               <tr className="heat-summary">
-                <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}>avg writes</td>
-                {cols.map(c => {
+                {showFormula && <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}>avg writes</td>}
+                {!showFormula && cols.length > 0 && <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}></td>}
+                {cols.map((c, i) => {
                   const cs = colStats[c.name] || { avg: 0, max: 0 };
                   const pct = Math.min(cs.max / 10 * 100, 100);
                   const color = cs.avg < 1.5 ? '#85b7eb' : cs.avg < 3 ? '#fac775' : cs.avg < 6 ? '#f09595' : '#e24b4a';
                   return (
                     <td key={c.name} className="cell heat-summary-cell">
+                      {i === 0 && !showFormula && <span style={{fontSize:10,color:'var(--text-faint)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700,marginRight:6}}>avg writes</span>}
                       <div className="heat-bar"><div className="heat-bar-fill" style={{width: pct + '%', background: color}} /></div>
                       <div className="heat-bar-label">{cs.avg.toFixed(1)} / row</div>
                     </td>
@@ -375,15 +442,16 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                 })}
                 {partitioned && <td className="cell"></td>}
                 {linkedTypes.map(t => <td key={t} className="cell"></td>)}
+                <td className="cell"></td>
               </tr>
             )}
             <tr className="add-row">
-              <td className="cell anchor"><span className="em">auto</span></td>
-              <td className="cell" colSpan={cols.length + (partitioned ? 1 : 0) + linkedTypes.length}>
+              {showFormula && <td className="cell anchor"><span className="em">auto</span></td>}
+              <td className="cell" colSpan={cols.length + (partitioned ? 1 : 0) + linkedTypes.length + 1}>
                 <div className="add-row-input">
                   <input
                     value={newRowTitle}
-                    placeholder={`INS new ${entityType}…`}
+                    placeholder={`+ add ${entityType} row…`}
                     onChange={e => setNewRowTitle(e.target.value)}
                     onKeyDown={e => { if (e.key === 'Enter') addRow(); }}
                   />
@@ -441,6 +509,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
   const [newLink, setNewLink] = React.useState({ to: '', rel: '' });
   const [editingPartitions, setEditingPartitions] = React.useState(false);
   const [partitionDraft, setPartitionDraft] = React.useState('');
+  const [showFormula, setShowFormula] = React.useState(false);
 
   if (!room) return <div className="tv-empty">select a room</div>;
 
@@ -459,10 +528,10 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
   }
 
   const rows = [
-    {
+    ...(showFormula ? [{
       path: '_anchor', kind: 'pk', rawType: 'text', type: 'TEXT', operator: 'identity', schematized: true, isPk: true,
       params: 'PRIMARY KEY · content-addressed', editable: false,
-    },
+    }] : []),
     ...cols.map(c => ({
       path: c.name, kind: 'field', rawType: c.type, fieldName: c.name,
       type: sqlType(c.type),
@@ -644,10 +713,15 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
           <div className="page-section-head">
             <h2 className="page-section-label">definition</h2>
             <span className="page-section-sub">
-              {rows.length} path{rows.length !== 1 ? 's' : ''} · {cols.length} field{cols.length !== 1 ? 's' : ''}
+              {cols.length} field{cols.length !== 1 ? 's' : ''}
               {linkedTypes.length > 0 && ` · ${linkedTypes.length} linked`}
               {partitioned && ' · partitioned'}
             </span>
+            <button
+              className={`heat-toggle schema-formula-toggle ${showFormula ? 'on' : ''}`}
+              onClick={() => setShowFormula(o => !o)}
+              title="reveal _anchor — the content-addressed primary key, computed from INS payload"
+            >ƒ formula fields</button>
           </div>
           <div className="dbtable schema-dbtable">
           <div className="dbtable-scroll">
@@ -1127,7 +1201,7 @@ function CreateTableForm({ state, room, onEmit, onCancel, defaultName = '', defa
   return (
     <div className="op-form" style={{margin:'12px 0',borderLeftColor:'var(--triad-significance)'}}>
       <div className="hint">
-        <b>create table</b> · writes <span className="kbd">DEF _schema.*</span> into the log so the shape is part of the data, not the code.
+        <b>create set</b> · writes <span className="kbd">DEF _schema.*</span> into the log so the shape is part of the data, not the code.
       </div>
       <div className="row">
         <label>name</label>
@@ -1200,10 +1274,10 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
       {!forceTable && !hideHead && (
         <div className="tv-head">
           <h2>{room.id.replace(/^!/, '').replace(/_/g, ' ')}</h2>
-          <span className="crumb">projection · {tables.length} table{tables.length!==1?'s':''} · {Object.keys(state.entities).length} rows · {state.connections.length} edges</span>
+          <span className="crumb">projection · {tables.length} set{tables.length!==1?'s':''} · {Object.keys(state.entities).length} rows · {state.connections.length} edges</span>
           <div className="right">
-            one table at a time — like airtable.
-            rooms = bases · entity types = tables · <b>CON</b> edges = linked records.
+            one set at a time — like airtable.
+            spaces = bases · sets = entity types · a <b>table</b> is one projection · <b>CON</b> edges = linked records.
             double-click a cell to edit (emits <b>DEF</b>).
           </div>
         </div>
@@ -1224,9 +1298,9 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
           <button
             className={`tv-tab new-tab ${creating ? 'active' : ''}`}
             onClick={() => setCreating(c => !c)}
-            title="declare a new table in _schema"
+            title="declare a new set in _schema"
           >
-            <span className="tname">+ new table</span>
+            <span className="tname">+ new set</span>
           </button>
         </div>
       )}
@@ -1246,13 +1320,13 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
         {totallyEmpty && !creating && (
           <div className="tv-empty">
             <div className="glyph">●</div>
-            <div>no tables in this room yet.</div>
-            <div style={{marginTop:6,fontSize:11.5}}>creating a table writes its shape into the log as <span className="kbd">DEF _schema.*</span> events.</div>
+            <div>no sets in this room yet.</div>
+            <div style={{marginTop:6,fontSize:11.5}}>creating a set writes its shape into the log as <span className="kbd">DEF _schema.*</span> events.</div>
             <div style={{marginTop:14}}>
               <button
                 onClick={() => setCreating(true)}
                 style={{padding:'6px 14px',background:'#000',color:'#fff',border:'1px solid #000',fontSize:12,cursor:'pointer'}}
-              >+ create your first table</button>
+              >+ create your first set</button>
             </div>
           </div>
         )}

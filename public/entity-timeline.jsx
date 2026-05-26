@@ -67,14 +67,46 @@ function EntityTimelineView({
   }, [allEventsInRoom, entityAnchor]);
 
   if (!entity) {
+    if (siblings.length === 0) {
+      return (
+        <div className="table-view">
+          {scrubber}
+          <div className="tv-body single">
+            <div className="tv-empty">
+              <div className="glyph">⏚</div>
+              <div>no rows in <b>{entityType}</b> yet — once you insert a row, its timeline appears here.</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="table-view">
         {scrubber}
-        <div className="tv-body single">
-          <div className="tv-empty">
-            <div className="glyph">⏚</div>
-            <div>no entity selected. pick one from the grid to view its timeline.</div>
-          </div>
+        <div className="tv-body single schema-body">
+          <header className="page-hero entity-hero">
+            <div className="page-hero-eyebrow">
+              <span className="page-hero-kind"><span className="page-hero-glyph">⏚</span> timeline</span>
+              <span className="page-hero-sep">·</span>
+              <span className="page-hero-crumb">{room.id.replace('!','')}<span className="page-hero-slash">/</span>{entityType}</span>
+            </div>
+            <h1 className="page-hero-title">pick a row</h1>
+            <div className="page-hero-sub">choose one of the {siblings.length} {entityType} row{siblings.length!==1?'s':''} below to see its event lifeline</div>
+          </header>
+          <section className="page-section">
+            <div className="page-section-head">
+              <h2 className="page-section-label">rows</h2>
+              <span className="page-section-sub">click to open</span>
+            </div>
+            <div className="tl-picker">
+              {siblings.map(s => (
+                <button key={s._anchor} className="tl-picker-row" onClick={() => jumpTo(s._anchor)}>
+                  <span className="tl-picker-name">{s.title || s.body || s.claim || s.what || s._anchor}</span>
+                  <span className="tl-picker-anchor">{s._anchor}</span>
+                </button>
+              ))}
+            </div>
+          </section>
         </div>
       </div>
     );
@@ -99,9 +131,9 @@ function EntityTimelineView({
             <span className="page-hero-crumb">{room.id.replace('!','')}<span className="page-hero-slash">/</span>{entityType}<span className="page-hero-slash">/</span>{entity._anchor}</span>
             <button
               className="entity-back"
-              onClick={() => setSelection({ kind: 'slice', sliceId: `${entityType}.grid`, sliceKind: 'grid', tableId: entityType })}
+              onClick={() => setSelection({ kind: 'slice', sliceId: `${entityType}.table`, sliceKind: 'table', tableId: entityType })}
               title="back to table"
-            >← {entityType} grid</button>
+            >← {entityType} table</button>
           </div>
           <h1 className="page-hero-title">{entity.title || entity.body || entity.claim || entity.what || entity._anchor}</h1>
           <div className="page-hero-sub" style={{display:'flex',alignItems:'center',gap:14,flexWrap:'wrap'}}>

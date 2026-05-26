@@ -314,7 +314,7 @@ function App() {
     if (!session) bootstrapAttemptedRef.current = false;
   }, [session]);
 
-  const [selection, setSelection] = useState({ kind: 'slice', sliceId: 'task.schema', tableId: 'task', sliceKind: 'schema' });
+  const [selection, setSelection] = useState({ kind: 'slice', sliceId: 'task.table', tableId: 'task', sliceKind: 'table' });
   const [cursor, setCursor] = useState(Infinity);
   const [highlight, setHighlight] = useState(null);
   const [ephemerals, setEphemerals] = useState([]);
@@ -478,7 +478,7 @@ function App() {
             if (existing.includes(name)) return;
             onEmit(window.MatrixEngine.OP.DEF, { anchor: null, path: '_schema.tables', value: [...existing, name] });
             onEmit(window.MatrixEngine.OP.DEF, { anchor: null, path: `_schema.fields.${name}`, value: [{ name: 'title', type: 'text' }] });
-            setSelection({ kind: 'slice', sliceId: `${name}.grid`, tableId: name, sliceKind: 'grid' });
+            setSelection({ kind: 'slice', sliceId: `${name}.table`, tableId: name, sliceKind: 'table' });
           }}
           eventsTotal={total}
           ephemeralsCount={ephemerals.length}
@@ -505,7 +505,7 @@ function App() {
               scrubber={scrubberEl}
             />
           )}
-          {selection.kind === 'slice' && (selection.sliceKind === 'grid') && (
+          {selection.kind === 'slice' && (selection.sliceKind === 'table') && (
             <window.TableView
               room={rooms.find(r => r.id === currentRoomId)}
               state={state}
