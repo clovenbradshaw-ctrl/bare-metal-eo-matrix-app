@@ -469,7 +469,12 @@ function App() {
                 title={stale ? 'reconnect to the homeserver to manage members' : 'manage members of this space'}
                 disabled={stale}
               >members</button>
-              <window.ImportButton roomId={currentRoomId} disabled={stale} />
+              <window.ImportButton
+                roomId={currentRoomId}
+                disabled={stale}
+                state={state}
+                onEmit={onEmit}
+              />
             </>
           );
         })()}
