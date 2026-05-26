@@ -2,48 +2,109 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Matrix Events</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>matrix-events · bare metal</title>
 <link rel="manifest" href="manifest.webmanifest">
-<meta name="theme-color" content="#0a0a0c">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Fraunces:opsz,wght@9..144,300;9..144,500;9..144,700&display=swap" rel="stylesheet">
+<meta name="theme-color" content="#fafaf7">
 <style>
-:root{--bg:#0a0a0c;--surface:#111115;--surface-2:#1a1a20;--border:#2a2a32;--text:#e0ddd8;--text-dim:#7a7872;--text-bright:#f5f2ed;--accent:#c4956a;--accent-dim:#8a6a4a;--accent-glow:rgba(196,149,106,.15);--green:#6a9a6a;--green-dim:rgba(106,154,106,.15);--red:#b06060;--yellow:#c4b06a;--mono:'IBM Plex Mono',monospace;--serif:'Fraunces',serif;--radius:3px}
+:root{
+  --bg:#fafaf7;
+  --surface:#fff;
+  --surface-2:#f4f3ee;
+  --surface-3:#ebe9e2;
+  --border:#c9c6bd;
+  --border-strong:#7a766c;
+  --text:#1a1a17;
+  --text-dim:#5a574e;
+  --text-bright:#000;
+  --text-faint:#8e8a7d;
+  --triad-existence:#0e7a52;
+  --triad-structure:#4731a8;
+  --triad-significance:#a91d1d;
+  --signal:#8a6300;
+  --red:var(--triad-significance);
+  --green:var(--triad-existence);
+  --yellow:var(--signal);
+  --mono: ui-monospace, 'SF Mono', 'Menlo', 'Monaco', 'Consolas', 'Liberation Mono', monospace;
+}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:var(--mono);background:var(--bg);color:var(--text);min-height:100vh;font-size:13px;line-height:1.6}
-.app{max-width:720px;margin:0 auto;padding:24px 20px}
-.header{display:flex;align-items:baseline;gap:12px;padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:20px;flex-wrap:wrap}
-.header h1{font-family:var(--serif);font-weight:700;font-size:20px;color:var(--accent)}
-.header .tag{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim)}
-.field{margin-bottom:12px}
-.field label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:4px}
-input{width:100%;padding:8px 10px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:var(--mono);font-size:13px;outline:none}
-input:focus{border-color:var(--accent-dim);box-shadow:0 0 0 2px var(--accent-glow)}
-button{padding:7px 16px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:var(--mono);font-size:12px;cursor:pointer}
-button:hover{border-color:var(--accent-dim);background:var(--accent-glow);color:var(--text-bright)}
-button.primary{background:var(--accent-dim);border-color:var(--accent);color:var(--text-bright)}
-button.danger{border-color:var(--red);color:var(--red)}
-button.danger:hover{background:rgba(176,96,96,.15)}
-button.link{background:transparent;border:none;padding:4px 0;color:var(--text-dim);text-decoration:underline;font-size:11px}
-button.link:hover{color:var(--accent)}
-.btn-row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
-.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
-.panel h2{font-family:var(--serif);font-weight:500;font-size:15px;color:var(--accent);margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
-#log{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;max-height:160px;overflow-y:auto;font-size:11px;line-height:1.7;color:var(--text-dim);margin-bottom:16px}
-#log .ok{color:var(--green)}
-#log .err{color:var(--red)}
-.room-item{padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:12px}
-.room-item:hover{background:var(--accent-glow)}
-.room-item.active{background:var(--accent-glow);border-left:2px solid var(--accent)}
-#stateView{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px;font-size:11px;max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--text-dim)}
+html,body{height:100%}
+body{font-family:var(--mono);background:var(--bg);color:var(--text);font-size:13px;line-height:1.6;overflow:hidden;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+input,textarea,select{font:inherit;color:inherit;background:#fff;border:1px solid var(--border);border-radius:0;padding:5px 8px;outline:none;font-size:12.5px;width:100%}
+input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0 1px #000}
 .hidden{display:none!important}
-.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:100}
-.modal{background:var(--surface);border:1px solid var(--accent-dim);border-radius:var(--radius);padding:24px;max-width:520px;width:90%}
-.modal h3{font-family:var(--serif);font-size:16px;color:var(--accent);margin-bottom:12px}
-.modal p{font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.7}
-.modal .key-display{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:12px;font-size:13px;color:var(--accent);word-break:break-all;margin-bottom:14px;user-select:all}
-.status-bar{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto;align-items:center}
-.badge{font-size:10px;text-transform:uppercase;letter-spacing:1px;padding:3px 8px;border-radius:var(--radius);border:1px solid var(--border);color:var(--text-dim);background:var(--surface)}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#ddd;border:2px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background:#888;background-clip:padding-box;border:2px solid transparent}
+
+/* ── Auth ────────────────────────────────────────────────────────── */
+.auth-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;overflow:auto;
+  background-image:linear-gradient(#ebe9e2 1px, transparent 1px),linear-gradient(90deg,#ebe9e2 1px, transparent 1px);
+  background-size:24px 24px;background-position:-1px -1px}
+.auth-card{background:var(--surface);border:1px solid var(--border-strong);width:100%;max-width:460px;box-shadow:6px 6px 0 var(--surface-3)}
+.auth-head{padding:18px 22px;border-bottom:1px solid var(--border)}
+.auth-head .logo{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:700;color:var(--text-bright);letter-spacing:.2px}
+.auth-head .logo .sq{width:18px;height:18px;background:#000;display:inline-block;position:relative}
+.auth-head .logo .sq::after{content:'';position:absolute;inset:4px;border:1px solid #fff}
+.auth-head .sub{font-size:11.5px;color:var(--text-dim);margin-top:4px;letter-spacing:.2px}
+.auth-tabs{display:flex;border-bottom:1px solid var(--border-strong)}
+.auth-tab{flex:1;padding:11px;font-size:12.5px;color:var(--text-dim);background:var(--surface-2);border-bottom:2px solid transparent;text-align:center;cursor:pointer;letter-spacing:.3px;text-transform:lowercase;font-weight:600}
+.auth-tab:hover{color:var(--text-bright)}
+.auth-tab.active{background:#fff;color:var(--text-bright);border-bottom-color:#000}
+.auth-body{padding:20px 22px}
+.field{margin-bottom:12px}
+.field label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:1.3px;color:var(--text-dim);font-weight:700;margin-bottom:5px}
+.field-row{display:flex;gap:0;align-items:stretch}
+.field-row .prefix{padding:5px 9px;background:var(--surface-3);border:1px solid var(--border);border-right:none;color:var(--text-dim);display:flex;align-items:center;font-size:12.5px;white-space:nowrap}
+.field-row .suffix{padding:5px 9px;background:var(--surface-3);border:1px solid var(--border);border-left:none;color:var(--text-dim);display:flex;align-items:center;font-size:12.5px;white-space:nowrap;max-width:55%;overflow:hidden;text-overflow:ellipsis}
+.field-row input{flex:1;min-width:0}
+.field .hint{font-size:10.5px;color:var(--text-dim);margin-top:4px;line-height:1.5}
+.btn-primary{display:block;width:100%;padding:10px;background:#000;color:#fff;border:1px solid #000;font-weight:700;letter-spacing:.4px;text-transform:lowercase;font-size:13px;cursor:pointer;margin-top:6px}
+.btn-primary:hover:not(:disabled){background:#222}
+.btn-primary:disabled{background:#bbb;border-color:#bbb;cursor:not-allowed}
+.btn-ghost{padding:6px 10px;background:#fff;border:1px solid var(--border-strong);color:var(--text);font-size:11.5px;cursor:pointer;letter-spacing:.3px;text-transform:lowercase;font-weight:600}
+.btn-ghost:hover{border-color:#000;color:var(--text-bright)}
+.btn-danger{padding:6px 10px;background:#fff;border:1px solid var(--red);color:var(--red);font-size:11.5px;cursor:pointer;letter-spacing:.3px;text-transform:lowercase;font-weight:600}
+.btn-danger:hover{background:var(--red);color:#fff}
+.auth-foot{padding:14px 22px;border-top:1px solid var(--border);background:var(--surface-2);font-size:11px;color:var(--text-dim);line-height:1.55}
+.auth-foot b{color:var(--text-bright);font-weight:700}
+.auth-err{padding:8px 10px;background:#fdf0f0;border:1px solid var(--red);color:var(--red);font-size:11.5px;margin-bottom:12px}
+.auth-info{padding:8px 10px;background:#f0f7f2;border:1px solid var(--triad-existence);color:var(--triad-existence);font-size:11.5px;margin-bottom:12px}
+
+.unlock-card .auth-tabs{justify-content:space-between}
+.unlock-card .auth-tab.active{cursor:default}
+.user-chip{display:inline-block;padding:4px 10px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-bright);font-size:12px;font-weight:600;margin-bottom:10px}
+
+/* ── App shell ────────────────────────────────────────────────────────── */
+.shell{display:grid;grid-template-rows:auto 1fr auto auto;height:100vh;background:var(--bg)}
+.shell-body{display:grid;grid-template-columns:240px 1fr;min-height:0;overflow:hidden}
+
+/* ── Topbar ─────────────────────────────────────────────────────────── */
+.topbar{display:flex;align-items:center;gap:12px;padding:8px 14px;border-bottom:1px solid var(--border-strong);background:var(--surface);min-height:46px;flex-wrap:wrap}
+.brand{font-weight:700;font-size:14px;color:var(--text-bright);letter-spacing:.2px;white-space:nowrap;display:flex;align-items:center;gap:8px}
+.brand .sq{width:14px;height:14px;background:#000;display:inline-block;position:relative}
+.brand .sq::after{content:'';position:absolute;inset:3px;border:1px solid #fff}
+.brand .sub{color:var(--text-dim);font-weight:400;margin-left:6px;font-size:12px}
+
+.room-picker{position:relative}
+.room-picker .pickbtn{display:flex;align-items:center;gap:8px;padding:5px 11px;font-size:12.5px;color:var(--text-bright);background:#fff;border:1px solid var(--border-strong);cursor:pointer;font-weight:500}
+.room-picker .pickbtn:hover{border-color:#000}
+.room-picker .pickbtn .dot{width:6px;height:6px;background:var(--triad-existence);display:inline-block}
+.room-picker .pickbtn .dot.off{background:var(--text-faint)}
+.room-picker .pickbtn .caret{font-size:9px;color:var(--text-dim)}
+
+.spacer{flex:1}
+.modes{display:flex;gap:0;flex-wrap:wrap}
+.modes button{padding:5px 13px;font-size:12px;color:var(--text);background:#fff;border:1px solid var(--border-strong);border-left-width:0;text-transform:lowercase;letter-spacing:.3px;cursor:pointer;font-weight:500}
+.modes button:first-child{border-left-width:1px}
+.modes button.active{background:#000;color:#fff;border-color:#000}
+.modes button.active + button{border-left-color:#000}
+.modes button:not(.active):hover{background:var(--surface-2);color:var(--text-bright)}
+
+.status-bar{display:flex;gap:6px;align-items:center;margin-left:8px}
+.badge{font-size:10px;text-transform:uppercase;letter-spacing:1px;padding:3px 7px;border:1px solid var(--border);color:var(--text-dim);background:var(--surface)}
 .badge.online{color:var(--green);border-color:var(--green)}
 .badge.offline{color:var(--red);border-color:var(--red)}
 .badge.degraded{color:var(--yellow);border-color:var(--yellow)}
@@ -51,101 +112,503 @@ button.link:hover{color:var(--accent)}
 .badge.locked{color:var(--red);border-color:var(--red)}
 .badge.queued{color:var(--yellow);border-color:var(--yellow)}
 .badge.idle{color:var(--text-dim)}
-.info{font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.6}
+
+/* ── Sidebar ────────────────────────────────────────────────────────── */
+.sidebar{display:flex;flex-direction:column;background:var(--surface-2);border-right:1px solid var(--border-strong);min-width:0;overflow-y:auto;font-size:12.5px}
+.sb-section{display:flex;flex-direction:column;padding:6px 0;border-bottom:1px solid var(--border)}
+.sb-section-head{padding:8px 12px 6px;display:flex;align-items:center;justify-content:space-between;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);font-weight:700}
+.sb-section-head .count{font-size:10px;color:var(--text-dim);padding:0 5px;border:1px solid var(--border);background:#fff;font-weight:600;letter-spacing:0}
+.sb-section-head button.iconbtn{padding:0 7px;font-size:14px;line-height:1;color:var(--text-dim);background:#fff;border:1px solid var(--border)}
+.sb-section-head button.iconbtn:hover{color:#000;border-color:#000}
+.room{padding:7px 12px;border-left:2px solid transparent;cursor:pointer;display:flex;flex-direction:column;gap:2px}
+.room:hover{background:#fff}
+.room.active{background:#fff;border-left-color:#000}
+.room.invite{border-left-color:var(--signal);color:var(--signal)}
+.room .rname{font-size:12.5px;color:var(--text-bright);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.room.active .rname{font-weight:700}
+.room .rmeta{font-size:10px;color:var(--text-dim);display:flex;gap:8px;align-items:center}
+.room .pill{padding:0 5px;border:1px solid var(--border);font-size:9.5px;background:#fff}
+.sb-empty{padding:5px 12px;font-size:11px;color:var(--text-dim);font-style:italic}
+.sb-newroom{padding:6px 12px;display:flex;flex-direction:column;gap:5px;background:#fff;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+.sb-newroom input{font-size:11.5px;padding:4px 7px}
+.sb-newroom .row{display:flex;gap:5px}
+.sb-newroom .row input{flex:1}
+.sb-newroom button{padding:4px 10px;background:#000;color:#fff;border:1px solid #000;font-size:11px;font-weight:700;letter-spacing:.3px;text-transform:lowercase}
+
+.sb-toast{padding:7px 12px;font-size:11px;color:var(--text-dim);background:#fff;border-bottom:1px solid var(--border);max-height:160px;overflow-y:auto;line-height:1.6}
+.sb-toast .line{padding:1px 0;border-bottom:1px dotted var(--border)}
+.sb-toast .line:last-child{border-bottom:none}
+.sb-toast .ok{color:var(--green)}
+.sb-toast .err{color:var(--red)}
+.sb-toast .ts{color:var(--text-faint);font-size:10px;margin-right:4px}
+
+.sb-foot{margin-top:auto;padding:10px 12px;border-top:1px solid var(--border);background:var(--surface-3);display:flex;flex-direction:column;gap:6px}
+.sb-foot .user{font-size:11.5px;color:var(--text-bright);overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.sb-foot .btn-row{display:flex;gap:4px;flex-wrap:wrap}
+.sb-foot .btn-row button{padding:4px 9px;font-size:11px;font-weight:600;background:#fff;border:1px solid var(--border-strong);color:var(--text);letter-spacing:.3px;text-transform:lowercase}
+.sb-foot .btn-row button:hover{border-color:#000;color:#000}
+.sb-foot .btn-row button.danger{color:var(--red);border-color:var(--red)}
+.sb-foot .btn-row button.danger:hover{background:var(--red);color:#fff}
+
+/* ── View area ──────────────────────────────────────────────────────── */
+.view-area{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;background:var(--bg)}
+.view{flex:1;overflow:auto;display:none}
+.view.active{display:flex;flex-direction:column}
+.view-head{padding:11px 16px;border-bottom:1px solid var(--border-strong);display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;background:var(--surface);flex-shrink:0}
+.view-head h2{font-weight:700;font-size:15px;color:var(--text-bright)}
+.view-head .crumb{font-size:11.5px;color:var(--text-dim);font-weight:500}
+.view-head .right{margin-left:auto;font-size:11.5px;color:var(--text-dim);max-width:380px;text-align:right;line-height:1.5}
+.view-head .right b{color:var(--text-bright);font-weight:700}
+
+/* ── Log view ───────────────────────────────────────────────────────── */
+.log-body{flex:1;overflow:auto;min-height:0}
+.log-empty{padding:48px 24px;text-align:center;color:var(--text-dim);font-size:12px;line-height:1.7}
+.log-empty .glyph{font-size:32px;color:var(--text-faint);margin-bottom:12px;display:block}
+.tl-row{display:grid;grid-template-columns:48px 24px 50px 1fr;gap:10px;padding:7px 14px;border-bottom:1px solid var(--border);font-size:12.5px;align-items:start;border-left:3px solid transparent}
+.tl-row:hover{background:var(--surface-2)}
+.tl-row.pending{border-left-color:var(--signal);background:#fdf9ef}
+.tl-row.violation{background:#fdf0f0;border-left-color:var(--red)}
+.tl-idx{color:var(--text-dim);font-size:11px;padding-top:2px;font-weight:500}
+.tl-glyph{font-size:14px;text-align:center;line-height:1;padding-top:2px;font-weight:700}
+.tl-glyph.existence{color:var(--triad-existence)}
+.tl-glyph.structure{color:var(--triad-structure)}
+.tl-glyph.significance{color:var(--triad-significance)}
+.tl-key{font-size:11px;text-transform:uppercase;letter-spacing:1.1px;color:var(--text-dim);padding-top:3px;font-weight:700}
+.tl-body{min-width:0;overflow:hidden}
+.tl-line{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+.tl-anchor{color:var(--text-bright);font-weight:600}
+.tl-path{color:var(--text-bright)}
+.tl-val{color:var(--triad-existence)}
+.tl-rel{color:var(--triad-structure)}
+.tl-sender{color:var(--text-dim);font-size:11px;margin-top:2px}
+.tl-pending{color:var(--signal);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:1px}
+
+/* ── State view ─────────────────────────────────────────────────────── */
+.state-body{flex:1;overflow:auto;min-height:0;padding:0}
+.state-section{padding:12px 16px;border-bottom:1px solid var(--border)}
+.state-section.bar-e{border-left:3px solid var(--triad-existence)}
+.state-section.bar-s{border-left:3px solid var(--triad-structure)}
+.state-section.bar-g{border-left:3px solid var(--triad-significance)}
+.state-section.bar-w{border-left:3px solid var(--signal)}
+.state-section h3{font-weight:700;font-size:11px;color:var(--text-bright);margin-bottom:9px;display:flex;align-items:center;gap:8px;text-transform:uppercase;letter-spacing:1.3px}
+.state-section h3 .count{font-size:11px;color:var(--text-dim);font-weight:500;letter-spacing:0;text-transform:none;padding:1px 6px;border:1px solid var(--border);background:#fff}
+.entity{background:#fff;border:1px solid var(--border);padding:9px 11px;margin-bottom:6px;font-size:12px;border-left:3px solid transparent}
+.entity:hover{border-color:var(--border-strong)}
+.entity.pending{border-left-color:var(--signal);background:#fdf9ef}
+.entity.partitioned{border-left:3px solid var(--triad-structure)}
+.entity .e-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px}
+.entity .e-anchor{color:var(--text-bright);font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.entity .e-hwm{font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;padding:1px 6px;border:1px solid var(--border-strong);background:var(--surface-2);white-space:nowrap}
+.entity .e-row{display:flex;gap:10px;font-size:12px;line-height:1.5;padding:1px 0}
+.entity .e-key{color:var(--text-dim);min-width:88px;font-weight:500}
+.entity .e-val{color:var(--text-bright);word-break:break-word}
+.entity .e-meta{margin-top:4px;font-size:10px;color:var(--text-faint);display:flex;gap:10px;flex-wrap:wrap}
+.conn{font-size:11.5px;color:var(--text);padding:2px 0;font-family:var(--mono)}
+.conn .arrow{color:var(--triad-structure);margin:0 6px}
+.viol{font-size:11px;color:var(--red);padding:3px 0;border-bottom:1px dashed #f4c4c4}
+.viol:last-child{border-bottom:none}
+.viol .v-type{color:var(--signal);text-transform:uppercase;font-size:10px;letter-spacing:1px;margin-right:6px}
+.schema-row{font-size:11.5px;color:var(--text);padding:1px 0}
+.schema-row .k{color:var(--text-bright);font-weight:500}
+.schema-row .v{color:var(--triad-existence);word-break:break-word}
+
+/* ── Tables view ────────────────────────────────────────────────────── */
+.tv-tabs{display:flex;gap:0;padding:0 14px;border-bottom:1px solid var(--border-strong);background:var(--surface-2);overflow-x:auto;flex-shrink:0}
+.tv-tab{display:flex;align-items:center;gap:7px;padding:8px 14px;background:transparent;border:none;border-bottom:3px solid transparent;color:var(--text);font-size:12.5px;cursor:pointer;white-space:nowrap;font-family:var(--mono);font-weight:500}
+.tv-tab:hover{color:var(--text-bright);background:var(--surface)}
+.tv-tab.active{border-bottom-color:#000;color:var(--text-bright);background:var(--surface);font-weight:700}
+.tv-tab .trows{font-size:10.5px;color:var(--text-dim);padding:1px 6px;border:1px solid var(--border-strong);background:#fff;font-weight:500}
+.tv-body{flex:1;overflow:auto;min-height:0;padding:16px}
+.tv-empty{padding:48px 30px;text-align:center;color:var(--text-dim);font-size:12px;line-height:1.7}
+.tv-empty .glyph{font-size:30px;color:var(--text-faint);margin-bottom:12px;display:block}
+.dbtable{background:#fff;border:1px solid var(--border-strong)}
+.dbtable-head{display:flex;justify-content:space-between;align-items:baseline;padding:9px 14px;border-bottom:1px solid var(--border-strong);background:var(--surface-2)}
+.dbtable-head .name{font-size:13px;color:var(--text-bright);font-weight:700;text-transform:lowercase}
+.dbtable-head .meta{font-size:11.5px;color:var(--text-dim)}
+.dbtable-scroll{overflow-x:auto;max-width:100%}
+table.dbgrid{border-collapse:collapse;font-size:12px;font-family:var(--mono);min-width:100%}
+table.dbgrid th, table.dbgrid td{padding:6px 11px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border);border-right:1px solid var(--border);white-space:nowrap}
+table.dbgrid th:last-child, table.dbgrid td:last-child{border-right:none}
+table.dbgrid thead th{background:var(--surface-3);color:var(--text);font-weight:700;font-size:10.5px;text-transform:uppercase;letter-spacing:1.3px;position:sticky;top:0;border-bottom:2px solid var(--border-strong)}
+table.dbgrid thead th.pk{color:var(--text-bright)}
+table.dbgrid tbody tr:hover{background:var(--surface-2)}
+table.dbgrid tbody tr:last-child td{border-bottom:none}
+table.dbgrid td.anchor{color:var(--text-bright);font-weight:600}
+table.dbgrid td.null{color:var(--text-faint);font-style:italic}
+table.dbgrid td.num{color:var(--triad-existence);text-align:right}
+table.dbgrid td.json{color:var(--text-dim);max-width:300px;overflow:hidden;text-overflow:ellipsis}
+table.dbgrid tr.pending td{background:#fdf9ef}
+
+/* ── Ops palette ────────────────────────────────────────────────────── */
+.ops{background:var(--surface);border-top:1px solid var(--border-strong)}
+.ops-head{padding:6px 14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border);min-height:30px}
+.ops-head .label{font-size:10px;text-transform:uppercase;letter-spacing:1.3px;color:var(--text-dim);font-weight:700}
+.ops-head .faint{font-size:11px;color:var(--text-dim)}
+.ops-head .spacer{flex:1}
+.ops-grid{display:flex;gap:5px;padding:8px 14px;flex-wrap:wrap}
+.op-btn{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border:1px solid var(--border-strong);background:#fff;color:var(--text);font-size:11.5px;cursor:pointer;letter-spacing:.3px;font-weight:600;font-family:var(--mono)}
+.op-btn:hover:not(:disabled){border-color:#000;background:var(--surface-2)}
+.op-btn:disabled{opacity:.4;cursor:not-allowed}
+.op-btn .gly{font-size:14px;line-height:1}
+.op-btn .key{font-size:11px;letter-spacing:1px}
+.op-btn.existence .gly{color:var(--triad-existence)}
+.op-btn.structure .gly{color:var(--triad-structure)}
+.op-btn.significance .gly{color:var(--triad-significance)}
+.op-btn.ephemeral{border-style:dashed;color:var(--text-dim)}
+.op-btn.active{background:#000;border-color:#000;color:#fff}
+.op-btn.active .gly,.op-btn.active .key{color:#fff}
+
+.op-form{padding:10px 14px;display:flex;flex-direction:column;gap:7px;border-top:1px solid var(--border);background:var(--surface-2);border-left:3px solid #000}
+.op-form .head{font-size:10.5px;text-transform:uppercase;letter-spacing:1.2px;color:var(--text-dim);font-weight:700}
+.op-form .head b{color:var(--text-bright)}
+.op-form .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:7px}
+.op-form .grid .field{margin:0}
+.op-form input,.op-form select{font-size:11.5px;padding:4px 7px;background:#fff;width:100%}
+.op-form .actions{display:flex;gap:6px;margin-top:2px;align-items:center}
+.op-form .actions .hint{font-size:10.5px;color:var(--text-dim);flex:1}
+.op-form .actions button{padding:5px 14px;font-size:11px;background:#000;border:1px solid #000;color:#fff;letter-spacing:.4px;text-transform:lowercase;font-weight:700;cursor:pointer}
+.op-form .actions button.ghost{background:#fff;color:var(--text);border-color:var(--border-strong)}
+.op-form .actions button.ghost:hover{border-color:#000;color:#000}
+.op-form .err{font-size:11px;color:var(--red);padding:3px 0}
+.op-form .row{display:flex;gap:6px;align-items:center}
+
+/* Ephemeral flash lane (NUL/SIG) */
+.eph-lane{display:flex;align-items:center;gap:12px;padding:4px 14px;background:#fdf4d8;border-top:1px solid var(--border);min-height:24px;font-size:11px;border-left:3px solid var(--signal)}
+.eph-lane.empty{display:none}
+.eph-lane .eph-label{font-size:9.5px;text-transform:uppercase;letter-spacing:1.3px;color:var(--signal);font-weight:700}
+.eph-flashes{display:flex;gap:5px;flex-wrap:wrap;flex:1}
+.eph-flash{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px dashed var(--signal);background:#fff;animation:ephFade 4.5s ease-out forwards;font-size:11px}
+.eph-flash .gly{font-size:11px;color:var(--triad-existence)}
+@keyframes ephFade{0%{opacity:0;transform:translateY(-2px)}10%{opacity:1;transform:none}80%{opacity:1}100%{opacity:0}}
+
+/* ── Scrubber footer ────────────────────────────────────────────────── */
+.scrubber{display:grid;grid-template-columns:auto 1fr auto auto;align-items:center;gap:12px;padding:6px 14px;border-top:1px solid var(--border-strong);background:var(--surface);font-size:11px;color:var(--text-dim);min-height:30px}
+.scrubber .label{font-size:10px;text-transform:uppercase;letter-spacing:1.3px;font-weight:700}
+.scrubber .label b{color:var(--text-bright)}
+.scrubber .bar{position:relative;height:10px;background:var(--surface-3);border:1px solid var(--border)}
+.scrubber .bar .fill{position:absolute;left:0;top:0;bottom:0;background:var(--text-faint)}
+.scrubber .bar .cursor{position:absolute;top:-3px;width:10px;height:14px;background:#000;border:1px solid #000;transform:translateX(-5px)}
+.scrubber .ts{font-variant-numeric:tabular-nums;color:var(--text)}
+.scrubber .live{padding:1px 7px;border:1px solid var(--triad-existence);color:var(--triad-existence);background:#fff;font-size:10px;text-transform:uppercase;letter-spacing:1px;font-weight:700}
+
+/* ── Modal ──────────────────────────────────────────────────────────── */
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px}
+.modal{background:var(--surface);border:1px solid #000;width:100%;max-width:480px;box-shadow:6px 6px 0 var(--surface-3)}
+.modal-head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.modal-head h3{font-size:13px;font-weight:700;color:var(--text-bright);text-transform:uppercase;letter-spacing:1.3px}
+.modal-head .close{font-size:18px;line-height:1;color:var(--text-dim);padding:0 6px;cursor:pointer}
+.modal-head .close:hover{color:#000}
+.modal-body{padding:18px;font-size:12px;line-height:1.6}
+.modal-body p{margin-bottom:12px;color:var(--text-dim)}
+.modal-foot{padding:12px 18px;border-top:1px solid var(--border);background:var(--surface-2);display:flex;justify-content:flex-end;gap:8px}
+.key-display{background:var(--surface-3);border:1px solid var(--border-strong);padding:12px;font-size:13px;color:var(--text-bright);word-break:break-all;margin:8px 0 14px;user-select:all;font-weight:600;letter-spacing:.3px}
+
+/* ── Responsive ─────────────────────────────────────────────────────── */
+@media (max-width: 720px){
+  .shell-body{grid-template-columns:1fr}
+  .sidebar{display:none}
+  .sidebar.show{display:flex;position:absolute;top:46px;left:0;bottom:0;width:240px;z-index:20;box-shadow:2px 0 8px rgba(0,0,0,.1)}
+  .topbar{padding:6px 10px;gap:8px}
+  .modes button{padding:4px 9px;font-size:11px}
+  .view-head{padding:9px 12px}
+  .view-head h2{font-size:14px}
+  .ops-grid{padding:7px 10px;gap:4px}
+  .op-btn{padding:4px 9px;font-size:11px}
+  .scrubber{padding:5px 10px;grid-template-columns:auto 1fr auto;gap:8px}
+  .scrubber .ts{display:none}
+}
+@media (max-width: 480px){
+  .brand .sub{display:none}
+  .status-bar .badge{padding:2px 5px;font-size:9px}
+}
 </style>
 </head>
 <body>
-<div class="app">
-  <div class="header">
-    <h1>Matrix Events</h1>
-    <span class="tag">rooms as database · operators as schema · fold as query</span>
+
+<!-- ── Auth screen ────────────────────────────────────────── -->
+<div id="authScreen" class="auth-screen">
+  <div class="auth-card">
+    <div class="auth-head">
+      <div class="logo"><span class="sq"></span>matrix-events</div>
+      <div class="sub">bare metal · rooms as database</div>
+    </div>
+    <div class="auth-tabs">
+      <button class="auth-tab active" data-auth-tab="signin">sign in</button>
+      <button class="auth-tab" data-auth-tab="register">create account</button>
+    </div>
+    <div class="auth-body" id="authBody">
+      <div id="authError" class="auth-err hidden"></div>
+      <div id="authInfo" class="auth-info hidden"></div>
+
+      <!-- Sign In -->
+      <div id="signinPane">
+        <div class="field">
+          <label>Username</label>
+          <div class="field-row">
+            <span class="prefix">@</span>
+            <input id="inUser" placeholder="alice  or  alice:matrix.org" autocomplete="username">
+            <span class="suffix" id="inUserSuffix">:matrix.org</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input id="inPass" type="password" autocomplete="current-password">
+        </div>
+        <div class="field">
+          <label>Homeserver</label>
+          <div class="field-row">
+            <span class="prefix">https://</span>
+            <input id="inHS" placeholder="matrix.org" value="matrix.org">
+          </div>
+          <div class="hint">where your account lives · default: matrix.org</div>
+        </div>
+        <button class="btn-primary" id="loginBtn">sign in</button>
+      </div>
+
+      <!-- Register -->
+      <div id="registerPane" class="hidden">
+        <div class="field">
+          <label>Choose a username</label>
+          <div class="field-row">
+            <span class="prefix">@</span>
+            <input id="regUser" placeholder="alice" autocomplete="username">
+            <span class="suffix" id="regUserSuffix">:matrix.org</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input id="regPass" type="password" autocomplete="new-password">
+          <div class="hint">at least 8 characters · this also unlocks the local vault</div>
+        </div>
+        <div class="field">
+          <label>Confirm password</label>
+          <input id="regPass2" type="password" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label>Homeserver</label>
+          <div class="field-row">
+            <span class="prefix">https://</span>
+            <input id="regHS" placeholder="matrix.org" value="matrix.org">
+          </div>
+          <div class="hint">the server must allow open registration</div>
+        </div>
+        <button class="btn-primary" id="registerBtn">create account</button>
+      </div>
+    </div>
+    <div class="auth-foot">
+      your session, projection cursor, and rooms are kept <b>locally</b>.<br>
+      no data leaves your browser without your password.
+    </div>
+  </div>
+</div>
+
+<!-- ── Unlock screen ──────────────────────────────────────── -->
+<div id="unlockScreen" class="auth-screen hidden">
+  <div class="auth-card unlock-card">
+    <div class="auth-head">
+      <div class="logo"><span class="sq"></span>matrix-events</div>
+      <div class="sub">welcome back · unlock your local vault</div>
+    </div>
+    <div class="auth-body">
+      <div id="unlockError" class="auth-err hidden"></div>
+      <div class="field">
+        <label>Account</label>
+        <div class="user-chip" id="unlockUser"></div>
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input id="unlockPass" type="password" autocomplete="current-password">
+        <div class="hint">unlocks local data · works offline</div>
+      </div>
+      <button class="btn-primary" id="unlockBtn">unlock</button>
+      <div style="margin-top:14px;text-align:center">
+        <button class="btn-ghost" id="useDifferentAccountBtn">use a different account</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── App shell ──────────────────────────────────────────── -->
+<div id="appShell" class="shell hidden">
+  <!-- Topbar -->
+  <div class="topbar">
+    <button class="btn-ghost hidden" id="sidebarToggle" style="padding:5px 9px;font-size:13px;line-height:1">☰</button>
+    <div class="brand"><span class="sq"></span>matrix-events<span class="sub">bare metal</span></div>
+    <div class="room-picker">
+      <button class="pickbtn" id="currentRoomBtn">
+        <span class="dot off" id="currentRoomDot"></span>
+        <span id="currentRoomName">no room selected</span>
+        <span class="caret">▾</span>
+      </button>
+    </div>
+    <div class="spacer"></div>
+    <div class="modes">
+      <button data-view="log" class="active">log</button>
+      <button data-view="state">state</button>
+      <button data-view="tables">tables</button>
+    </div>
     <div class="status-bar">
       <span id="netBadge" class="badge">● —</span>
       <span id="lockBadge" class="badge">🔒 —</span>
-      <span id="outboxBadge" class="badge">✓ —</span>
-    </div>
-  </div>
-  <div id="log"></div>
-
-  <div id="authPanel" class="panel">
-    <h2>Connect</h2>
-    <p class="info">First login on this device. We'll set up a local vault from your password so your data stays encrypted on disk.</p>
-    <div class="field"><label>Username</label><input id="inUser" placeholder="@user:homeserver.com" oninput="
-      const v=this.value.trim();
-      document.getElementById('hsField').classList.toggle('hidden',v.includes(':'));
-      if(v.includes(':'))document.getElementById('inHS').value='https://'+v.split(':').slice(1).join(':');
-    "></div>
-    <div class="field"><label>Password</label><input id="inPass" type="password"></div>
-    <div class="field" id="hsField"><label>Homeserver</label><input id="inHS" placeholder="https://matrix.org"></div>
-    <div class="btn-row"><button class="primary" id="loginBtn">Login</button></div>
-  </div>
-
-  <div id="unlockPanel" class="panel hidden">
-    <h2>Unlock</h2>
-    <p class="info">Enter your password to unlock local data. Works offline — sync resumes when you're back online.</p>
-    <div class="field"><label>Account</label><span id="unlockUser" style="color:var(--accent)"></span></div>
-    <div class="field"><label>Password</label><input id="unlockPass" type="password" onkeydown="if(event.key==='Enter')document.getElementById('unlockBtn').click()"></div>
-    <div class="btn-row">
-      <button class="primary" id="unlockBtn">Unlock</button>
-      <button class="link" id="useDifferentAccountBtn">Use a different account</button>
+      <span id="outboxBadge" class="badge">↻ —</span>
     </div>
   </div>
 
-  <div id="appPanel" class="hidden">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap">
-      <span id="userDisplay" style="color:var(--accent);font-size:12px"></span>
-      <div class="btn-row" style="margin-top:0">
-        <button id="syncNowBtn" style="font-size:11px">↻ Sync now</button>
-        <button id="clearOutboxBtn" style="font-size:11px">Clear failed</button>
-        <button id="lockBtn" style="font-size:11px">Lock</button>
-        <button id="logoutBtn" class="danger" style="font-size:11px">Logout (wipe)</button>
+  <!-- Body -->
+  <div class="shell-body">
+    <!-- Sidebar -->
+    <div class="sidebar" id="sidebar">
+      <div class="sb-section">
+        <div class="sb-section-head">
+          Rooms <span class="count" id="roomsCount">0</span>
+        </div>
+        <div id="roomList"></div>
+        <div class="sb-newroom">
+          <div class="row">
+            <input id="newRoomName" placeholder="room name">
+            <input id="newRoomType" placeholder="type" value="general" style="max-width:80px">
+          </div>
+          <button id="createRoomBtn">+ create room</button>
+        </div>
+      </div>
+      <div class="sb-section">
+        <div class="sb-section-head">Activity</div>
+        <div class="sb-toast" id="logList"></div>
+      </div>
+      <div class="sb-foot">
+        <div class="user" id="userDisplay">—</div>
+        <div class="btn-row">
+          <button id="syncNowBtn">↻ sync</button>
+          <button id="clearOutboxBtn">clear failed</button>
+          <button id="lockBtn">lock</button>
+          <button id="logoutBtn" class="danger">logout</button>
+        </div>
       </div>
     </div>
-    <div class="panel">
-      <h2>Rooms</h2>
-      <div id="roomList" style="margin-bottom:12px"></div>
-      <div style="display:flex;gap:8px">
-        <input id="newRoomName" placeholder="Room name" style="flex:1">
-        <input id="newRoomType" placeholder="Type" style="width:100px">
-        <button id="createRoomBtn">Create</button>
+
+    <!-- View area -->
+    <div class="view-area">
+      <!-- LOG view -->
+      <div id="viewLog" class="view active">
+        <div class="view-head">
+          <h2>timeline</h2>
+          <span class="crumb" id="logCrumb">no room selected</span>
+          <div class="right">
+            append-only operator stream · <b>EVENTS</b> are folded into projected state.
+            click an entity in <b>state</b> view to inspect its history.
+          </div>
+        </div>
+        <div class="log-body" id="logBody">
+          <div class="log-empty">
+            <span class="glyph">∅</span>
+            select or create a room to begin.
+          </div>
+        </div>
+      </div>
+
+      <!-- STATE view -->
+      <div id="viewState" class="view">
+        <div class="view-head">
+          <h2>projected state</h2>
+          <span class="crumb" id="stateCrumb">no room selected</span>
+          <div class="right">
+            <b>fold(events)</b> — the canonical projection.
+            includes pending optimistic edits.
+          </div>
+        </div>
+        <div class="state-body" id="stateBody"></div>
+      </div>
+
+      <!-- TABLES view -->
+      <div id="viewTables" class="view">
+        <div class="view-head">
+          <h2>tables</h2>
+          <span class="crumb" id="tablesCrumb">no room selected</span>
+          <div class="right">
+            entities grouped by <b>_type</b> — DEFs project as columns.
+          </div>
+        </div>
+        <div class="tv-tabs" id="tvTabs"></div>
+        <div class="tv-body" id="tvBody"></div>
       </div>
     </div>
-    <div class="panel hidden" id="roomControls">
-      <h2 id="currentRoomName">—</h2>
-      <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Members: <span id="memberList">—</span></div>
-      <div class="btn-row" style="margin-top:0">
-        <button id="emitInsBtn">+ INS (create entity)</button>
-        <button id="emitDefBtn">⊢ DEF (set value)</button>
-        <button id="inviteBtn">⋈ Invite user</button>
-      </div>
+  </div>
+
+  <!-- Ops palette -->
+  <div class="ops">
+    <div class="ops-head">
+      <span class="label">Emit operator</span>
+      <span class="faint" id="opsHint">select an op · or click ∅/○ to flash an ephemeral signal</span>
+      <span class="spacer"></span>
+      <button class="btn-ghost" id="inviteBtn" style="padding:3px 9px;font-size:11px">⋈ invite</button>
     </div>
-    <div class="panel">
-      <h2>Projected State (integral fold)</h2>
-      <pre id="stateView" style="min-height:60px">{ }</pre>
-    </div>
+    <div class="ops-grid" id="opsGrid"></div>
+    <div class="op-form hidden" id="opForm"></div>
+  </div>
+
+  <!-- Ephemeral lane -->
+  <div class="eph-lane empty" id="ephLane">
+    <span class="eph-label">Ephemeral</span>
+    <div class="eph-flashes" id="ephFlashes"></div>
+  </div>
+
+  <!-- Scrubber -->
+  <div class="scrubber">
+    <span class="label">FOLD(<b id="foldCount">0</b>)</span>
+    <div class="bar" id="scrubBar"><div class="fill" id="scrubFill"></div><div class="cursor" id="scrubCursor" style="left:100%"></div></div>
+    <span class="live">live</span>
+    <span class="ts" id="foldTs">—</span>
   </div>
 </div>
+
+<!-- ── Modals ──────────────────────────────────────────── -->
 <div id="recoveryDisplayModal" class="modal-backdrop hidden">
   <div class="modal">
-    <h3>Save your recovery key</h3>
-    <p>This key restores your message history on new browsers and devices. Save it somewhere safe — it cannot be shown again.</p>
-    <div class="key-display" id="recoveryKeyText"></div>
-    <div class="btn-row" style="margin-top:0">
-      <button class="primary" id="recoveryDisplayAck">I've saved it</button>
+    <div class="modal-head"><h3>save your recovery key</h3></div>
+    <div class="modal-body">
+      <p>this key restores your message history on new browsers and devices. save it somewhere safe — it cannot be shown again.</p>
+      <div class="key-display" id="recoveryKeyText"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-primary" id="recoveryDisplayAck" style="width:auto;padding:7px 18px">i've saved it</button>
     </div>
   </div>
 </div>
+
 <div id="recoveryEntryModal" class="modal-backdrop hidden">
   <div class="modal">
-    <h3>Enter your recovery key</h3>
-    <p>This device is new. Paste the recovery key from your first login to decrypt prior messages.</p>
-    <div class="field"><input id="recoveryKeyInput" placeholder="EsTb …" autocomplete="off"></div>
-    <div class="btn-row" style="margin-top:0">
-      <button class="primary" id="recoveryEntrySubmit">Unlock</button>
-      <button id="recoveryEntrySkip">Skip</button>
+    <div class="modal-head"><h3>enter your recovery key</h3></div>
+    <div class="modal-body">
+      <p>this device is new. paste the recovery key from your first login to decrypt prior messages.</p>
+      <input id="recoveryKeyInput" placeholder="EsTb …" autocomplete="off">
+    </div>
+    <div class="modal-foot">
+      <button class="btn-ghost" id="recoveryEntrySkip">skip</button>
+      <button class="btn-primary" id="recoveryEntrySubmit" style="width:auto;padding:7px 18px">unlock</button>
     </div>
   </div>
 </div>
+
+<div id="roomPickerModal" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>switch room</h3>
+      <button class="close" data-close-modal="roomPickerModal">×</button>
+    </div>
+    <div class="modal-body" id="roomPickerBody"></div>
+  </div>
+</div>
+
+<div id="entityModal" class="modal-backdrop hidden">
+  <div class="modal" style="max-width:640px">
+    <div class="modal-head">
+      <h3 id="entityModalAnchor">entity</h3>
+      <button class="close" data-close-modal="entityModal">×</button>
+    </div>
+    <div class="modal-body" id="entityModalBody"></div>
+  </div>
+</div>
+
 <script type="module" src="/src/main.js"></script>
 </body>
 </html>
