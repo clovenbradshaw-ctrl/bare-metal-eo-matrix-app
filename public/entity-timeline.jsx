@@ -1,9 +1,13 @@
-/* entity-timeline.jsx — per-entity timeline slice.
+/* entity-timeline.jsx — timeline slice for a set.
  *
- * Shows the event history of a single anchor: every log event that touched it,
- * ordered earliest → latest, on a vertical spine with triad-colored dots.
- * The header carries an entity-picker so you can jump between siblings of the
- * same type without going back to the grid.
+ * When an entityAnchor is selected, this shows the event history of a single
+ * anchor: every log event that touched it, ordered earliest → latest, on a
+ * vertical spine with triad-colored dots. The header carries an entity-picker
+ * so you can jump between siblings of the same type.
+ *
+ * When no entityAnchor is selected, this is the set-level timeline: it shows
+ * every log event that touched any entity in the set, with the option to
+ * focus on one entity at a time.
  */
 
 (function () {
@@ -58,35 +62,103 @@ function EntityTimelineView({
   const siblings = useMemo(() => Object.values(state.entities).filter(e => e._type === entityType), [state.entities, entityType]);
   const entity = state.entities[entityAnchor];
 
-  // Events that touched this anchor
+  // Events touching this anchor (focused) or any entity in the set (set-level)
   const events = useMemo(() => {
-    if (!entityAnchor) return [];
-    return allEventsInRoom
-      .map((e, i) => ({ ...e, _seq: i, _anchorFocus: entityAnchor }))
-      .filter(e => eventTouchesAnchor(e, entityAnchor));
-  }, [allEventsInRoom, entityAnchor]);
+    const indexed = allEventsInRoom.map((e, i) => ({ ...e, _seq: i, _anchorFocus: entityAnchor || null }));
+    if (entityAnchor) return indexed.filter(e => eventTouchesAnchor(e, entityAnchor));
+    const anchors = new Set(siblings.map(s => s._anchor));
+    return indexed.filter(e => {
+      const c = e.content || {};
+      if (anchors.has(c.anchor)) return true;
+      if (anchors.has(c.source_anchor) || anchors.has(c.target_anchor)) return true;
+      if (Array.isArray(c.input_anchors) && c.input_anchors.some(a => anchors.has(a))) return true;
+      return false;
+    });
+  }, [allEventsInRoom, entityAnchor, siblings]);
 
+  function jumpTo(anchor) {
+    if (!anchor) {
+      setSelection({ kind: 'slice', sliceId: `${entityType}.timeline`, sliceKind: 'timeline', tableId: entityType });
+      return;
+    }
+    const target = state.entities[anchor];
+    if (!target) return;
+    setSelection({ kind: 'slice', sliceId: `${target._type}.timeline.${anchor}`, sliceKind: 'timeline', tableId: target._type, entityAnchor: anchor });
+  }
+
+  // Set-level timeline (no entity focused) — show all events on this set's anchors.
   if (!entity) {
     return (
       <div className="table-view">
         {scrubber}
-        <div className="tv-body single">
-          <div className="tv-empty">
-            <div className="glyph">⏚</div>
-            <div>no entity selected. pick one from the grid to view its timeline.</div>
-          </div>
+        <div className="tv-body single schema-body">
+          <header className="page-hero entity-hero">
+            <div className="page-hero-eyebrow">
+              <span className="page-hero-kind"><span className="page-hero-glyph">⏚</span> timeline</span>
+              <span className="page-hero-sep">·</span>
+              <span className="page-hero-crumb">{room.id.replace('!','')}<span className="page-hero-slash">/</span>{entityType}</span>
+              <button
+                className="entity-back"
+                onClick={() => setSelection({ kind: 'slice', sliceId: `${entityType}.table`, sliceKind: 'table', tableId: entityType })}
+                title="back to set"
+              >← {entityType} table</button>
+            </div>
+            <h1 className="page-hero-title">{entityType} · timeline</h1>
+            <div className="page-hero-sub" style={{display:'flex',alignItems:'center',gap:14,flexWrap:'wrap'}}>
+              <span>{events.length} event{events.length !== 1 ? 's' : ''} across {siblings.length} entit{siblings.length !== 1 ? 'ies' : 'y'}</span>
+              {siblings.length > 0 && (
+                <span style={{display:'flex',alignItems:'center',gap:6}}>
+                  <span style={{color:'var(--text-faint)',fontSize:11,textTransform:'uppercase',letterSpacing:1.2}}>focus on:</span>
+                  <select
+                    value=""
+                    onChange={e => jumpTo(e.target.value)}
+                    style={{fontSize:12,padding:'3px 7px',border:'1px solid var(--border-strong)',background:'#fff',fontFamily:'var(--mono)'}}
+                  >
+                    <option value="">— all entities —</option>
+                    {siblings.map(s => (
+                      <option key={s._anchor} value={s._anchor}>{s.title || s.body || s.claim || s.what || s._anchor}</option>
+                    ))}
+                  </select>
+                </span>
+              )}
+            </div>
+          </header>
+
+          <section className="page-section">
+            <div className="page-section-head">
+              <h2 className="page-section-label">events</h2>
+              <span className="page-section-sub">earliest → latest · {events.length} on this set</span>
+            </div>
+            <div className="tl-spine">
+              {events.map(ev => {
+                const s = eventSummary(ev);
+                const isRec = s.op?.key === 'rec';
+                const isViol = state._violations.some(v => v._eventId === ev.event_id);
+                return (
+                  <div key={ev.event_id} className="tl-event">
+                    <div className={`tl-dot ${s.triad} ${isRec ? 'rec' : ''}`} />
+                    <div className={`tl-card ${s.op?.triad === 'structure' ? 'con' : ''} ${isRec ? 'rec' : ''} ${isViol ? 'eva-fail' : ''}`}>
+                      <div className="tl-card-head">
+                        <span className={`tl-card-op ${s.triad}`}>{s.key}</span>
+                        <span className="tl-card-ts">#{String(ev._seq).padStart(3,'0')} · {new Date(ev.origin_server_ts).toLocaleString()}</span>
+                      </div>
+                      <div className="tl-card-body">
+                        {s.body}
+                        <div className="tl-card-agent">by {ev.sender}</div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+              {events.length === 0 && <div className="tv-empty">no events have touched this set yet</div>}
+            </div>
+          </section>
         </div>
       </div>
     );
   }
 
   const fields = Object.entries(entity).filter(([k]) => !k.startsWith('_'));
-
-  function jumpTo(anchor) {
-    const target = state.entities[anchor];
-    if (!target) return;
-    setSelection({ kind: 'slice', sliceId: `${target._type}.timeline.${anchor}`, sliceKind: 'timeline', tableId: target._type, entityAnchor: anchor });
-  }
 
   return (
     <div className="table-view">
@@ -99,9 +171,9 @@ function EntityTimelineView({
             <span className="page-hero-crumb">{room.id.replace('!','')}<span className="page-hero-slash">/</span>{entityType}<span className="page-hero-slash">/</span>{entity._anchor}</span>
             <button
               className="entity-back"
-              onClick={() => setSelection({ kind: 'slice', sliceId: `${entityType}.grid`, sliceKind: 'grid', tableId: entityType })}
-              title="back to table"
-            >← {entityType} grid</button>
+              onClick={() => setSelection({ kind: 'slice', sliceId: `${entityType}.table`, sliceKind: 'table', tableId: entityType })}
+              title="back to set"
+            >← {entityType} table</button>
           </div>
           <h1 className="page-hero-title">{entity.title || entity.body || entity.claim || entity.what || entity._anchor}</h1>
           <div className="page-hero-sub" style={{display:'flex',alignItems:'center',gap:14,flexWrap:'wrap'}}>

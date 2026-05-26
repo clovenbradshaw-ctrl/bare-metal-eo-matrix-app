@@ -184,7 +184,7 @@ function TweakControls({ t, setTweak, onLoadSeed, onClearAll }) {
         <TweakToggle label="Show entity _hwm"
           value={t.showHwm} onChange={v => setTweak('showHwm', v)} />
       </TweakSection>
-      <TweakSection label="Table view">
+      <TweakSection label="Set view">
         <TweakToggle label="Show CREATE TABLE DDL"
           value={t.showSchemaDDL} onChange={v => setTweak('showSchemaDDL', v)} />
       </TweakSection>
@@ -193,10 +193,11 @@ function TweakControls({ t, setTweak, onLoadSeed, onClearAll }) {
           value={t.defaultMode}
           onChange={v => setTweak('defaultMode', v)}
           options={[
-            { value: 'db',    label: 'log'    },
-            { value: 'table', label: 'tables' },
-            { value: 'graph', label: 'graph'  },
-            { value: 'app',   label: 'kanban' },
+            { value: 'db',       label: 'log'      },
+            { value: 'table',    label: 'table'    },
+            { value: 'graph',    label: 'graph'    },
+            { value: 'kanban',   label: 'kanban'   },
+            { value: 'timeline', label: 'timeline' },
           ]}
         />
       </TweakSection>
@@ -427,7 +428,7 @@ function App() {
             if (existing.includes(name)) return;
             onEmit(window.MatrixEngine.OP.DEF, { anchor: null, path: '_schema.tables', value: [...existing, name] });
             onEmit(window.MatrixEngine.OP.DEF, { anchor: null, path: `_schema.fields.${name}`, value: [{ name: 'title', type: 'text' }] });
-            setSelection({ kind: 'slice', sliceId: `${name}.grid`, tableId: name, sliceKind: 'grid' });
+            setSelection({ kind: 'slice', sliceId: `${name}.table`, tableId: name, sliceKind: 'table' });
           }}
           eventsTotal={total}
           ephemeralsCount={ephemerals.length}
@@ -454,7 +455,7 @@ function App() {
               scrubber={scrubberEl}
             />
           )}
-          {selection.kind === 'slice' && (selection.sliceKind === 'grid') && (
+          {selection.kind === 'slice' && (selection.sliceKind === 'table') && (
             <window.TableView
               room={rooms.find(r => r.id === currentRoomId)}
               state={state}
@@ -482,16 +483,6 @@ function App() {
               scrubber={scrubberEl}
               forceTable={selection.tableId}
               forceMode="kanban"
-            />
-          )}
-          {selection.kind === 'slice' && selection.sliceKind === 'notebook' && (
-            <window.AppView
-              room={rooms.find(r => r.id === currentRoomId)}
-              state={state}
-              onEmit={onEmit}
-              scrubber={scrubberEl}
-              forceTable={selection.tableId}
-              forceMode="notebook"
             />
           )}
           {selection.kind === 'slice' && selection.sliceKind === 'graph' && (
