@@ -340,7 +340,7 @@ function GraphView({ room, state, onEmit, scrubber }) {
           <button onClick={unpinAll} title="re-run physics">↻ relax</button>
         </div>
         <div className="right">
-          nodes = INS · edges = CON · drag to move · click to inspect
+          drag to move · click to inspect
         </div>
       </div>
 
@@ -576,7 +576,7 @@ function GraphView({ room, state, onEmit, scrubber }) {
 
         {nodes.length === 0 && (
           <div className="tv-empty" style={{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
-            no entities yet — emit INS to create nodes
+            no records yet — add one to create a node
           </div>
         )}
       </div>

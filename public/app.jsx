@@ -145,8 +145,8 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
 function Scrubber({ cursor, total, ts, onSeek, onLive, live }) {
   return (
     <div className="scrubber">
-      <span className="label">
-        fold(events[0..<b>{cursor}</b>]) <span className="muted">/ {total}</span>
+      <span className="label" title={`fold(events[0..${cursor}]) / ${total}`}>
+        {live ? 'live' : 'time travel'}
       </span>
       <input
         type="range"

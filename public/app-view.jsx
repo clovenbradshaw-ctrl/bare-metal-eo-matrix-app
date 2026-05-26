@@ -249,11 +249,7 @@ function CreateBoardForm({ state, onEmit, onCancel }) {
         create a kanban board
       </div>
       <div style={{fontSize:11.5,color:'var(--text-dim)',marginBottom:18,lineHeight:1.6}}>
-        a kanban is a projection of an entity type into partitions. defining the board writes its
-        shape into the log:
-        <span className="kbd" style={{margin:'0 4px'}}>DEF _schema.tables</span>
-        <span className="kbd" style={{margin:'0 4px'}}>DEF _schema.fields.&lt;type&gt;</span>
-        <span className="kbd" style={{margin:'0 4px'}}>DEF _schema.partitions.&lt;type&gt;</span>
+        a kanban groups records of one set into columns. pick the set, name the columns, and a board lands in the sidebar.
       </div>
       <div style={{display:'flex',flexDirection:'column',gap:10}}>
         <div style={{display:'flex',gap:8,alignItems:'center'}}>
@@ -322,11 +318,7 @@ function AppView({ room, state, onEmit, scrubber, forceTable, forceMode }) {
       {!forceTable && (
         <div className="app-head">
           <h2>{room.title || 'untitled workspace'}</h2>
-          <span className="crumb">projection · {creating ? 'create board' : kind.kind}{kind.kanbanType ? ` · ${kind.kanbanType}` : ''} · {Object.keys(state.entities).length} entities</span>
-          <div className="right">
-            add a card → emits <b>INS</b> + <b>DEF</b>. drag → <b>SEG</b>.
-            switch to <b>log</b> to see them land.
-          </div>
+          <span className="crumb">projection · {creating ? 'create board' : kind.kind}{kind.kanbanType ? ` · ${kind.kanbanType}` : ''} · {Object.keys(state.entities).length} records</span>
         </div>
       )}
       {scrubber}

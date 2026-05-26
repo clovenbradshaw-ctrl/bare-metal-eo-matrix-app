@@ -370,7 +370,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             {rows.length === 0 && (
               <tr>
                 <td className="cell" colSpan={allCols.length + 1} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
-                  0 rows · schema is defined, no INS events yet
+                  no rows yet — add one below
                 </td>
               </tr>
             )}
@@ -451,11 +451,11 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                 <div className="add-row-input">
                   <input
                     value={newRowTitle}
-                    placeholder={`+ add ${entityType} row…`}
+                    placeholder="add row…"
                     onChange={e => setNewRowTitle(e.target.value)}
                     onKeyDown={e => { if (e.key === 'Enter') addRow(); }}
                   />
-                  <button onClick={addRow}>INSERT</button>
+                  <button onClick={addRow} title="add a new row">+</button>
                 </div>
               </td>
             </tr>
@@ -1278,9 +1278,7 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
           <h2>{room.title || 'untitled workspace'}</h2>
           <span className="crumb">projection · {tables.length} set{tables.length!==1?'s':''} · {Object.keys(state.entities).length} rows · {state.connections.length} edges</span>
           <div className="right">
-            one set at a time — like airtable.
-            spaces = bases · sets = entity types · a <b>table</b> is one projection · <b>CON</b> edges = linked records.
-            double-click a cell to edit (emits <b>DEF</b>).
+            double-click a cell to edit.
           </div>
         </div>
       )}
