@@ -166,6 +166,32 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .proj-modal-create:hover:not(:disabled){background:#222}
 .proj-modal-create:disabled{background:var(--text-faint);border-color:var(--text-faint);cursor:not-allowed}
 
+/* ── CSV import modal (reuses .proj-modal-* shell) ───────────────────── */
+.csv-target-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.csv-target-opt{display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--border-strong);background:#fff;cursor:pointer;font-size:12px;font-weight:600;color:var(--text-dim)}
+.csv-target-opt.on{border-color:#000;color:var(--text-bright);background:var(--surface-2)}
+.csv-target-opt.disabled{opacity:.4;cursor:not-allowed}
+.csv-target-opt input[type=radio]{margin:0}
+.csv-target-opt > span{min-width:120px;text-transform:lowercase;letter-spacing:.2px}
+.csv-target-input{flex:1;font-family:var(--mono);font-size:12px;padding:4px 8px;border:1px solid var(--border-strong);background:#fff;color:var(--text-bright);outline:none;min-width:0}
+.csv-target-input:focus{border-color:#000}
+.csv-cols-wrap{max-height:220px;overflow:auto;border:1px solid var(--border)}
+.csv-cols{width:100%;border-collapse:collapse;font-size:11.5px;font-family:var(--mono)}
+.csv-cols th{background:var(--surface-2);text-align:left;padding:5px 8px;font-weight:700;text-transform:lowercase;letter-spacing:.4px;border-bottom:1px solid var(--border);color:var(--text-dim);position:sticky;top:0;z-index:1}
+.csv-cols td{padding:4px 8px;border-bottom:1px solid var(--border)}
+.csv-cols tr:last-child td{border-bottom:none}
+.csv-col-name{font-weight:600;color:var(--text-bright)}
+.csv-cols select{font-family:var(--mono);font-size:11px;padding:2px 6px;border:1px solid var(--border-strong);background:#fff}
+.csv-col-status{font-size:10.5px;text-transform:lowercase;letter-spacing:.3px;color:var(--text-dim)}
+.csv-col-status-matches{color:var(--triad-structure,#4a6)}
+.csv-col-status-new-field{color:var(--triad-significance,#a64)}
+.csv-col-status-new-set{color:var(--text-faint)}
+.csv-preview-wrap{max-height:160px;overflow:auto;border:1px solid var(--border)}
+.csv-preview{border-collapse:collapse;font-size:11px;font-family:var(--mono);width:max-content;min-width:100%}
+.csv-preview th{background:var(--surface-2);text-align:left;padding:4px 8px;font-weight:700;color:var(--text-dim);border-bottom:1px solid var(--border);border-right:1px solid var(--border);position:sticky;top:0}
+.csv-preview td{padding:3px 8px;border-bottom:1px solid var(--border);border-right:1px solid var(--border);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.csv-preview tr:last-child td{border-bottom:none}
+
 /* ── Inline +column header (airtable) ────────────────────────────────── */
 .dbgrid th.add-col{width:48px;padding:0;background:var(--surface-3);border-left:1px dashed var(--border);position:relative;overflow:visible}
 .dbgrid .add-col-btn{width:100%;height:100%;min-height:30px;background:transparent;border:none;cursor:pointer;color:var(--text-dim);font-size:16px;font-weight:700;font-family:var(--mono)}

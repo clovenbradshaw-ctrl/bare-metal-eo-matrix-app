@@ -404,21 +404,357 @@ function IdentityChip({ session, onSignOut }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// ImportButton — pick a file, encrypt it client-side, upload as a blob to
-// the homeserver media store, and emit an `import` entity into the room.
-// The decryption key rides inside the Megolm-encrypted event content, so
-// the homeserver only stores ciphertext.
+// CSV parsing + type inference (RFC 4180-ish: quoted fields with escaped
+// quotes and embedded newlines, comma/CRLF tolerant).
 // ─────────────────────────────────────────────────────────────────────────
 
-function ImportButton({ roomId, disabled }) {
+function parseCsv(text) {
+  // Strip a leading BOM so it doesn't show up as the first column header.
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const rows = [];
+  let cur = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else { inQuotes = false; }
+      } else {
+        field += c;
+      }
+      continue;
+    }
+    if (c === '"') { inQuotes = true; continue; }
+    if (c === ',') { cur.push(field); field = ''; continue; }
+    if (c === '\r') continue;
+    if (c === '\n') { cur.push(field); field = ''; rows.push(cur); cur = []; continue; }
+    field += c;
+  }
+  if (field !== '' || cur.length > 0) { cur.push(field); rows.push(cur); }
+  // Drop a trailing all-empty row that a final newline tends to produce.
+  while (rows.length && rows[rows.length - 1].every(v => v === '')) rows.pop();
+  return rows;
+}
+
+function inferCsvType(values) {
+  let nonEmpty = 0, nums = 0, bools = 0, dates = 0, urls = 0, emails = 0;
+  for (const raw of values) {
+    if (raw == null) continue;
+    const v = String(raw).trim();
+    if (v === '') continue;
+    nonEmpty++;
+    if (/^-?\d+(\.\d+)?$/.test(v)) nums++;
+    if (/^(true|false)$/i.test(v)) bools++;
+    if (/^https?:\/\//i.test(v)) urls++;
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) emails++;
+    if (/^\d{4}-\d{2}-\d{2}/.test(v) && !Number.isNaN(Date.parse(v))) dates++;
+  }
+  if (nonEmpty === 0) return 'text';
+  if (bools === nonEmpty) return 'boolean';
+  if (nums === nonEmpty) return 'number';
+  if (dates === nonEmpty) return 'date';
+  if (urls === nonEmpty) return 'url';
+  if (emails === nonEmpty) return 'email';
+  // multi-line strings → longtext (so the table view formats them as such)
+  for (const raw of values) if (raw != null && String(raw).includes('\n')) return 'longtext';
+  return 'text';
+}
+
+function coerceCsvValue(raw, type) {
+  if (raw == null) return '';
+  const v = String(raw);
+  if (type === 'number') {
+    if (v.trim() === '') return '';
+    const n = Number(v);
+    return Number.isFinite(n) ? n : v;
+  }
+  if (type === 'boolean') {
+    if (/^true$/i.test(v.trim())) return true;
+    if (/^false$/i.test(v.trim())) return false;
+    return v;
+  }
+  return v;
+}
+
+function slugifySetName(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/\.[^.]+$/, '')
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9_]/g, '');
+}
+
+function uniqueHeaders(headers) {
+  // Browsers (and our schema) need unique column names — disambiguate
+  // collisions and blank headers so 1000 rows don't render as garbage.
+  const seen = new Map();
+  return headers.map((h, idx) => {
+    let base = String(h ?? '').trim();
+    if (!base) base = `column_${idx + 1}`;
+    let name = base;
+    let n = seen.get(base) || 0;
+    if (n > 0) name = `${base}_${n + 1}`;
+    seen.set(base, n + 1);
+    while (seen.has(name) && name !== base) {
+      n++;
+      name = `${base}_${n + 1}`;
+    }
+    return name;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CsvImportModal — pick a target set (new or existing) and confirm columns.
+// Emits SEG-free DEF/INS events: declares the set in `_schema.tables`,
+// merges fields into `_schema.fields.<set>`, and INS one entity per row.
+// ─────────────────────────────────────────────────────────────────────────
+
+function CsvImportModal({ file, parsed, state, onClose, onConfirm }) {
+  const declaredTables = state?.schema?.tables || [];
+  const observedTables = Array.from(new Set(
+    Object.values(state?.entities || {})
+      .map(e => e._type)
+      .filter(t => t && !t.startsWith('_'))
+  ));
+  const existingSets = Array.from(new Set([...declaredTables, ...observedTables])).sort();
+
+  const fileBase = (file?.name || 'imported').replace(/\.[^.]+$/, '');
+  const defaultNew = slugifySetName(fileBase) || 'imported';
+
+  const [mode, setMode] = useState(existingSets.length ? 'new' : 'new'); // 'new' | 'existing'
+  const [newName, setNewName] = useState(defaultNew);
+  const [pickedExisting, setPickedExisting] = useState(existingSets[0] || '');
+
+  // Editable column type per CSV column. Initialise from inference.
+  const colInfo = useMemo(() => {
+    const headers = uniqueHeaders(parsed.headers);
+    return headers.map((name, i) => ({
+      name,
+      type: inferCsvType(parsed.rows.map(r => r[i])),
+    }));
+  }, [parsed]);
+  const [colTypes, setColTypes] = useState(() => colInfo.map(c => c.type));
+
+  useEffect(() => {
+    function esc(e) { if (e.key === 'Escape') onClose(); }
+    document.addEventListener('keydown', esc);
+    return () => document.removeEventListener('keydown', esc);
+  }, [onClose]);
+
+  const targetName = mode === 'new' ? slugifySetName(newName) : pickedExisting;
+  const targetIsNew = mode === 'new' || !existingSets.includes(targetName);
+  const existingFields = (state?.schema?.fields?.[targetName] || []);
+  const existingFieldNames = new Set(existingFields.map(f => f.name));
+
+  // Per-column status when merging into an existing set.
+  const merged = colInfo.map((c, i) => {
+    const collision = existingFieldNames.has(c.name);
+    return {
+      name: c.name,
+      type: colTypes[i],
+      status: targetIsNew
+        ? 'new-set'
+        : collision ? 'matches' : 'new-field',
+    };
+  });
+
+  const canConfirm = !!targetName && parsed.rows.length > 0;
+
+  function commit() {
+    if (!canConfirm) return;
+    onConfirm({
+      target: targetName,
+      targetIsNew,
+      headers: colInfo.map(c => c.name),
+      colTypes,
+      rows: parsed.rows,
+      existingFields,
+    });
+  }
+
+  const previewRows = parsed.rows.slice(0, 3);
+
+  return (
+    <div className="proj-modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="proj-modal" onMouseDown={e => e.stopPropagation()}>
+        <header className="proj-modal-head">
+          <div className="proj-modal-eyebrow">import csv</div>
+          <div className="proj-modal-title">
+            <span className="proj-modal-set">{file.name}</span>
+            <span className="proj-modal-dim">
+              · {parsed.rows.length} {parsed.rows.length === 1 ? 'row' : 'rows'}
+              · {colInfo.length} {colInfo.length === 1 ? 'column' : 'columns'}
+            </span>
+          </div>
+        </header>
+
+        <div className="proj-modal-body">
+          <div className="proj-modal-section-label">target set</div>
+          <div className="csv-target-row">
+            <label className={`csv-target-opt ${mode === 'new' ? 'on' : ''}`}>
+              <input type="radio" checked={mode === 'new'} onChange={() => setMode('new')} />
+              <span>new set</span>
+              <input
+                type="text"
+                className="csv-target-input"
+                value={newName}
+                onChange={e => setNewName(e.target.value)}
+                onFocus={() => setMode('new')}
+                placeholder="set name"
+              />
+            </label>
+            <label className={`csv-target-opt ${mode === 'existing' ? 'on' : ''} ${existingSets.length === 0 ? 'disabled' : ''}`}>
+              <input
+                type="radio"
+                checked={mode === 'existing'}
+                disabled={existingSets.length === 0}
+                onChange={() => setMode('existing')}
+              />
+              <span>merge into existing</span>
+              <select
+                className="csv-target-input"
+                value={pickedExisting}
+                onChange={e => setPickedExisting(e.target.value)}
+                onFocus={() => existingSets.length && setMode('existing')}
+                disabled={existingSets.length === 0}
+              >
+                {existingSets.length === 0 && <option value="">no sets yet</option>}
+                {existingSets.map(s => (
+                  <option key={s} value={s}>{s}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="proj-modal-section-label">columns · {merged.length}</div>
+          <div className="csv-cols-wrap">
+            <table className="csv-cols">
+              <thead>
+                <tr><th>column</th><th>type</th><th></th></tr>
+              </thead>
+              <tbody>
+                {merged.map((c, i) => (
+                  <tr key={i} className={`csv-col-${c.status}`}>
+                    <td className="csv-col-name">{c.name}</td>
+                    <td>
+                      <select
+                        value={c.type}
+                        onChange={e => setColTypes(arr => arr.map((t, j) => j === i ? e.target.value : t))}
+                      >
+                        <option value="text">text</option>
+                        <option value="longtext">long text</option>
+                        <option value="number">number</option>
+                        <option value="boolean">checkbox</option>
+                        <option value="select">single-select</option>
+                        <option value="date">date</option>
+                        <option value="url">url</option>
+                        <option value="email">email</option>
+                      </select>
+                    </td>
+                    <td className={`csv-col-status csv-col-status-${c.status}`}>
+                      {c.status === 'matches' ? 'matches existing field'
+                        : c.status === 'new-field' ? 'will add to schema'
+                        : 'new set'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {previewRows.length > 0 && (
+            <>
+              <div className="proj-modal-section-label">
+                preview · first {previewRows.length} of {parsed.rows.length}
+              </div>
+              <div className="csv-preview-wrap">
+                <table className="csv-preview">
+                  <thead>
+                    <tr>{colInfo.map((c, i) => <th key={i}>{c.name}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {previewRows.map((row, ri) => (
+                      <tr key={ri}>
+                        {colInfo.map((c, ci) => (
+                          <td key={ci}>{row[ci] == null ? '' : String(row[ci])}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+
+        <footer className="proj-modal-foot">
+          <button className="proj-modal-cancel" onClick={onClose}>cancel</button>
+          <button
+            className="proj-modal-create"
+            onClick={commit}
+            disabled={!canConfirm}
+            title={!canConfirm ? 'pick a target set' : ''}
+          >
+            import {parsed.rows.length} {parsed.rows.length === 1 ? 'row' : 'rows'}
+            {targetName ? ` → ${targetName}` : ''}
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ImportButton — pick a file. CSVs open a target-picker (new set or merge
+// into an existing one, with type inference) and emit one INS per row;
+// other files encrypt + upload to the homeserver media store and emit a
+// single `import` entity that points at the blob.
+// ─────────────────────────────────────────────────────────────────────────
+
+function ImportButton({ roomId, disabled, state, onEmit }) {
   const inputRef = useRef(null);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(null); // {done, total}
   const [err, setErr] = useState(null);
+  const [csvJob, setCsvJob] = useState(null); // {file, parsed}
   const ML = window.MatrixLive;
 
+  function isCsv(file) {
+    if (!file) return false;
+    if (/\.csv$/i.test(file.name || '')) return true;
+    const mt = (file.type || '').toLowerCase();
+    return mt === 'text/csv' || mt === 'application/csv';
+  }
+
   async function handleFile(file) {
-    if (!file || !ML?.importFile) return;
+    if (!file) return;
     setErr(null);
+    if (isCsv(file)) {
+      try {
+        const text = await file.text();
+        const rowsRaw = parseCsv(text);
+        if (rowsRaw.length === 0) throw new Error('empty CSV');
+        const headers = rowsRaw[0];
+        const rows = rowsRaw.slice(1);
+        setCsvJob({ file, parsed: { headers, rows } });
+      } catch (e) {
+        console.warn('[csv-import] parse failed:', e);
+        setErr(e?.message || 'parse failed');
+        setTimeout(() => setErr(null), 4000);
+      } finally {
+        if (inputRef.current) inputRef.current.value = '';
+      }
+      return;
+    }
+    // Non-CSV: existing media-blob import path.
+    if (!ML?.importFile) {
+      setErr('import unavailable in this mode');
+      setTimeout(() => setErr(null), 4000);
+      if (inputRef.current) inputRef.current.value = '';
+      return;
+    }
     setBusy(true);
     try {
       await ML.importFile(roomId, file);
@@ -432,6 +768,79 @@ function ImportButton({ roomId, disabled }) {
     }
   }
 
+  async function runCsvImport({ target, targetIsNew, headers, colTypes, rows, existingFields }) {
+    setCsvJob(null);
+    if (!onEmit) {
+      setErr('cannot emit events here');
+      setTimeout(() => setErr(null), 4000);
+      return;
+    }
+    const ME = window.MatrixEngine;
+    setBusy(true);
+    setProgress({ done: 0, total: rows.length });
+    try {
+      // 1. Declare the set in _schema.tables if it isn't already.
+      const tables = state?.schema?.tables || [];
+      if (!tables.includes(target)) {
+        await onEmit(ME.OP.DEF, { anchor: null, path: '_schema.tables', value: [...tables, target] });
+      }
+
+      // 2. Merge field declarations into _schema.fields.<target>.
+      const fieldsByName = new Map();
+      for (const f of existingFields) fieldsByName.set(f.name, { ...f });
+      for (let i = 0; i < headers.length; i++) {
+        const name = headers[i];
+        const type = colTypes[i] || 'text';
+        if (!fieldsByName.has(name)) {
+          fieldsByName.set(name, { name, type });
+        }
+      }
+      const mergedFields = Array.from(fieldsByName.values());
+      // Only re-emit if the field list changed — avoids a noop event when
+      // every CSV column matches an existing field exactly.
+      const schemaChanged = targetIsNew
+        || mergedFields.length !== existingFields.length
+        || mergedFields.some((f, i) => existingFields[i]?.name !== f.name);
+      if (schemaChanged) {
+        await onEmit(ME.OP.DEF, {
+          anchor: null,
+          path: `_schema.fields.${target}`,
+          value: mergedFields,
+        });
+      }
+
+      // 3. INS one entity per CSV row. Use a per-row ts tiebreaker so two
+      //    identical rows still produce distinct content-addressed anchors.
+      const baseTs = Date.now();
+      const sender = ML?.getSession?.()?.mxid || '@you:demo';
+      for (let r = 0; r < rows.length; r++) {
+        const payload = {};
+        for (let c = 0; c < headers.length; c++) {
+          const raw = rows[r][c];
+          if (raw == null || raw === '') continue;
+          payload[headers[c]] = coerceCsvValue(raw, colTypes[c] || 'text');
+        }
+        const ts = baseTs + r;
+        const anchor = ME.makeAnchor(target, payload, sender, ts);
+        await onEmit(ME.OP.INS, { anchor, entity_type: target, payload });
+        if ((r & 0x1F) === 0) setProgress({ done: r + 1, total: rows.length });
+      }
+      setProgress({ done: rows.length, total: rows.length });
+    } catch (e) {
+      console.warn('[csv-import] failed:', e);
+      setErr(e?.message || 'import failed');
+      setTimeout(() => setErr(null), 5000);
+    } finally {
+      setBusy(false);
+      setTimeout(() => setProgress(null), 800);
+    }
+  }
+
+  const label = busy
+    ? (progress ? `importing ${progress.done}/${progress.total}…` : 'uploading…')
+    : err ? `failed: ${err}`
+    : 'import';
+
   return (
     <>
       <button
@@ -440,13 +849,23 @@ function ImportButton({ roomId, disabled }) {
         disabled={disabled || busy}
         title={disabled ? 'sign in to a homeserver to import files'
                         : 'import a CSV / JSON / binary file into this space'}
-      >{busy ? 'uploading…' : err ? `failed: ${err}` : 'import'}</button>
+      >{label}</button>
       <input
         type="file"
         ref={inputRef}
         style={{display:'none'}}
+        accept=".csv,text/csv,application/csv,*/*"
         onChange={(e) => handleFile(e.target.files?.[0])}
       />
+      {csvJob && (
+        <CsvImportModal
+          file={csvJob.file}
+          parsed={csvJob.parsed}
+          state={state}
+          onClose={() => setCsvJob(null)}
+          onConfirm={runCsvImport}
+        />
+      )}
     </>
   );
 }
