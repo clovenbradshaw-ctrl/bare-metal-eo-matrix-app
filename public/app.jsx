@@ -179,14 +179,14 @@ function TweakControls({ t, setTweak, onLoadSeed, onClearAll }) {
   const { TweaksPanel, TweakSection, TweakToggle, TweakRadio, TweakButton } = window;
   return (
     <TweaksPanel title="Tweaks">
-      <TweakSection label="Database view">
+      <TweakSection label="Log">
         <TweakToggle label="Show violations"
           value={t.showViolations} onChange={v => setTweak('showViolations', v)} />
         <TweakToggle label="Show entity _hwm"
           value={t.showHwm} onChange={v => setTweak('showHwm', v)} />
       </TweakSection>
-      <TweakSection label="Table view">
-        <TweakToggle label="Show CREATE TABLE DDL"
+      <TweakSection label="Set">
+        <TweakToggle label="Show CREATE SET DDL"
           value={t.showSchemaDDL} onChange={v => setTweak('showSchemaDDL', v)} />
       </TweakSection>
       <TweakSection label="Start in">
@@ -195,7 +195,7 @@ function TweakControls({ t, setTweak, onLoadSeed, onClearAll }) {
           onChange={v => setTweak('defaultMode', v)}
           options={[
             { value: 'db',    label: 'log'    },
-            { value: 'table', label: 'tables' },
+            { value: 'table', label: 'sets'   },
             { value: 'graph', label: 'graph'  },
             { value: 'app',   label: 'kanban' },
           ]}
@@ -443,10 +443,6 @@ function App() {
   return (
     <div className="shell">
       <div className="topbar">
-        <span className="brand">
-          matrix-events
-          <span className="sub">bare metal</span>
-        </span>
         <window.IdentityChip
           session={session}
           onSignOut={handleSignOut}
