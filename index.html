@@ -223,6 +223,8 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .room-picker .panel .new-room button{padding:3px 10px;background:#000;color:#fff;border:1px solid #000;font-size:11px}
 .topbar-members{padding:5px 11px;font-size:12px;color:var(--text-bright);background:#fff;border:1px solid var(--border-strong);cursor:pointer;min-height:28px;font-weight:500;text-transform:lowercase;letter-spacing:.3px}
 .topbar-members:hover{border-color:#000;background:#000;color:#fff}
+.topbar-spaces{padding:5px 11px;font-size:12px;color:var(--text-bright);background:#fff;border:1px solid var(--border-strong);cursor:pointer;min-height:28px;font-weight:600;text-transform:lowercase;letter-spacing:.3px;font-family:var(--mono)}
+.topbar-spaces:hover{border-color:#000;background:#000;color:#fff}
 
 .modes{display:flex;gap:0;flex-wrap:wrap}
 .modes button{padding:5px 13px;font-size:12px;color:var(--text);background:#fff;border:1px solid var(--border-strong);border-left-width:0;text-transform:lowercase;letter-spacing:.3px;cursor:pointer;white-space:nowrap;font-weight:500}
@@ -736,6 +738,48 @@ table.dbgrid tr.add-row td.add-row-gutter{width:120px;padding:10px 6px;text-alig
 .register-pitch-title{font-size:13px;color:var(--text-bright);font-weight:700;margin-bottom:6px}
 .register-pitch-body{font-size:12px;color:var(--text-dim);line-height:1.55}
 .register-pitch-body b{color:var(--text-bright);font-weight:700}
+
+/* ── Workspaces home (post-login launchpad) ──────────────────────────── */
+.wh-shell{position:fixed;inset:0;display:flex;flex-direction:column;background:var(--bg);overflow:auto;
+  background-image:
+    linear-gradient(var(--surface-2) 1px, transparent 1px),
+    linear-gradient(90deg, var(--surface-2) 1px, transparent 1px);
+  background-size: 32px 32px, 32px 32px;
+}
+.wh-topbar{display:flex;align-items:center;gap:12px;padding:9px 16px;border-bottom:1px solid var(--border-strong);background:var(--surface);min-height:46px}
+.wh-brand{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:700;color:var(--text-bright);letter-spacing:.2px;font-family:var(--mono)}
+.wh-brand-mark{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;background:#000;color:#fff;font-size:14px}
+.wh-spacer{flex:1}
+.wh-body{flex:1;display:flex;flex-direction:column;align-items:center;padding:60px 32px 80px;max-width:1080px;margin:0 auto;width:100%}
+.wh-hero{text-align:center;margin-bottom:40px;max-width:560px}
+.wh-greeting{font-size:28px;font-weight:700;color:var(--text-bright);letter-spacing:.2px;margin-bottom:10px;font-family:var(--mono);text-transform:lowercase}
+.wh-tagline{font-size:14px;color:var(--text-dim);line-height:1.55}
+.wh-stale-hint{margin-top:12px;padding:8px 12px;background:#fffcec;border:1px solid var(--signal);color:var(--text);font-size:12px;display:inline-block}
+.wh-loading{font-size:13px;color:var(--text-dim);padding:40px 0;font-family:var(--mono)}
+.wh-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;width:100%;max-width:920px}
+.wh-card{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:18px 18px 16px;background:#fff;border:1px solid var(--border-strong);cursor:pointer;text-align:left;font-family:var(--mono);min-height:140px;transition:transform .08s ease, box-shadow .08s ease;position:relative}
+.wh-card:hover{border-color:#000;box-shadow:4px 4px 0 var(--surface-3);transform:translate(-1px,-1px)}
+.wh-card-sigil{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;background:var(--triad-structure);color:#fff;font-size:18px;font-weight:700;flex-shrink:0}
+.wh-card-sigil-new{background:#fff;color:#000;border:1px dashed var(--border-strong);font-size:22px;font-weight:400}
+.wh-card-name{font-size:15px;color:var(--text-bright);font-weight:700;line-height:1.25;word-break:break-word}
+.wh-card-meta{font-size:11px;color:var(--text-dim);font-weight:500}
+.wh-card-action{margin-top:auto;font-size:11px;color:var(--triad-structure);font-weight:700;text-transform:uppercase;letter-spacing:.8px}
+.wh-card-invite{border-left:3px solid var(--signal);background:#fffcec}
+.wh-card-invite .wh-card-sigil{background:var(--signal)}
+.wh-card-new{cursor:default;background:var(--surface-2);border-style:dashed}
+.wh-card-new:hover{border-color:var(--border-strong);box-shadow:none;transform:none}
+.wh-new-form{display:flex;gap:6px;width:100%;margin-top:4px}
+.wh-new-input{flex:1;font-size:13px;padding:7px 9px;border:1px solid var(--border-strong);background:#fff;font-family:var(--mono);outline:none;min-width:0}
+.wh-new-input:focus{border-color:#000;box-shadow:inset 0 0 0 1px #000}
+.wh-new-btn{padding:7px 14px;background:#000;color:#fff;border:1px solid #000;font-family:var(--mono);font-size:12.5px;font-weight:700;cursor:pointer;text-transform:lowercase;letter-spacing:.3px;flex-shrink:0}
+.wh-new-btn:hover:not(:disabled){background:#222}
+.wh-new-btn:disabled{opacity:.45;cursor:not-allowed}
+.wh-card-err{font-size:11px;color:var(--red);font-weight:600;margin-top:4px}
+@media (max-width:560px){
+  .wh-body{padding:32px 18px 60px}
+  .wh-greeting{font-size:22px}
+  .wh-grid{grid-template-columns:1fr;max-width:none}
+}
 
 /* ── Identity chip (in topbar) ────────────────────────────────────────── */
 .identity-chip{position:relative}
