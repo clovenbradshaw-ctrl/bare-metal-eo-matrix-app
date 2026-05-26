@@ -32,10 +32,22 @@ function fmtCell(value, type) {
   return { cls: 'str', text: String(value) };
 }
 
-function EditableCell({ value, onCommit, type, heat }) {
+function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsumed, onNavigate }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const inputRef = useRef(null);
+
+  function draftFromValue(v) {
+    return v === undefined || v === null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+  }
+
+  useEffect(() => {
+    if (shouldFocus && !editing) {
+      setDraft(draftFromValue(value));
+      setEditing(true);
+      if (onFocusConsumed) onFocusConsumed();
+    }
+  }, [shouldFocus]);
 
   useEffect(() => {
     if (editing && inputRef.current) {
@@ -45,7 +57,7 @@ function EditableCell({ value, onCommit, type, heat }) {
   }, [editing]);
 
   function startEdit() {
-    setDraft(value === undefined || value === null ? '' : (typeof value === 'object' ? JSON.stringify(value) : String(value)));
+    setDraft(draftFromValue(value));
     setEditing(true);
   }
   function commit() {
@@ -59,6 +71,10 @@ function EditableCell({ value, onCommit, type, heat }) {
     }
     if (parsed !== value) onCommit(parsed);
   }
+  function commitAndNavigate(dir) {
+    commit();
+    if (onNavigate) onNavigate(dir);
+  }
 
   if (editing) {
     return (
@@ -69,7 +85,8 @@ function EditableCell({ value, onCommit, type, heat }) {
           onChange={e => setDraft(e.target.value)}
           onBlur={commit}
           onKeyDown={e => {
-            if (e.key === 'Enter') commit();
+            if (e.key === 'Enter') { e.preventDefault(); commitAndNavigate('enter'); }
+            else if (e.key === 'Tab') { e.preventDefault(); commitAndNavigate(e.shiftKey ? 'shift-tab' : 'tab'); }
             else if (e.key === 'Escape') setEditing(false);
           }}
         />
@@ -78,7 +95,7 @@ function EditableCell({ value, onCommit, type, heat }) {
   }
   const { cls, text } = fmtCell(value, type);
   const heatCls = heat ? heatClass(heat) : '';
-  return <td className={`cell ${cls} ${heatCls}`} onDoubleClick={startEdit} title={heat ? `${heat} write${heat===1?'':'s'} · double-click to edit` : 'double-click to edit · emits DEF'}>{text}</td>;
+  return <td className={`cell ${cls} ${heatCls}`} onClick={startEdit} title={heat ? `${heat} write${heat===1?'':'s'} · click to edit` : 'click to edit · emits DEF'}>{text}</td>;
 }
 
 function heatClass(n) {
@@ -181,12 +198,12 @@ function linksFromAnchor(anchor, otherType, state) {
     if (c.source === anchor) {
       const tgt = state.entities[c.target];
       if (tgt && tgt._type === otherType) {
-        out.push({ anchor: c.target, label: tgt.title || tgt.body || tgt.claim || tgt.what || c.target.slice(-8), rel: c.type, type: otherType, dir: 'out' });
+        out.push({ anchor: c.target, label: tgt.Name || tgt.title || tgt.body || tgt.claim || tgt.what || c.target.slice(-8), rel: c.type, type: otherType, dir: 'out' });
       }
     } else if (c.target === anchor) {
       const src = state.entities[c.source];
       if (src && src._type === otherType) {
-        out.push({ anchor: c.source, label: src.title || src.body || src.claim || src.what || c.source.slice(-8), rel: c.type, type: otherType, dir: 'in' });
+        out.push({ anchor: c.source, label: src.Name || src.title || src.body || src.claim || src.what || c.source.slice(-8), rel: c.type, type: otherType, dir: 'in' });
       }
     }
   }
@@ -201,12 +218,36 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   const { cols, rows, partitioned, partitionFromSchema } = useMemo(() => buildTable(entityType, state), [entityType, state]);
   const linkedTypes = useMemo(() => linkedTypesFor(entityType, state), [entityType, state]);
   const declaredInSchema = !!state.schema?.fields?.[entityType] || (state.schema?.tables || []).includes(entityType);
-  const [newRowTitle, setNewRowTitle] = useState('');
   const [heatOn, setHeatOn] = useState(false);
   const [showFormula, setShowFormula] = useState(false);
   const [addingField, setAddingField] = useState(false);
   const [newField, setNewField] = useState({ name: '', type: 'text' });
   const addFieldRef = useRef(null);
+
+  // Cell-focus coordination for the airtable-style flow: a cell whose
+  // {anchor, field} matches pendingFocus opens in edit mode on the next render.
+  const [pendingFocus, setPendingFocus] = useState(null);
+  const tsCounterRef = useRef(0);
+  const autoFocusedTablesRef = useRef(new Set());
+
+  useEffect(() => {
+    setPendingFocus(null);
+  }, [entityType]);
+
+  // When landing on a freshly-created table (one row, all fields empty),
+  // open the first cell in edit mode so the user can just start typing.
+  useEffect(() => {
+    if (autoFocusedTablesRef.current.has(entityType)) return;
+    if (rows.length !== 1 || cols.length === 0) return;
+    const r = rows[0];
+    const allEmpty = cols.every(c => {
+      const v = r[c.name];
+      return v === undefined || v === null || v === '';
+    });
+    if (!allEmpty) return;
+    autoFocusedTablesRef.current.add(entityType);
+    setPendingFocus({ anchor: r._anchor, field: cols[0].name });
+  }, [entityType, rows, cols]);
 
   useEffect(() => {
     if (!addingField) return;
@@ -251,18 +292,50 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     onEmit(TV_OP.SEG, { anchor, partition });
   }
 
+  function nextUniqueTs() {
+    const now = Date.now();
+    tsCounterRef.current = Math.max(tsCounterRef.current + 1, now);
+    return tsCounterRef.current;
+  }
+
   function addRow() {
-    const title = newRowTitle.trim();
-    if (!title) return;
     const sender = '@you:demo';
-    const ts = Date.now();
-    // INS creates the thing (empty payload); DEF puts the first parameter on it.
+    const ts = nextUniqueTs();
     const anchor = window.MatrixEngine.makeAnchor(entityType, {}, sender, ts);
     onEmit(TV_OP.INS, { anchor, entity_type: entityType, payload: {} });
-    const firstTextField = (cols.find(c => c.type === 'text') || cols[0]);
-    const fieldName = firstTextField?.name || 'title';
-    onEmit(TV_OP.DEF, { anchor, path: fieldName, value: title });
-    setNewRowTitle('');
+    return anchor;
+  }
+
+  function navigate(rowIdx, colIdx, dir) {
+    if (dir === 'tab') {
+      if (colIdx < cols.length - 1) {
+        setPendingFocus({ anchor: rows[rowIdx]._anchor, field: cols[colIdx + 1].name });
+      } else if (rowIdx === rows.length - 1) {
+        const newAnchor = addRow();
+        setPendingFocus({ anchor: newAnchor, field: cols[0].name });
+      } else {
+        setPendingFocus({ anchor: rows[rowIdx + 1]._anchor, field: cols[0].name });
+      }
+    } else if (dir === 'shift-tab') {
+      if (colIdx > 0) {
+        setPendingFocus({ anchor: rows[rowIdx]._anchor, field: cols[colIdx - 1].name });
+      } else if (rowIdx > 0) {
+        setPendingFocus({ anchor: rows[rowIdx - 1]._anchor, field: cols[cols.length - 1].name });
+      }
+    } else if (dir === 'enter') {
+      if (rowIdx === rows.length - 1) {
+        const newAnchor = addRow();
+        setPendingFocus({ anchor: newAnchor, field: cols[0].name });
+      } else {
+        setPendingFocus({ anchor: rows[rowIdx + 1]._anchor, field: cols[colIdx].name });
+      }
+    }
+  }
+
+  function addRowAndFocus() {
+    if (cols.length === 0) return;
+    const newAnchor = addRow();
+    setPendingFocus({ anchor: newAnchor, field: cols[0].name });
   }
 
   const allCols = [
@@ -367,14 +440,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && (
-              <tr>
-                <td className="cell" colSpan={allCols.length + 1} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
-                  0 rows · schema is defined, no INS events yet
-                </td>
-              </tr>
-            )}
-            {rows.map(r => (
+            {rows.map((r, rIdx) => (
               <tr key={r._anchor}>
                 {showFormula && (
                   <td
@@ -389,13 +455,16 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     title="view this entity's timeline"
                   >{r._anchor}</td>
                 )}
-                {cols.map(c => (
+                {cols.map((c, cIdx) => (
                   <EditableCell
                     key={c.name}
                     value={r[c.name]}
                     type={c.type}
                     heat={heatOn ? (r._writes?.[c.name] || 0) : 0}
                     onCommit={(v) => commitCell(r._anchor, c.name, v)}
+                    shouldFocus={pendingFocus?.anchor === r._anchor && pendingFocus?.field === c.name}
+                    onFocusConsumed={() => setPendingFocus(null)}
+                    onNavigate={(dir) => navigate(rIdx, cIdx, dir)}
                   />
                 ))}
                 {partitioned && (
@@ -445,20 +514,22 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                 <td className="cell"></td>
               </tr>
             )}
-            <tr className="add-row">
-              {showFormula && <td className="cell anchor"><span className="em">auto</span></td>}
-              <td className="cell" colSpan={cols.length + (partitioned ? 1 : 0) + linkedTypes.length + 1}>
-                <div className="add-row-input">
-                  <input
-                    value={newRowTitle}
-                    placeholder={`+ add ${entityType} row…`}
-                    onChange={e => setNewRowTitle(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter') addRow(); }}
-                  />
-                  <button onClick={addRow}>INSERT</button>
-                </div>
-              </td>
-            </tr>
+            {cols.length > 0 && (
+              <tr className="add-row" onClick={addRowAndFocus} title="click to add a row · or hit Enter from the last cell">
+                {showFormula && <td className="cell anchor add-row-gutter"><span className="add-row-plus">+</span></td>}
+                <td className="cell add-row-cell" colSpan={cols.length + (partitioned ? 1 : 0) + linkedTypes.length + 1}>
+                  {!showFormula && <span className="add-row-plus">+</span>}
+                  <span className="add-row-hint">{rows.length === 0 ? `add the first ${entityType} row` : 'add row'}</span>
+                </td>
+              </tr>
+            )}
+            {cols.length === 0 && (
+              <tr>
+                <td className="cell" colSpan={allCols.length + 1} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
+                  no fields yet · add a field with the <span className="kbd">+</span> in the header
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>

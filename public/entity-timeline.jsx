@@ -101,7 +101,7 @@ function EntityTimelineView({
             <div className="tl-picker">
               {siblings.map(s => (
                 <button key={s._anchor} className="tl-picker-row" onClick={() => jumpTo(s._anchor)}>
-                  <span className="tl-picker-name">{s.title || s.body || s.claim || s.what || s._anchor}</span>
+                  <span className="tl-picker-name">{s.Name || s.title || s.body || s.claim || s.what || s._anchor}</span>
                   <span className="tl-picker-anchor">{s._anchor}</span>
                 </button>
               ))}
@@ -135,7 +135,7 @@ function EntityTimelineView({
               title="back to table"
             >← {entityType} table</button>
           </div>
-          <h1 className="page-hero-title">{entity.title || entity.body || entity.claim || entity.what || entity._anchor}</h1>
+          <h1 className="page-hero-title">{entity.Name || entity.title || entity.body || entity.claim || entity.what || entity._anchor}</h1>
           <div className="page-hero-sub" style={{display:'flex',alignItems:'center',gap:14,flexWrap:'wrap'}}>
             <span>{events.length} event{events.length !== 1 ? 's' : ''} touched this anchor</span>
             {siblings.length > 1 && (
@@ -147,7 +147,7 @@ function EntityTimelineView({
                   style={{fontSize:12,padding:'3px 7px',border:'1px solid var(--border-strong)',background:'#fff',fontFamily:'var(--mono)'}}
                 >
                   {siblings.map(s => (
-                    <option key={s._anchor} value={s._anchor}>{s.title || s.body || s.claim || s.what || s._anchor}</option>
+                    <option key={s._anchor} value={s._anchor}>{s.Name || s.title || s.body || s.claim || s.what || s._anchor}</option>
                   ))}
                 </select>
               </span>
