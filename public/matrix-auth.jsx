@@ -21,59 +21,56 @@ try { localStorage.removeItem(LEGACY_SPACES_KEY); } catch {}
 // ─────────────────────────────────────────────────────────────────────────
 
 function loadSession() {
-  // Real Matrix sessions live in the bridge (`MatrixLive`); they auto-
-  // restore at cold boot via the IndexedDB pickle key, so we surface
-  // whatever the bridge currently has. Demo sessions are pure UI state
-  // and stay in localStorage.
   try {
-    const live = window.MatrixLive?.getSession?.();
-    if (live) return live;
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const s = JSON.parse(raw);
-    if (s && !s.demo) return null;
-    return s;
+    // Only demo sessions are restored from localStorage. Real Matrix
+    // sessions live in the bridge: the vault key is stashed in
+    // sessionStorage so a tab refresh re-adopts it and brings the
+    // client back online without a password prompt.
+    if (s && s.demo) return s;
+    return null;
   } catch { return null; }
 }
 function saveSession(s) {
-  // Only persist demo sessions. Real sessions are tied to the bridge's
-  // in-memory client; the bridge persists the access token separately
-  // (IndexedDB pickle key).
+  // Only persist demo sessions. Real sessions are tracked by the bridge.
   if (s && s.demo) localStorage.setItem(SESSION_KEY, JSON.stringify(s));
   else             localStorage.removeItem(SESSION_KEY);
 }
 
 function useSession() {
-  const [session, setSession] = useState(loadSession);
+  const ML = typeof window !== 'undefined' ? window.MatrixLive : null;
 
-  useEffect(() => { saveSession(session); }, [session]);
+  const [session, setSession] = useState(() => {
+    const demo = loadSession();
+    if (demo) return demo;
+    return ML?.getSession?.() || null;
+  });
+  const [booting, setBooting] = useState(() => !!ML?.isBooting?.());
 
-  // Mirror the bridge's session into React state. The bridge auto-
-  // restores at startup; this hook picks that up so the user lands on
-  // the workbench instead of the LoginScreen after a cold reload.
+  // The bridge runs an async auto-restore on cold boot; subscribe so
+  // React picks up the resumed session (or the "nothing to resume"
+  // signal) without flashing the login screen.
   useEffect(() => {
-    const ML = window.MatrixLive;
-    if (!ML?.subscribe) return;
-    const sync = () => {
-      const live = ML.getSession?.();
-      setSession(prev => {
-        // Keep demo sessions visible if the bridge has nothing to say.
-        if (!live) return prev && prev.demo ? prev : null;
-        // Identity object so React skips re-renders when nothing changed.
-        if (prev && !prev.demo && prev.mxid === live.mxid &&
-            prev.stale === live.stale && prev.vaultLocked === live.vaultLocked) {
-          return prev;
-        }
-        return live;
+    const M = window.MatrixLive;
+    if (!M?.subscribe) return;
+    return M.subscribe((reason) => {
+      if (reason !== 'session') return;
+      setBooting(!!M.isBooting?.());
+      setSession((current) => {
+        if (current?.demo) return current;       // demo is user-driven
+        const live = M.getSession?.() || null;
+        if (live) return live;
+        // Bridge says no session. If we thought we were authed for real,
+        // drop down to the login screen.
+        return current && !current.demo ? null : current;
       });
-    };
-    sync();
-    return ML.subscribe((reason) => {
-      if (reason === 'session') sync();
     });
   }, []);
 
-  return [session, setSession];
+  useEffect(() => { saveSession(session); }, [session]);
+  return [session, setSession, booting];
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -96,6 +93,29 @@ function useMembers(roomId) {
       myPowerLevel: ML.myPowerLevelIn ? ML.myPowerLevelIn(roomId) : 0,
     };
   }, [ML, roomId, tick]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// BootSplash — shown while the bridge is auto-restoring a session from
+// the sessionStorage vault stash. Brief by design: the bridge resolves
+// quickly to either a live session or "nothing to resume", and the
+// app immediately swaps to either the workspace or the LoginScreen.
+// ─────────────────────────────────────────────────────────────────────────
+
+function BootSplash() {
+  return (
+    <div className="login-shell">
+      <div className="login-card" style={{maxWidth:340}}>
+        <div className="login-head">
+          <div className="login-brand">
+            <span className="login-brand-mark">▦</span>
+            <span>workspace</span>
+          </div>
+          <div className="login-sub">resuming session…</div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -676,6 +696,7 @@ function MembersDialog({ space, mySession, onClose }) {
 Object.assign(window, {
   useSession,
   useMembers,
+  BootSplash,
   LoginScreen,
   IdentityChip,
   MembersDialog,

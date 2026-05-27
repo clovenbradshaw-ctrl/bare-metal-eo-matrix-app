@@ -2,20 +2,21 @@
  * client.js — Matrix connection layer
  *
  * Wraps matrix-js-sdk: login, session persistence, sync, crypto init.
+ * Adds vault-encrypted session storage and offline-capable unlock.
  *
- * Four entry points:
+ * Three entry points:
  *   - login(hs, user, password)         : first time on this device
  *   - unlock(userId, password)          : subsequent launches; works offline
- *   - restoreSession(userId)            : restart sync from a saved blob
- *   - tryAutoRestore()                  : cold-boot path, no password
+ *   - restoreSession(userId)            : auto-unlock from in-memory key (no-op when locked)
  *
- * The Matrix access token + device_id live in IndexedDB encrypted with a
- * non-extractable AES-GCM key (see ./pickleKey.js). Cold reloads restore
- * the session silently — the user's vault password is no longer required
- * just to bring up the client. The vault still encrypts OPFS / outbox at
- * rest; unlocking it enables saves and decrypts cached events.
+ * The session token is stored vault-encrypted in localStorage so that a
+ * device with a locked vault cannot mint Matrix requests, and the
+ * token is wiped from disk on full logout.
  */
 
+// Must run before matrix-js-sdk opens its IDB store, so it sees the
+// scoped names instead of the global `matrix-js-sdk::*` ones.
+import './idbScope.js';
 import * as sdk from 'matrix-js-sdk';
 import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/index.js';
 import { vault, sessionKey, rememberLastUser, forgetLastUser, getLastUser } from './vault.js';
@@ -24,35 +25,10 @@ import { clearAll as clearOutbox } from './outbox.js';
 import { watchSync } from './network.js';
 import { wipeMediaCache } from './media.js';
 import { wipeManifest } from './roomManifest.js';
-import {
-  storeSessionEncrypted, loadSessionEncrypted, dropSessionEncrypted,
-  hasStoredSession as hasIdbSession, wipePickleKey,
-} from './pickleKey.js';
+import { wipePickleKey } from './pickleKey.js';
 
 let client = null;
 let _watchSyncUnsub = null;
-
-// ── Encryption status (consumed by the UI banner) ──
-// 'unknown'   — not yet checked
-// 'ok'        — cross-signing ready, key backup attached
-// 'verifying' — bootstrap / restore in progress
-// 'history-locked' — backup exists on server but we couldn't restore it
-//                    (user needs to enter recovery key)
-// 'no-backup' — account has no key backup yet (first-ever login)
-let _encryptionStatus = 'unknown';
-const _encryptionListeners = new Set();
-export function getEncryptionStatus() { return _encryptionStatus; }
-export function onEncryptionStatus(fn) {
-  _encryptionListeners.add(fn);
-  return () => _encryptionListeners.delete(fn);
-}
-function setEncryptionStatus(s) {
-  if (_encryptionStatus === s) return;
-  _encryptionStatus = s;
-  for (const fn of _encryptionListeners) {
-    try { fn(s); } catch (e) { console.warn('[matrix] encryption listener failed:', e); }
-  }
-}
 
 let progress = (msg) => console.log('[matrix]', msg);
 export function setProgress(fn) {
@@ -67,15 +43,49 @@ export function setRecoveryKeyDisplayer(fn) { recoveryKeyDisplayer = fn; }
 export function getClient() { return client; }
 
 const CRYPTO_STORE_NAME = 'matrix-js-sdk::matrix-sdk-crypto';
+const CRYPTO_OWNER_KEY = 'eomx:crypto-owner';
 
 function clearCryptoStore() {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     progress('Clearing stale crypto store…');
     const req = indexedDB.deleteDatabase(CRYPTO_STORE_NAME);
-    req.onsuccess = () => { progress('Crypto store cleared'); resolve(); };
-    req.onerror = () => { progress('Crypto store clear failed'); reject(req.error); };
-    req.onblocked = () => { progress('Crypto store clear blocked — closing connections'); resolve(); };
+    let blockedTimer = null;
+    const settle = () => {
+      if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+      resolve();
+    };
+    req.onsuccess = () => { progress('Crypto store cleared'); settle(); };
+    req.onerror = () => {
+      progress('Crypto store clear failed: ' + (req.error?.message || 'unknown'));
+      settle();
+    };
+    // onblocked means another connection is still open. Don't resolve
+    // synchronously — that would race the caller's next initRustCrypto
+    // against an in-flight delete and produce confusing failures. Wait
+    // briefly for the lingering connection to close, then give up.
+    req.onblocked = () => {
+      progress('Crypto store delete blocked — waiting for connections to close');
+      blockedTimer = setTimeout(() => {
+        progress('Crypto store delete still blocked — proceeding anyway');
+        settle();
+      }, 3000);
+    };
   });
+}
+
+/**
+ * Pre-empt the "account in the store doesn't match" failure by wiping
+ * the crypto store before init when we know it belongs to a different
+ * user. Avoids hitting the exception-based retry path inside
+ * initCryptoWithRetry, which has worse timing characteristics.
+ */
+async function ensureCryptoStoreOwner(userId) {
+  const prior = localStorage.getItem(CRYPTO_OWNER_KEY);
+  if (prior && prior !== userId) {
+    progress(`Crypto store belonged to ${prior}; resetting for ${userId}`);
+    await clearCryptoStore();
+  }
+  localStorage.setItem(CRYPTO_OWNER_KEY, userId);
 }
 
 function isCryptoStoreMismatch(err) {
@@ -165,6 +175,28 @@ async function getSecretStorageKey({ keys }) {
   }
 }
 
+// ── Encryption status (consumed by the UI banner) ──
+// 'unknown'   — not yet checked
+// 'ok'        — cross-signing ready, key backup attached
+// 'verifying' — bootstrap / restore in progress
+// 'history-locked' — backup exists on server but we couldn't restore it
+//                    (user needs to enter recovery key)
+// 'no-backup' — account has no key backup yet (first-ever login)
+let _encryptionStatus = 'unknown';
+const _encryptionListeners = new Set();
+export function getEncryptionStatus() { return _encryptionStatus; }
+export function onEncryptionStatus(fn) {
+  _encryptionListeners.add(fn);
+  return () => _encryptionListeners.delete(fn);
+}
+function setEncryptionStatus(s) {
+  if (_encryptionStatus === s) return;
+  _encryptionStatus = s;
+  for (const fn of _encryptionListeners) {
+    try { fn(s); } catch (e) { console.warn('[matrix] encryption listener failed:', e); }
+  }
+}
+
 async function ensureEncryptionSetUp({ userMxid, password }) {
   const crypto = client.getCrypto();
   if (!crypto) return;
@@ -248,6 +280,12 @@ async function ensureEncryptionSetUp({ userMxid, password }) {
   setEncryptionStatus('ok');
 }
 
+/**
+ * Retry the key-backup restore path with the recovery key the user just
+ * entered. Invoked from the EncryptionBanner; the recovery-key provider
+ * (in `public/recovery-modal.jsx`) shows the prompt modal as part of
+ * `loadSessionBackupPrivateKeyFromSecretStorage`'s callback chain.
+ */
 export async function retryKeyBackupRestore() {
   if (!client) throw new Error('Not signed in');
   const crypto = client.getCrypto();
@@ -289,34 +327,29 @@ async function discoverBaseUrl(rawHs, mxid) {
   return rawHs.replace(/\/+$/, '');
 }
 
-// ── Session storage ──
-//
-// The Matrix access token + device_id lives in IndexedDB encrypted with a
-// non-extractable AES-GCM CryptoKey (the "pickle key"). The key itself is
-// stored as a CryptoKey object in IndexedDB and is generated with
-// `extractable: false`, so it cannot be read out of the browser even by
-// origin-attached scripts — only used to encrypt/decrypt via the WebCrypto
-// API. This mirrors Element Web's pickleKey design and lets cold reloads
-// auto-restore the session without requiring the user's Matrix password.
-//
-// Legacy: earlier versions stored a vault-encrypted blob in localStorage
-// under `mx_session_enc:{userId}`. We still drop that key on logout, but
-// new sessions go only into IndexedDB.
+// ── Vault-encrypted session storage ──
 
 async function persistSession(userId, session) {
-  await storeSessionEncrypted(userId, session);
+  if (!vault.isUnlocked()) throw new Error('Vault locked — cannot persist session');
+  const blob = await vault.encryptJSON(session);
+  // localStorage can't store Uint8Array directly — base64 it.
+  let s = '';
+  for (let i = 0; i < blob.length; i++) s += String.fromCharCode(blob[i]);
+  localStorage.setItem(sessionKey(userId), btoa(s));
 }
 
 async function loadSession(userId) {
-  return loadSessionEncrypted(userId);
+  const raw = localStorage.getItem(sessionKey(userId));
+  if (!raw) return null;
+  if (!vault.isUnlocked()) throw new Error('Vault locked — cannot read session');
+  const bin = atob(raw);
+  const blob = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) blob[i] = bin.charCodeAt(i);
+  return vault.decryptJSON(blob);
 }
 
-async function dropSession(userId) {
-  // Drop both the IndexedDB-stored session and the legacy localStorage
-  // blob, so a re-login on a device that had pre-pickle-key data starts
-  // clean.
-  try { localStorage.removeItem(sessionKey(userId)); } catch {}
-  await dropSessionEncrypted(userId);
+function dropSession(userId) {
+  localStorage.removeItem(sessionKey(userId));
 }
 
 // ── Public API ──
@@ -343,9 +376,6 @@ export async function login(homeserver, username, password) {
 
   // Bootstrap or unlock the vault using the Matrix password. The vault
   // key never leaves memory; the password is only used here for KDF.
-  // Note: the vault encrypts OPFS/outbox data at rest. The session token
-  // itself goes into the IndexedDB pickle-key store (see persistSession),
-  // so cold-reload auto-restore does NOT require the vault to unlock.
   if (!vault.hasMeta(resp.user_id)) {
     progress('Initializing local vault…');
     await vault.initialize(resp.user_id, password);
@@ -353,18 +383,15 @@ export async function login(homeserver, username, password) {
     progress('Unlocking local vault…');
     const ok = await vault.unlock(resp.user_id, password);
     if (!ok) {
-      // The Matrix homeserver accepted this password (`tmp.login` above
-      // succeeded), but the local vault was bootstrapped with a different
-      // one — the user rotated their password on another device, or the
-      // local data was written by a previous account with a coincidentally
-      // matching username. Either way: do NOT silently nuke OPFS / outbox.
-      // Throw so the caller can surface "your local cache is locked,
-      // either enter the original password or explicitly reset" instead
-      // of destroying the user's data.
-      throw new Error(
-        'Local cache password does not match this Matrix password. ' +
-        'Sign out from the menu to clear local data, then sign in again.'
-      );
+      // Password changed on the server; the old key can't decrypt this
+      // user's local data anymore. Reset the vault so the new password
+      // becomes the unlock. The OPFS room files and outbox entries are
+      // left in place — they're dead bytes (unreadable without the old
+      // key) but other users' files on this device stay intact.
+      progress('Vault password mismatch — rotating to current password (prior local data is no longer readable)');
+      vault.wipe(resp.user_id);
+      wipeManifest(resp.user_id);
+      await vault.initialize(resp.user_id, password);
     }
   }
 
@@ -387,6 +414,7 @@ export async function login(homeserver, username, password) {
     cryptoCallbacks: { getSecretStorageKey },
   });
 
+  await ensureCryptoStoreOwner(resp.user_id);
   progress('Initializing encryption…');
   await initCryptoWithRetry(client);
 
@@ -416,10 +444,10 @@ export async function login(homeserver, username, password) {
  * will be in RECONNECTING. The local store + outbox keep functioning.
  */
 export async function restoreSession(userId) {
-  // The session blob is encrypted with the IndexedDB pickle key — vault
-  // does NOT need to be unlocked to restore. (Vault unlock is still
-  // required to read cached OPFS data; without it the SDK will repopulate
-  // rooms from a fresh /sync.)
+  if (!vault.isUnlocked() || vault.getUserId() !== userId) {
+    return null;
+  }
+
   let session;
   try {
     session = await loadSession(userId);
@@ -438,6 +466,7 @@ export async function restoreSession(userId) {
     deviceId,
     cryptoCallbacks: { getSecretStorageKey },
   });
+  await ensureCryptoStoreOwner(sid);
   progress('Restoring session…');
   try {
     await initCryptoWithRetry(client);
@@ -450,9 +479,9 @@ export async function restoreSession(userId) {
     await client.startClient({ initialSyncLimit: 1000 });
     if (_watchSyncUnsub) _watchSyncUnsub();
     _watchSyncUnsub = watchSync(client);
-    // Best-effort wait for sync. 30s tolerates slow homeservers and big
-    // initial syncs; if the server is actually unreachable, getSyncState()
-    // settles on ERROR sooner and we drop straight into local-only mode.
+    // 30s tolerates slow homeservers and large initial syncs without
+    // false-positive "stale" demotion; if the server is actually
+    // unreachable, getSyncState() settles on ERROR sooner.
     try { await waitForSync(client, 30000); }
     catch (e) {
       if (/Session expired/i.test(e.message)) sessionExpired = true;
@@ -470,7 +499,7 @@ export async function restoreSession(userId) {
     try { client.stopClient(); } catch {}
     if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
     client = null;
-    await dropSession(userId);
+    dropSession(userId);
     progress('Saved session was rejected by the server — log in again to refresh credentials.');
     return null;
   }
@@ -495,21 +524,11 @@ export async function unlock(userId, password) {
   if (!ok) throw new Error('Invalid password');
   rememberLastUser(userId);
 
-  // No session in either store → vault is unlocked but we have no Matrix
-  // token. Caller must try a fresh online login (and may fall back to
+  // No session blob → vault is unlocked but we have no Matrix token.
+  // Caller must try a fresh online login (and may fall back to
   // local-only mode if the homeserver is unreachable).
-  const haveSession = (await hasIdbSession(userId)) ||
-                      !!localStorage.getItem(sessionKey(userId));
-  if (!haveSession) {
+  if (!localStorage.getItem(sessionKey(userId))) {
     return { userId, online: false, needsLogin: true };
-  }
-
-  // If a client is already running (auto-restored at cold boot before
-  // the user typed their password), no need to restart it — just confirm
-  // online state.
-  if (client) {
-    const state = client.getSyncState && client.getSyncState();
-    return { userId, online: state === 'PREPARED' || state === 'SYNCING', needsLogin: false };
   }
 
   const c = await restoreSession(userId);
@@ -524,23 +543,45 @@ export async function unlock(userId, password) {
 }
 
 /**
- * Cold-boot auto-restore: attempt to bring up the Matrix client for the
- * last-known user using the IndexedDB pickle key, WITHOUT requiring the
- * vault password. Returns the active session info or null.
+ * Cold-boot auto-restore. Tries two stashes in order:
  *
- * Vault remains locked, which means OPFS-cached events are unreadable
- * until the user enters their password — but the SDK will rehydrate
- * from a fresh /sync, so the user sees their rooms regardless. Writes
- * to the outbox still require a vault unlock (the outbox encrypts each
- * record with the vault key).
+ *   1. sessionStorage  (tab refresh — fast path)
+ *   2. IDB pickle key  (browser restart — wrapped under a non-extractable
+ *                       AES key, persists until sign-out / wipe)
+ *
+ * Both verify the adopted key against on-disk vault meta before exposing
+ * the vault as unlocked. Returns null when there's nothing to resume.
+ *
+ * Decoupling the two stashes from the session blob itself means a
+ * browser-restart auto-restore comes up with the vault UNLOCKED — which
+ * is what the outbox / OPFS path needs to write data. Earlier iterations
+ * left the vault locked on browser-restart and saves silently failed.
  */
-export async function tryAutoRestore() {
-  const uid = getLastUser();
-  if (!uid) return null;
-  if (!(await hasIdbSession(uid))) return null;
-  const c = await restoreSession(uid);
-  if (!c) return null;
-  return { userId: uid, client: c };
+export async function tryAutoUnlock() {
+  const lastUser = getLastUser();
+  if (!lastUser) return null;
+  if (!vault.hasMeta(lastUser)) return null;
+
+  let adopted = await vault.tryAdoptStashedKey(lastUser);
+  if (!adopted) {
+    adopted = await vault.tryAdoptKeyFromIdb(lastUser);
+  }
+  if (!adopted) return null;
+
+  progress('Resuming session…');
+
+  let online = false;
+  try {
+    const c = await restoreSession(lastUser);
+    if (c) {
+      const state = c.getSyncState && c.getSyncState();
+      online = state === 'PREPARED' || state === 'SYNCING';
+    }
+  } catch (e) {
+    progress(`Auto-restore: ${e.message}`);
+  }
+
+  return { userId: lastUser, online };
 }
 
 /**
@@ -558,14 +599,48 @@ export async function lock() {
 }
 
 /**
- * Full logout: server-side logout, wipe encrypted session, wipe vault
- * metadata, wipe OPFS room data, wipe outbox, drop the crypto store.
- * Everything on disk for this user is gone after this resolves.
+ * Sign out: revoke the access token on the server, drop the cached
+ * session token, and lock the vault. Local data (OPFS rooms, media,
+ * outbox, vault metadata, room manifest) is kept on disk so the same
+ * user can sign back in later without losing their workspace, and so
+ * a different user signing in on this device doesn't blow away the
+ * previous user's encrypted-at-rest data.
+ *
+ * The crypto store is left alone; if a different user signs in next,
+ * `initCryptoWithRetry` detects the mismatch and rebuilds from the
+ * server's key backup.
+ *
+ * Call `wipeLocalData()` separately for a full device clean.
  */
 export async function logout() {
-  // Capture the user id BEFORE wiping the vault; we need it to clean up
-  // per-user blobs even when the vault is currently locked (cold-reload
-  // auto-restore case).
+  const uid = vault.getUserId();
+  if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
+  if (client) {
+    try { client.stopClient(); } catch {}
+    try { await client.logout(true); } catch {}
+    client = null;
+  }
+  if (uid) dropSession(uid);
+  vault.lock();
+  // Keep `getLastUser()` so the login form can pre-fill the username.
+  // The next sign-in will re-derive the vault key from the password.
+}
+
+/**
+ * Destructive wipe: removes every byte of local state this app owns —
+ * OPFS room files, media cache, outbox, every vault, every saved
+ * session, room manifests, and the matrix-js-sdk crypto store. The
+ * `getLastUser()` hint is forgotten too.
+ *
+ * Call this when the user explicitly asks to "clear local data" or
+ * when the local vault has been irrecoverably corrupted.
+ */
+export async function wipeLocalData() {
+  // Capture the user id BEFORE wiping — `vault.getUserId()` clears on
+  // `vault.wipe()`, but we still want to wipe the IDB pickle stash for
+  // that user (vault.wipe already triggers a best-effort drop, but
+  // belt-and-suspenders here covers the auto-restore-failed case where
+  // vault was never adopted in this tab).
   const uid = vault.getUserId() || getLastUser();
   if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
   if (client) {
@@ -574,7 +649,7 @@ export async function logout() {
     client = null;
   }
   if (uid) {
-    await dropSession(uid);
+    dropSession(uid);
     wipeManifest(uid);
     vault.wipe(uid);
     try { await wipePickleKey(uid); } catch {}
@@ -583,6 +658,7 @@ export async function logout() {
   try { await wipeMediaCache(); } catch {}
   try { await clearOutbox(); } catch {}
   try { await clearCryptoStore(); } catch {}
+  localStorage.removeItem(CRYPTO_OWNER_KEY);
   setEncryptionStatus('unknown');
   forgetLastUser();
 }
@@ -598,13 +674,7 @@ export function hasLocalAccount(userId) {
   return vault.hasMeta(userId);
 }
 
-/** Does the user have a usable saved access token (legacy localStorage)? */
+/** Does the user have a usable saved access token? */
 export function hasSavedSession(userId) {
-  return !!localStorage.getItem(sessionKey(userId));
-}
-
-/** Does the user have a saved access token in the new IDB pickle store? */
-export async function hasSavedSessionAsync(userId) {
-  if (await hasIdbSession(userId)) return true;
   return !!localStorage.getItem(sessionKey(userId));
 }

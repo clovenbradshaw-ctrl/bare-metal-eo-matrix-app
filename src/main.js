@@ -18,11 +18,13 @@
  */
 import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
+         tryAutoUnlock, wipeLocalData,
          setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider,
-         tryAutoRestore, getEncryptionStatus, onEncryptionStatus,
+         getEncryptionStatus, onEncryptionStatus,
          retryKeyBackupRestore } from './client.js';
-import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, getNamespace,
+import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
+import { planDatasetFromFile } from './dataset.js';
 import { fold, foldFrom, initial, stateHash } from './fold.js';
 import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          loadTimelineSince, invite, getMembers, myPowerLevel, kickMember,
@@ -55,6 +57,7 @@ let unsubRoomChanges = null;
 let netState = 'offline';
 let activeSession = null;               // { mxid, homeserver, device_id, ... }
 let progressLog = [];                   // ring buffer of recent log lines
+let booting = true;                     // true until cold-boot auto-restore settles
 
 // In-memory mirror of the persisted room manifest. Lets `listRooms`
 // return something useful when the SDK hasn't synced yet (offline boot,
@@ -333,7 +336,7 @@ async function reconnect(password) {
   return await afterAuth(refreshedId, hs);
 }
 
-async function logout() {
+async function tearDownLiveState() {
   if (outboxFlusher) { outboxFlusher.stop(); outboxFlusher = null; }
   if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
   if (manifestSaveTimer) { clearTimeout(manifestSaveTimer); manifestSaveTimer = null; }
@@ -345,7 +348,22 @@ async function logout() {
   sentEventToLocalId.clear();
   roomManifest = [];
   roomManifestKey = '';
+}
+
+async function logout() {
+  await tearDownLiveState();
   await mxLogout();
+  activeSession = null;
+  notify('session');
+}
+
+/**
+ * Hard reset: signs out AND wipes every byte of local state. Use when
+ * the user explicitly asks to clear local data.
+ */
+async function clearLocalData() {
+  await tearDownLiveState();
+  await wipeLocalData();
   activeSession = null;
   notify('session');
 }
@@ -540,8 +558,11 @@ async function emit(roomId, op, content) {
 // decryption key travels inside the Megolm-encrypted event content,
 // so the homeserver only ever sees opaque bytes.
 //
-// Default layout: an `import` entity with the file ref + metadata.
-// Callers can override the entity type and add extra DEFs via opts.
+// Layout: every import creates an `import` entity with the file ref +
+// metadata. For CSV / JSON we additionally parse the bytes, infer a
+// schema, and emit it as a derived set so the rows are addressable as
+// data, not just a blob. Callers can opt out by passing
+// `materialize: false`.
 async function importFileToRoom(roomId, file, opts = {}) {
   if (!roomId) throw new Error('importFileToRoom needs a roomId');
   if (!file) throw new Error('importFileToRoom needs a file');
@@ -551,6 +572,21 @@ async function importFileToRoom(roomId, file, opts = {}) {
 
   const entityType = opts.entityType || 'import';
   const displayName = opts.name || file.name || 'file';
+
+  // Parse before upload so we can fail fast on malformed CSV/JSON and
+  // so the derived set name is in hand by the time we DEF the import
+  // entity. Parsing reads the file bytes from a fresh stream — uploading
+  // does not consume the File.
+  let plan = null;
+  if (opts.materialize !== false) {
+    try {
+      plan = await planDatasetFromFile(file, {
+        existingTables: existingTablesIn(roomId),
+      });
+    } catch (e) {
+      logProgress(`Could not parse ${displayName} as a dataset: ${e.message}`);
+    }
+  }
 
   logProgress(`Uploading ${displayName} (${file.size} bytes)…`);
   const ref = await mediaUploadFile(file, { name: displayName });
@@ -566,8 +602,67 @@ async function importFileToRoom(roomId, file, opts = {}) {
   await def(roomId, anchor, 'file', ref);
   await def(roomId, anchor, 'imported_at', new Date().toISOString());
 
+  if (plan) {
+    await materializeDataset(roomId, plan, anchor);
+    await def(roomId, anchor, 'derived_set', plan.setName);
+    await def(roomId, anchor, 'rows_imported', plan.rows.length);
+    if (plan.truncated) await def(roomId, anchor, 'truncated', true);
+  }
+
   notify('events');
-  return { anchor, ref };
+  return { anchor, ref, derivedSet: plan?.setName || null };
+}
+
+// Read the current room timeline, fold it, and return the list of
+// declared + observed set names. Used at import time so a derived set
+// can claim a unique name without clobbering the existing schema.
+function existingTablesIn(roomId) {
+  try {
+    const events = roomEvents.get(roomId) || [];
+    const state = fold(events);
+    const declared = state.schema?.tables || [];
+    const observed = Array.from(new Set(
+      Object.values(state.entities)
+        .map(e => e._type)
+        .filter(t => t && !t.startsWith('_'))
+    ));
+    return Array.from(new Set([...declared, ...observed]));
+  } catch (e) {
+    console.warn('[import] could not read existing tables:', e);
+    return [];
+  }
+}
+
+// Declare the derived set's schema, then emit one INS + N DEFs per row.
+// Rows are emitted serially through the outbox so order is preserved;
+// the optimistic hook surfaces them in the UI as they enqueue.
+async function materializeDataset(roomId, plan, importAnchor) {
+  const tables = existingTablesIn(roomId);
+  if (!tables.includes(plan.setName)) {
+    await defSchema(roomId, 'tables', [...tables, plan.setName]);
+  }
+  await defSchema(roomId, `fields.${plan.setName}`, plan.fields);
+
+  logProgress(`Building set "${plan.setName}" · ${plan.rows.length} rows × ${plan.fields.length} fields`);
+  let rowCount = 0;
+  for (const row of plan.rows) {
+    const rowAnchor = await ins(roomId, plan.setName, {});
+    for (const f of plan.fields) {
+      if (row[f.name] !== undefined && row[f.name] !== null) {
+        await def(roomId, rowAnchor, f.name, row[f.name]);
+      }
+    }
+    rowCount++;
+    if (rowCount % 50 === 0) {
+      logProgress(`  …${rowCount}/${plan.rows.length} rows`);
+    }
+    // Link the first row back to the source import entity so the
+    // provenance edge is observable in graph projections.
+    if (rowCount === 1 && importAnchor) {
+      try { await con(roomId, importAnchor, rowAnchor, 'derived'); } catch {}
+    }
+  }
+  logProgress(`Set "${plan.setName}" ready · ${rowCount} rows`);
 }
 
 /**
@@ -629,10 +724,8 @@ setRecoveryKeyProvider(() => new Promise((resolve) => {
   }
 }));
 
-// ── Encryption-status surface ──
-//
-// The React banner subscribes via `subscribe('encryption')`; the client
-// layer pushes status changes here.
+// Bridge encryption-status changes into the React subscription stream.
+// EncryptionBanner subscribes via `subscribe('encryption')`.
 onEncryptionStatus(() => notify('encryption'));
 
 // ── Public surface ──
@@ -642,11 +735,13 @@ window.MatrixLive = {
   login: loginWithMatrix,
   reconnect,
   logout,
+  clearLocalData,
   hasLocalAccount,
   getLastUser,
   getSession: () => activeSession,
   isAuthed: () => !!activeSession,
   isStale: () => !!(activeSession && activeSession.stale),
+  isBooting: () => booting,
   // Rooms
   listRooms,
   createRoom: createWorkspace,
@@ -687,43 +782,31 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-// ── Cold-boot auto-restore ──
-//
-// If the last-known user has a session stored in IndexedDB (encrypted
-// with the pickle key), bring up the Matrix client silently. The vault
-// remains locked — OPFS-cached events stay unreadable until the user
-// types their password — but the SDK rehydrates rooms via /sync, so the
-// user lands on their workspace without a re-login prompt.
-//
-// Failures here are non-fatal: the LoginScreen renders as before.
+// Cold-boot auto-restore. If a previous unlock in this tab stashed the
+// vault key in sessionStorage, we resume the Matrix session without
+// returning to the login screen. The first `notify('session')` fires
+// either when restore succeeds or when we conclude there's nothing to
+// resume, so the React layer can mount immediately and show a "resuming"
+// state instead of flashing the login portal.
 (async () => {
   try {
-    const restored = await tryAutoRestore();
-    if (!restored) {
-      notify('session');
-      return;
+    const result = await tryAutoUnlock();
+    if (result) {
+      const c = getClient();
+      const hs = c?.getHomeserverUrl?.() || '';
+      // Having a client at all is enough to call afterAuth — that
+      // matches how loginWithMatrix routes the unlock path. If the
+      // sync state is still RECONNECTING we'll show as online with
+      // the network watcher; afterAuthStale is only for the no-client
+      // case (vault unlocked but no usable Matrix token).
+      if (c) await afterAuth(result.userId, hs);
+      else   await afterAuthStale(result.userId, hs);
     }
-    activeSession = {
-      mxid: restored.userId,
-      homeserver: restored.client.getHomeserverUrl?.() || '',
-      device_id: restored.client.getDeviceId?.() || null,
-      signed_in_at: Date.now(),
-      stale: false,
-      // Flag for the UI: we have a Matrix client but the vault is locked,
-      // so outbox writes and OPFS reads need a password unlock first.
-      vaultLocked: !vault.isUnlocked() || vault.getUserId() !== restored.userId,
-    };
-    if (outboxFlusher) outboxFlusher.stop();
-    outboxFlusher = makeOutboxFlusher();
-    outboxFlusher.start();
-    if (unsubRoomChanges) unsubRoomChanges();
-    unsubRoomChanges = onRoomChanges(() => {
-      refreshManifestFromLive();
-      notify('rooms');
-    });
-    notify('session');
   } catch (e) {
     console.warn('[bridge] auto-restore failed:', e);
+    logProgress('Auto-restore failed: ' + (e?.message || e));
+  } finally {
+    booting = false;
     notify('session');
   }
 })();
