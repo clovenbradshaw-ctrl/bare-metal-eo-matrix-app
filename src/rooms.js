@@ -94,6 +94,7 @@ export function discoverRooms(roomType = null) {
       roomType: content.room_type,
       membership,
       inviter,
+      archived: roomIsArchived(room),
       meta: content,
     });
   }
@@ -131,13 +132,16 @@ export function onRoomChanges(handler) {
   // Also listen for state events so that when the meta event arrives
   // after a join, the room list refreshes with the correct type.
   const onState = () => handler();
+  const onTags = () => handler();
   client.on(ClientEvent.Room, onRoom);
   client.on(RoomEvent.MyMembership, onMembership);
   client.on(RoomStateEvent.Events, onState);
+  client.on(RoomEvent.Tags, onTags);
   return () => {
     client.removeListener(ClientEvent.Room, onRoom);
     client.removeListener(RoomEvent.MyMembership, onMembership);
     client.removeListener(RoomStateEvent.Events, onState);
+    client.removeListener(RoomEvent.Tags, onTags);
   };
 }
 
@@ -400,6 +404,29 @@ export async function setName(roomId, name) {
   const client = getClient();
   if (!client) throw new Error('Not connected');
   await client.setRoomName(roomId, name);
+}
+
+const ARCHIVED_TAG = () => `${getNamespace()}.archived`;
+
+/**
+ * Mark / unmark a room as archived. Stored as an account-data room
+ * tag so the state is per-user and syncs across devices.
+ */
+export async function setArchived(roomId, archived) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+  const tag = ARCHIVED_TAG();
+  if (archived) {
+    await client.setRoomTag(roomId, tag, {});
+  } else {
+    await client.deleteRoomTag(roomId, tag);
+  }
+}
+
+function roomIsArchived(room) {
+  const tags = room?.tags;
+  if (!tags) return false;
+  return Object.prototype.hasOwnProperty.call(tags, ARCHIVED_TAG());
 }
 
 /**

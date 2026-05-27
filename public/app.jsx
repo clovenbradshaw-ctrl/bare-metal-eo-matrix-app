@@ -99,12 +99,22 @@ function useDemoTitleOverrides() {
 
 function WorkspacesHome({
   session, rooms, isLive, syncReady,
-  onEnter, onCreate, onSignOut, onAcceptInvite,
+  onEnter, onCreate, onSignOut, onAcceptInvite, onArchive,
 }) {
   const [newName, setNewName] = useState('');
   const [creating, setCreating] = useState(false);
   const [err, setErr] = useState(null);
+  const [showArchived, setShowArchived] = useState(false);
   const inputRef = useRef(null);
+
+  const activeRooms = rooms.filter(r => !r.archived);
+  const archivedRooms = rooms.filter(r => r.archived);
+
+  async function toggleArchive(roomId, archived) {
+    if (!onArchive) return;
+    try { await onArchive(roomId, archived); }
+    catch (e) { setErr(e?.message || 'could not update archive state'); }
+  }
 
   const demo = !!session?.demo;
   const stale = !demo && !!session?.stale;
@@ -112,7 +122,7 @@ function WorkspacesHome({
 
   // Show a "loading" placeholder while a real Matrix sync is still warming
   // up — otherwise we briefly flash "no spaces yet" before rooms arrive.
-  const loading = isLive && !syncReady && rooms.length === 0;
+  const loading = isLive && !syncReady && activeRooms.length === 0;
 
   async function handleCreate() {
     const name = newName.trim();
@@ -148,7 +158,7 @@ function WorkspacesHome({
           <div className="wh-tagline">
             {loading
               ? 'loading your spaces from the homeserver…'
-              : rooms.length > 0
+              : activeRooms.length > 0
                 ? 'pick a space to enter, or start a new one.'
                 : demo
                   ? 'create your first space — it will be saved locally in this browser.'
@@ -166,58 +176,99 @@ function WorkspacesHome({
         {loading ? (
           <div className="wh-loading">…</div>
         ) : (
-          <div className="wh-grid">
-            {rooms.map(r => {
-              const title = r.title || 'untitled space';
-              const initial = (title[0] || '?').toUpperCase();
-              const isInvite = r.membership === 'invite';
-              return (
-                <button
-                  key={r.id}
-                  className={`wh-card ${isInvite ? 'wh-card-invite' : ''}`}
-                  onClick={() => isInvite ? onAcceptInvite?.(r.id) : onEnter(r.id)}
-                  title={r.id}
-                >
-                  <span className="wh-card-sigil">{initial}</span>
-                  <span className="wh-card-name">{title}</span>
-                  <span className="wh-card-meta">
-                    {isInvite
-                      ? `invite${r.inviter ? ` from ${r.inviter}` : ''}`
-                      : r.eventCount > 0
-                        ? `${r.eventCount} events`
-                        : 'empty'}
-                  </span>
-                  {isInvite && <span className="wh-card-action">accept →</span>}
-                </button>
-              );
-            })}
+          <>
+            <div className="wh-grid">
+              {activeRooms.map(r => {
+                const title = r.title || 'untitled space';
+                const initial = (title[0] || '?').toUpperCase();
+                const isInvite = r.membership === 'invite';
+                return (
+                  <div
+                    key={r.id}
+                    className={`wh-card ${isInvite ? 'wh-card-invite' : ''}`}
+                    onClick={() => isInvite ? onAcceptInvite?.(r.id) : onEnter(r.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        isInvite ? onAcceptInvite?.(r.id) : onEnter(r.id);
+                      }
+                    }}
+                    title={r.id}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <span className="wh-card-sigil">{initial}</span>
+                    <span className="wh-card-name">{title}</span>
+                    {isInvite ? (
+                      <span className="wh-card-meta">
+                        invite{r.inviter ? ` from ${r.inviter}` : ''}
+                      </span>
+                    ) : null}
+                    {isInvite && <span className="wh-card-action">accept →</span>}
+                    {!isInvite && isLive && onArchive && (
+                      <button
+                        className="wh-card-archive"
+                        onClick={(e) => { e.stopPropagation(); toggleArchive(r.id, true); }}
+                        title="archive this space"
+                      >archive</button>
+                    )}
+                  </div>
+                );
+              })}
 
-            <div className="wh-card wh-card-new">
-              <span className="wh-card-sigil wh-card-sigil-new">+</span>
-              <div className="wh-new-form">
-                <input
-                  ref={inputRef}
-                  className="wh-new-input"
-                  value={newName}
-                  placeholder="name a new space"
-                  onChange={e => setNewName(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') handleCreate(); }}
-                  disabled={creating || stale}
-                />
-                <button
-                  className="wh-new-btn"
-                  onClick={handleCreate}
-                  disabled={!newName.trim() || creating || stale}
-                >
-                  {creating ? 'creating…' : 'create'}
-                </button>
+              <div className="wh-card wh-card-new">
+                <span className="wh-card-sigil wh-card-sigil-new">+</span>
+                <div className="wh-new-form">
+                  <input
+                    ref={inputRef}
+                    className="wh-new-input"
+                    value={newName}
+                    placeholder="name a new space"
+                    onChange={e => setNewName(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') handleCreate(); }}
+                    disabled={creating || stale}
+                  />
+                  <button
+                    className="wh-new-btn"
+                    onClick={handleCreate}
+                    disabled={!newName.trim() || creating || stale}
+                  >
+                    {creating ? 'creating…' : 'create'}
+                  </button>
+                </div>
+                {stale && (
+                  <span className="wh-card-meta">reconnect to create new spaces</span>
+                )}
+                {err && <span className="wh-card-err">{err}</span>}
               </div>
-              {stale && (
-                <span className="wh-card-meta">reconnect to create new spaces</span>
-              )}
-              {err && <span className="wh-card-err">{err}</span>}
             </div>
-          </div>
+
+            {archivedRooms.length > 0 && (
+              <div className="wh-archived">
+                <button
+                  className="wh-archived-head"
+                  onClick={() => setShowArchived(s => !s)}
+                >
+                  archived · {archivedRooms.length} {showArchived ? '▾' : '▸'}
+                </button>
+                {showArchived && (
+                  <div className="wh-archived-list">
+                    {archivedRooms.map(r => (
+                      <div key={r.id} className="wh-archived-row" title={r.id}>
+                        <span className="wh-archived-name">{r.title || 'untitled space'}</span>
+                        {isLive && onArchive && (
+                          <button
+                            className="wh-archived-restore"
+                            onClick={() => toggleArchive(r.id, false)}
+                          >unarchive</button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -240,8 +291,11 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
     return () => document.removeEventListener('mousedown', close);
   }, [open]);
 
+  // Archived spaces stay reachable if you're currently inside one, but
+  // are hidden from the picker list otherwise.
+  const visibleRooms = rooms.filter(r => !r.archived || r.id === currentRoomId);
   const current = rooms.find(r => r.id === currentRoomId);
-  const label = current ? (current.title || 'untitled workspace') : (rooms.length ? 'pick a workspace' : 'no workspaces');
+  const label = current ? (current.title || 'untitled workspace') : (visibleRooms.length ? 'pick a workspace' : 'no workspaces');
 
   return (
     <div className="room-picker" ref={ref}>
@@ -263,15 +317,15 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
               </button>
             </div>
           )}
-          <div className="panel-head">workspaces · {rooms.length}</div>
-          {rooms.length === 0 && (
+          <div className="panel-head">workspaces · {visibleRooms.length}</div>
+          {visibleRooms.length === 0 && (
             <div style={{padding:'10px 12px',fontSize:11,color:'var(--text-dim)',fontStyle:'italic'}}>
               {isLive
                 ? 'no workspaces yet — create one below.'
                 : 'no workspaces yet.'}
             </div>
           )}
-          {rooms.map(r => (
+          {visibleRooms.map(r => (
             <div
               key={r.id}
               className={`room-row ${r.id === currentRoomId ? 'active' : ''}`}
@@ -284,7 +338,6 @@ function RoomPicker({ rooms, currentRoomId, setCurrentRoomId, onCreateRoom, demo
                   <span style={{marginLeft:6,color:'var(--signal)',fontSize:10,textTransform:'uppercase'}}>invite</span>
                 )}
               </span>
-              <span className="rmeta">{r.eventCount} ev</span>
               {isLive && r.membership === 'join' && onManageMembers && (
                 <button
                   className="sp-row-share"
@@ -521,6 +574,14 @@ function App() {
     }
   }
 
+  async function handleArchive(roomId, archived) {
+    if (!isLive || !window.MatrixLive?.archiveRoom) {
+      throw new Error('archive requires a live homeserver connection');
+    }
+    await window.MatrixLive.archiveRoom(roomId, archived);
+    if (archived && currentRoomId === roomId) setCurrentRoomId(null);
+  }
+
   const ts = effectiveCursor > 0 ? allEvents[effectiveCursor - 1].origin_server_ts : null;
 
   const rooms = isLive
@@ -623,6 +684,7 @@ function App() {
         onCreate={onCreateRoom}
         onSignOut={handleSignOut}
         onAcceptInvite={handleAcceptInvite}
+        onArchive={isLive ? handleArchive : null}
       />
     );
   }
