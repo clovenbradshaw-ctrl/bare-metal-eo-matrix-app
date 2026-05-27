@@ -425,7 +425,7 @@ function useLiveStore(enabled, currentRoomId) {
 }
 
 function App() {
-  const [session, setSession] = window.useSession();
+  const [session, setSession, booting] = window.useSession();
   const [tweaks, setTweak] = window.useTweaks(TWEAK_DEFAULTS);
 
   // Demo source (in-memory + seed); used when session.demo OR no session.
@@ -492,7 +492,11 @@ function App() {
   const state = useMemo(() => ME.fold(allEvents.slice(0, effectiveCursor)), [allEvents, effectiveCursor]);
 
   // Gate the app on auth (or demo session) — every hook is above this line.
+  // While the bridge is still trying to resume a session from the
+  // sessionStorage vault stash, show a splash instead of flashing the
+  // login portal.
   if (!session) {
+    if (booting) return <window.BootSplash />;
     return <window.LoginScreen onSignIn={(s) => setSession(s)} />;
   }
 

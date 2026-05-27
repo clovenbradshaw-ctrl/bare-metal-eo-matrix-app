@@ -52,14 +52,20 @@ async function deriveKey(password, salt) {
     false,
     ['deriveKey']
   );
+  // Extractable so we can stash a copy in sessionStorage for refresh-only
+  // persistence. The raw key never reaches localStorage or disk.
   return crypto.subtle.deriveKey(
     { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: PBKDF2_ITERATIONS },
     material,
     { name: 'AES-GCM', length: KEY_BITS },
-    false,
+    true,
     ['encrypt', 'decrypt']
   );
 }
+
+// sessionStorage key for the tab-scoped vault stash. Survives F5,
+// dies when the tab/browser closes.
+const SESSION_STASH_KEY = 'vault:session_stash';
 
 function loadMeta(userId) {
   const raw = localStorage.getItem(metaKey(userId));
@@ -129,6 +135,7 @@ class Vault {
     saveMeta(userId, salt, verifierIv, verifierCt);
     this._key = key;
     this._userId = userId;
+    await this._stashKey();
     this._notify();
   }
 
@@ -149,6 +156,7 @@ class Vault {
       if (decoder.decode(new Uint8Array(plain)) !== `verify:${userId}`) return false;
       this._key = candidate;
       this._userId = userId;
+      await this._stashKey();
       this._notify();
       return true;
     } catch {
@@ -171,7 +179,77 @@ class Vault {
   /** Lock: clear key from memory, keep data on disk. */
   lock() {
     this._key = null;
+    this._userId = null;
+    this._clearStash();
     this._notify();
+  }
+
+  /**
+   * Stash the current key into sessionStorage so a tab refresh can re-adopt
+   * it without prompting for the password again. Tab close / browser quit
+   * clears sessionStorage, which is exactly the persistence boundary we want.
+   */
+  async _stashKey() {
+    if (!this._key || !this._userId) return;
+    try {
+      const raw = await crypto.subtle.exportKey('raw', this._key);
+      const bytes = new Uint8Array(raw);
+      sessionStorage.setItem(SESSION_STASH_KEY, JSON.stringify({
+        userId: this._userId,
+        key: b64(bytes),
+      }));
+    } catch (e) {
+      // Non-extractable key, sessionStorage disabled, or quota — refresh
+      // persistence just won't work in that case.
+      console.warn('[vault] stash failed:', e?.message || e);
+    }
+  }
+
+  _clearStash() {
+    try { sessionStorage.removeItem(SESSION_STASH_KEY); } catch {}
+  }
+
+  /**
+   * Restore the vault from a sessionStorage stash left by an earlier
+   * unlock/initialize in this tab. Returns true on success.
+   *
+   * The stashed key is verified against the on-disk vault meta before
+   * we expose it as "unlocked", so a tampered stash can't trick us.
+   */
+  async tryAdoptStashedKey(expectedUserId) {
+    let raw;
+    try { raw = sessionStorage.getItem(SESSION_STASH_KEY); }
+    catch { return false; }
+    if (!raw) return false;
+
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch { this._clearStash(); return false; }
+    if (!parsed?.userId || !parsed.key) { this._clearStash(); return false; }
+    if (expectedUserId && parsed.userId !== expectedUserId) return false;
+
+    const meta = loadMeta(parsed.userId);
+    if (!meta) { this._clearStash(); return false; }
+
+    try {
+      const keyBytes = unb64(parsed.key);
+      const key = await crypto.subtle.importKey(
+        'raw', keyBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
+      );
+      const plain = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: meta.verifierIv }, key, meta.verifierCt
+      );
+      if (decoder.decode(new Uint8Array(plain)) !== `verify:${parsed.userId}`) {
+        this._clearStash();
+        return false;
+      }
+      this._key = key;
+      this._userId = parsed.userId;
+      this._notify();
+      return true;
+    } catch {
+      this._clearStash();
+      return false;
+    }
   }
 
   /**
@@ -184,6 +262,7 @@ class Vault {
     if (this._userId === userId) {
       this._key = null;
       this._userId = null;
+      this._clearStash();
       this._notify();
     }
   }
