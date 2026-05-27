@@ -32,6 +32,49 @@ function fmtCell(value, type) {
   return { cls: 'str', text: String(value) };
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Formula evaluator — Airtable-flavored. {field} references resolve against
+// the row record; helpers like RECORD_ID() expose computed properties. The
+// Function constructor evaluates in the room's browser, which is the same
+// trust boundary as any other DEF — formulas live in _schema.fields.* and
+// are authored by room members.
+// ─────────────────────────────────────────────────────────────────────────
+function evalFormula(formula, record) {
+  if (!formula || typeof formula !== 'string') return '';
+  const code = formula.replace(/\{([^}]+)\}/g, (_, name) => `record[${JSON.stringify(name.trim())}]`);
+  try {
+    const fn = new Function(
+      'record', 'RECORD_ID', 'CONCATENATE', 'UPPER', 'LOWER', 'LEN', 'IF', 'TRIM', 'LEFT', 'RIGHT',
+      `"use strict"; return (${code});`
+    );
+    const s = (v) => v == null ? '' : String(v);
+    return fn(
+      record,
+      () => record._anchor,
+      (...args) => args.map(s).join(''),
+      (v) => s(v).toUpperCase(),
+      (v) => s(v).toLowerCase(),
+      (v) => s(v).length,
+      (cond, a, b) => cond ? a : b,
+      (v) => s(v).trim(),
+      (v, n) => s(v).slice(0, n),
+      (v, n) => s(v).slice(-n),
+    );
+  } catch (e) {
+    return '#ERROR';
+  }
+}
+
+function FormulaCell({ formula, record }) {
+  const value = evalFormula(formula, record);
+  const { cls, text } = fmtCell(value, 'text');
+  return (
+    <td className={`cell formula ${cls}`} title={formula ? `= ${formula}` : 'formula · double-click the header in schema view to set'}>
+      {text}
+    </td>
+  );
+}
+
 function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsumed, onNavigate }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
@@ -145,7 +188,7 @@ function buildTable(entityType, state) {
   let cols;
   if (Array.isArray(schemaFields)) {
     const declared = new Set(schemaFields.map(f => f.name));
-    cols = schemaFields.map(f => ({ name: f.name, type: f.type, options: f.options, schematized: true }));
+    cols = schemaFields.map(f => ({ name: f.name, type: f.type, options: f.options, formula: f.formula, schematized: true }));
     // any data-only columns get appended
     const extras = new Set();
     for (const r of rows) {
@@ -239,13 +282,15 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     if (autoFocusedTablesRef.current.has(entityType)) return;
     if (rows.length !== 1 || cols.length === 0) return;
     const r = rows[0];
-    const allEmpty = cols.every(c => {
+    const editable = cols.filter(c => c.type !== 'formula');
+    if (editable.length === 0) return;
+    const allEmpty = editable.every(c => {
       const v = r[c.name];
       return v === undefined || v === null || v === '';
     });
     if (!allEmpty) return;
     autoFocusedTablesRef.current.add(entityType);
-    setPendingFocus({ anchor: r._anchor, field: cols[0].name });
+    setPendingFocus({ anchor: r._anchor, field: editable[0].name });
   }, [entityType, rows, cols]);
 
   function addNewField() {
@@ -314,26 +359,39 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     return anchor;
   }
 
+  function nextEditableCol(startIdx, step) {
+    for (let i = startIdx; i >= 0 && i < cols.length; i += step) {
+      if (cols[i].type !== 'formula') return i;
+    }
+    return -1;
+  }
+
   function navigate(rowIdx, colIdx, dir) {
     if (dir === 'tab') {
-      if (colIdx < cols.length - 1) {
-        setPendingFocus({ anchor: rows[rowIdx]._anchor, field: cols[colIdx + 1].name });
+      const next = nextEditableCol(colIdx + 1, 1);
+      if (next !== -1) {
+        setPendingFocus({ anchor: rows[rowIdx]._anchor, field: cols[next].name });
       } else if (rowIdx === rows.length - 1) {
+        const first = nextEditableCol(0, 1);
         const newAnchor = addRow();
-        setPendingFocus({ anchor: newAnchor, field: cols[0].name });
+        if (first !== -1) setPendingFocus({ anchor: newAnchor, field: cols[first].name });
       } else {
-        setPendingFocus({ anchor: rows[rowIdx + 1]._anchor, field: cols[0].name });
+        const first = nextEditableCol(0, 1);
+        if (first !== -1) setPendingFocus({ anchor: rows[rowIdx + 1]._anchor, field: cols[first].name });
       }
     } else if (dir === 'shift-tab') {
-      if (colIdx > 0) {
-        setPendingFocus({ anchor: rows[rowIdx]._anchor, field: cols[colIdx - 1].name });
+      const prev = nextEditableCol(colIdx - 1, -1);
+      if (prev !== -1) {
+        setPendingFocus({ anchor: rows[rowIdx]._anchor, field: cols[prev].name });
       } else if (rowIdx > 0) {
-        setPendingFocus({ anchor: rows[rowIdx - 1]._anchor, field: cols[cols.length - 1].name });
+        const last = nextEditableCol(cols.length - 1, -1);
+        if (last !== -1) setPendingFocus({ anchor: rows[rowIdx - 1]._anchor, field: cols[last].name });
       }
     } else if (dir === 'enter') {
       if (rowIdx === rows.length - 1) {
+        const first = nextEditableCol(0, 1);
         const newAnchor = addRow();
-        setPendingFocus({ anchor: newAnchor, field: cols[0].name });
+        if (first !== -1) setPendingFocus({ anchor: newAnchor, field: cols[first].name });
       } else {
         setPendingFocus({ anchor: rows[rowIdx + 1]._anchor, field: cols[colIdx].name });
       }
@@ -342,8 +400,9 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
 
   function addRowAndFocus() {
     if (cols.length === 0) return;
+    const first = nextEditableCol(0, 1);
     const newAnchor = addRow();
-    setPendingFocus({ anchor: newAnchor, field: cols[0].name });
+    if (first !== -1) setPendingFocus({ anchor: newAnchor, field: cols[first].name });
   }
 
   const allCols = [
@@ -406,17 +465,25 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             <tr>
               {allCols.map(c => {
                 const cs = colStats[c.name];
+                const isFormula = c.type === 'formula';
                 const renameable = !c.isPk && c.type !== 'linked' && c.type !== 'partition';
                 // Only allow dblclick-rename on fields with no row data — renaming a
-                // populated field would orphan its values under the old key.
-                const empty = rows.every(r => r[c.name] === undefined || r[c.name] === null || r[c.name] === '');
+                // populated field would orphan its values under the old key. Formula
+                // fields don't store row data, so they're always rename-safe.
+                const empty = isFormula || rows.every(r => r[c.name] === undefined || r[c.name] === null || r[c.name] === '');
                 const dblRenameable = renameable && empty;
                 const isRenaming = renameable && renamingField?.oldName === c.name;
+                const showGlyph = c.isPk || isFormula;
+                const headerTitle = c.isPk
+                  ? '_anchor · formula field, derived from INS payload'
+                  : isFormula
+                    ? (c.formula ? `formula: ${c.formula}` : 'formula field · set the expression in schema view')
+                    : (c.schematized === false ? 'in data but not in _schema' : (dblRenameable ? 'double-click to rename' : ''));
                 return (
-                  <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''} ${c.isPk ? 'formula' : ''} ${isRenaming ? 'renaming' : ''}`}
-                      title={c.isPk ? '_anchor · formula field, derived from INS payload' : (c.schematized === false ? 'in data but not in _schema' : (dblRenameable ? 'double-click to rename' : ''))}
+                  <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''} ${showGlyph ? 'formula' : ''} ${isRenaming ? 'renaming' : ''}`}
+                      title={headerTitle}
                       onDoubleClick={dblRenameable ? () => setRenamingField({ oldName: c.name, draft: c.name }) : undefined}>
-                    {c.isPk && <span className="formula-glyph" title="formula field">ƒ </span>}
+                    {showGlyph && <span className="formula-glyph" title="formula field">ƒ </span>}
                     {isRenaming ? (
                       <input
                         autoFocus
@@ -462,16 +529,20 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                   >{r._anchor}</td>
                 )}
                 {cols.map((c, cIdx) => (
-                  <EditableCell
-                    key={c.name}
-                    value={r[c.name]}
-                    type={c.type}
-                    heat={heatOn ? (r._writes?.[c.name] || 0) : 0}
-                    onCommit={(v) => commitCell(r._anchor, c.name, v)}
-                    shouldFocus={pendingFocus?.anchor === r._anchor && pendingFocus?.field === c.name}
-                    onFocusConsumed={() => setPendingFocus(null)}
-                    onNavigate={(dir) => navigate(rIdx, cIdx, dir)}
-                  />
+                  c.type === 'formula' ? (
+                    <FormulaCell key={c.name} formula={c.formula} record={r} />
+                  ) : (
+                    <EditableCell
+                      key={c.name}
+                      value={r[c.name]}
+                      type={c.type}
+                      heat={heatOn ? (r._writes?.[c.name] || 0) : 0}
+                      onCommit={(v) => commitCell(r._anchor, c.name, v)}
+                      shouldFocus={pendingFocus?.anchor === r._anchor && pendingFocus?.field === c.name}
+                      onFocusConsumed={() => setPendingFocus(null)}
+                      onNavigate={(dir) => navigate(rIdx, cIdx, dir)}
+                    />
+                  )
                 ))}
                 {partitioned && (
                   <EditableCell
@@ -544,7 +615,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
 }
 
 function sqlType(t) {
-  return { text: 'TEXT', number: 'INTEGER', boolean: 'BOOLEAN', json: 'JSONB', select: 'TEXT', multiselect: 'TEXT[]', longtext: 'TEXT', date: 'TIMESTAMP', url: 'TEXT', email: 'TEXT', partition: 'TEXT', linked: 'LINK' }[t] || 'TEXT';
+  return { text: 'TEXT', number: 'INTEGER', boolean: 'BOOLEAN', json: 'JSONB', select: 'TEXT', multiselect: 'TEXT[]', longtext: 'TEXT', date: 'TIMESTAMP', url: 'TEXT', email: 'TEXT', partition: 'TEXT', linked: 'LINK', formula: 'FORMULA' }[t] || 'TEXT';
 }
 
 function fmtAbsDate(ts) {
@@ -572,6 +643,7 @@ const FIELD_TYPES = [
   { value: 'url',         label: 'url',          hint: 'validated http(s)'   },
   { value: 'email',       label: 'email',        hint: 'validated address'   },
   { value: 'json',        label: 'json',         hint: 'arbitrary structured'},
+  { value: 'formula',     label: 'formula',      hint: 'read-only · e.g. RECORD_ID() or UPPER({Name})' },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -600,6 +672,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
   function opFor(c) {
     if (c.linked) return 'link';
     if (c.partition) return 'partition';
+    if (c.type === 'formula') return 'compute';
     if (c.type === 'multiselect') return 'append';
     return 'overwrite';
   }
@@ -615,7 +688,8 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
       operator: opFor(c),
       schematized: c.schematized,
       options: c.options,
-      params: c.options ? c.options.join(', ') : (c.type === 'json' ? 'arbitrary JSON' : ''),
+      formula: c.formula,
+      params: c.options ? c.options.join(', ') : (c.type === 'formula' ? (c.formula || '') : (c.type === 'json' ? 'arbitrary JSON' : '')),
       editable: c.schematized,
     })),
     ...(partitioned ? [{
@@ -673,6 +747,8 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
       // Manage options vs other params on type swap
       if (newType !== 'select' && newType !== 'multiselect') delete updated.options;
       else if (!updated.options) updated.options = [];
+      if (newType !== 'formula') delete updated.formula;
+      else if (typeof updated.formula !== 'string') updated.formula = '';
       return updated;
     });
     emitFields(next);
@@ -686,6 +762,11 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
 
   function setFieldOptions(fieldName, options) {
     const next = fieldsArray().map(f => f.name === fieldName ? { ...f, options } : f);
+    emitFields(next);
+  }
+
+  function setFieldFormula(fieldName, formula) {
+    const next = fieldsArray().map(f => f.name === fieldName ? { ...f, formula } : f);
     emitFields(next);
   }
 
@@ -711,15 +792,21 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
     setEditingField({ fieldName: row.fieldName || row.path, kind: 'params' });
     if (row.kind === 'partition') {
       setDraft(partitions.join(', '));
+    } else if (row.rawType === 'formula') {
+      setDraft(row.formula || '');
     } else {
       setDraft(row.options ? row.options.join(', ') : '');
     }
   }
 
   function commitParams(row) {
-    const tokens = draft.split(',').map(s => s.trim()).filter(Boolean);
-    if (row.kind === 'partition') emitPartitions(tokens);
-    else if (row.kind === 'field') setFieldOptions(row.fieldName, tokens);
+    if (row.kind === 'field' && row.rawType === 'formula') {
+      setFieldFormula(row.fieldName, draft);
+    } else {
+      const tokens = draft.split(',').map(s => s.trim()).filter(Boolean);
+      if (row.kind === 'partition') emitPartitions(tokens);
+      else if (row.kind === 'field') setFieldOptions(row.fieldName, tokens);
+    }
     setEditingField(null);
     setDraft('');
   }
@@ -842,6 +929,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
                           title={r.kind === 'field' && r.editable ? 'double-click to rename' : ''}
                         >
                           {r.schematized === false && <span style={{color:'var(--signal)'}}>? </span>}
+                          {(r.isPk || r.rawType === 'formula') && <span className="formula-glyph" title="formula field">ƒ </span>}
                           {r.path}
                         </td>
                       )}
@@ -879,7 +967,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
                               if (e.key === 'Enter') commitParams(r);
                               else if (e.key === 'Escape') { setEditingField(null); setDraft(''); }
                             }}
-                            placeholder={r.kind === 'partition' ? 'backlog, doing, done' : 'value-a, value-b, value-c'}
+                            placeholder={r.kind === 'partition' ? 'backlog, doing, done' : r.rawType === 'formula' ? 'RECORD_ID()  ·  UPPER({Name})  ·  CONCATENATE({title}, \" (\", {status}, \")\")' : 'value-a, value-b, value-c'}
                           />
                         </td>
                       ) : (
@@ -941,7 +1029,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
                     </select>
                   </td>
                   <td className="cell" style={{color:'var(--text-faint)',fontStyle:'italic',fontSize:'11px'}}>
-                    {newField.type === 'multiselect' ? 'append' : 'overwrite'}
+                    {newField.type === 'multiselect' ? 'append' : newField.type === 'formula' ? 'compute' : 'overwrite'}
                   </td>
                   <td className="cell" colSpan={2} style={{color:'var(--text-faint)',fontStyle:'italic',fontSize:'11px'}}>
                     will emit <span className="kbd">DEF _schema.fields.{entityType}</span> with new field appended
@@ -1075,7 +1163,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
 
 function canEditParams(r) {
   if (r.kind === 'field' && r.editable) {
-    return r.rawType === 'select' || r.rawType === 'multiselect';
+    return r.rawType === 'select' || r.rawType === 'multiselect' || r.rawType === 'formula';
   }
   if (r.kind === 'partition' && r.editable) return true;
   return false;
@@ -1088,6 +1176,10 @@ function paramsLabel(r) {
       return <span>{r.options.map((o, i) => (
         <span key={o} className="param-chip">{o}</span>
       ))}</span>;
+    }
+    if (r.rawType === 'formula') {
+      if (!r.formula) return <span style={{color:'var(--text-faint)',fontStyle:'italic'}}>(no formula — double-click · e.g. RECORD_ID())</span>;
+      return <code style={{color:'var(--text-bright)'}}>{r.formula}</code>;
     }
     return r.params || <span style={{color:'var(--text-faint)'}}>—</span>;
   }
