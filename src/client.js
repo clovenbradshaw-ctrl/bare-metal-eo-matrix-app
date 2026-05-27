@@ -174,68 +174,6 @@ async function getSecretStorageKey({ keys }) {
   }
 }
 
-async function ensureEncryptionSetUp({ userMxid, password }) {
-  const crypto = client.getCrypto();
-  if (!crypto) return;
-
-  if (await crypto.isCrossSigningReady()) {
-    try { await crypto.checkKeyBackupAndEnable(); } catch (e) {
-      progress(`Key backup check failed: ${e.message}`);
-    }
-    return;
-  }
-
-  const accountHasCrossSigning = await crypto.userHasCrossSigningKeys(userMxid, true);
-
-  if (accountHasCrossSigning) {
-    progress('Restoring encryption keys from recovery…');
-    await crypto.bootstrapCrossSigning({});
-    try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (e) {
-      progress(`Could not load backup key: ${e.message}`);
-    }
-    try {
-      await crypto.restoreKeyBackup();
-    } catch (e) {
-      progress(`Key backup restore failed: ${e.message}`);
-    }
-    try { await crypto.checkKeyBackupAndEnable(); } catch {}
-    return;
-  }
-
-  if (!password) {
-    progress('Skipping encryption setup: no password available (login again to enable history backup)');
-    return;
-  }
-
-  progress('Setting up encryption + recovery key…');
-  const localUser = userMxid.replace(/^@/, '').split(':')[0];
-  const generatedKey = await crypto.createRecoveryKeyFromPassphrase();
-
-  await crypto.bootstrapCrossSigning({
-    authUploadDeviceSigningKeys: async (makeRequest) => {
-      await makeRequest({
-        type: 'm.login.password',
-        identifier: { type: 'm.id.user', user: localUser },
-        password,
-      });
-    },
-  });
-
-  await crypto.bootstrapSecretStorage({
-    createSecretStorageKey: async () => generatedKey,
-    setupNewKeyBackup: true,
-    setupNewSecretStorage: true,
-  });
-
-  try { await crypto.checkKeyBackupAndEnable(); } catch {}
-
-  if (recoveryKeyDisplayer && generatedKey.encodedPrivateKey) {
-    await recoveryKeyDisplayer(generatedKey.encodedPrivateKey);
-  } else {
-    progress(`Recovery key: ${generatedKey.encodedPrivateKey}`);
-  }
-}
-
 async function discoverBaseUrl(rawHs, mxid) {
   const serverName = mxid && mxid.includes(':')
     ? mxid.split(':').slice(1).join(':')
@@ -357,12 +295,6 @@ export async function login(homeserver, username, password) {
   await waitForSync(client);
   progress('Sync ready');
 
-  try {
-    await ensureEncryptionSetUp({ userMxid: resp.user_id, password });
-  } catch (e) {
-    progress(`Encryption setup failed: ${e.message}`);
-  }
-
   return { client, userId: resp.user_id, deviceId: resp.device_id };
 }
 
@@ -432,12 +364,6 @@ export async function restoreSession(userId) {
     dropSession(userId);
     progress('Saved session was rejected by the server — log in again to refresh credentials.');
     return null;
-  }
-
-  try {
-    await ensureEncryptionSetUp({ userMxid: sid, password: null });
-  } catch (e) {
-    progress(`Encryption restore failed: ${e.message}`);
   }
 
   return client;
