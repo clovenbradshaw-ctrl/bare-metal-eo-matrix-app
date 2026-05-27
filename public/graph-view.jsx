@@ -98,7 +98,35 @@ function colorForType(type, typeIndex) {
 // Graph view
 // ─────────────────────────────────────────────────────────────────────────
 
-function GraphView({ room, state, onEmit, scrubber }) {
+// Restrict the room state to one set: the set's own entities plus any
+// entity reachable in one CON hop (the "explicitly connected" rule).
+// Connections only ride along if at least one endpoint is in the set.
+// The `_connections` meta set is cross-set by nature, so it pulls the
+// whole room.
+function scopedSubgraph(state, entityType) {
+  if (!entityType) return { entities: [], connections: [] };
+  if (entityType === '_connections') {
+    return { entities: Object.values(state.entities), connections: state.connections };
+  }
+  const inSet = new Set();
+  for (const a of Object.keys(state.entities)) {
+    if (state.entities[a]._type === entityType) inSet.add(a);
+  }
+  const touching = state.connections.filter(c => inSet.has(c.source) || inSet.has(c.target));
+  const reachable = new Set(inSet);
+  for (const c of touching) {
+    if (state.entities[c.source]) reachable.add(c.source);
+    if (state.entities[c.target]) reachable.add(c.target);
+  }
+  const entities = [];
+  for (const a of reachable) {
+    const e = state.entities[a];
+    if (e) entities.push(e);
+  }
+  return { entities, connections: touching };
+}
+
+function GraphView({ room, state, onEmit, scrubber, entityType }) {
   const svgRef = useRef(null);
   const positionsRef = useRef({});   // anchor -> {x,y,pinned}
   const [, setBumper] = useState(0);  // force re-render after drag/sim
@@ -118,12 +146,12 @@ function GraphView({ room, state, onEmit, scrubber }) {
   const [connectPrompt, setConnectPrompt] = useState(null); // { from, to, x, y }
   const [mousePos, setMousePos] = useState(null);
 
-  // Derive nodes + edges from state
+  // Derive nodes + edges from state, scoped to the set + its one-hop neighbors.
   const { nodes, edges, typeIndex } = useMemo(() => {
-    const ents = Object.values(state.entities);
-    const types = Array.from(new Set(ents.map(e => e._type))).sort();
+    const sub = scopedSubgraph(state, entityType);
+    const types = Array.from(new Set(sub.entities.map(e => e._type))).sort();
     const typeIndex = Object.fromEntries(types.map((t, i) => [t, i]));
-    const nodes = ents.map(e => {
+    const nodes = sub.entities.map(e => {
       const prev = positionsRef.current[e._anchor];
       return {
         id: e._anchor,
@@ -136,14 +164,14 @@ function GraphView({ room, state, onEmit, scrubber }) {
         pinned: prev?.pinned || false,
       };
     });
-    const edges = state.connections.map((c, i) => ({
+    const edges = sub.connections.map((c, i) => ({
       id: `e${i}`,
       source: c.source,
       target: c.target,
       rel: c.type,
     }));
     return { nodes, edges, typeIndex };
-  }, [state.entities, state.connections, state.partitions]);
+  }, [state.entities, state.connections, state.partitions, entityType]);
 
   // Run simulation when graph topology changes
   useEffect(() => {
@@ -268,7 +296,10 @@ function GraphView({ room, state, onEmit, scrubber }) {
 
   function createEntityAt(x, y) {
     const declared = state.schema?.tables || [];
-    const typeName = (addEntityType || declared[0] || 'node').trim();
+    // Stay inside the scoped set; for the cross-set _connections projection
+    // there's no single "home" set, so fall back to the dropdown / first declared.
+    const scopeDefault = entityType && entityType !== '_connections' ? entityType : null;
+    const typeName = (scopeDefault || addEntityType || declared[0] || 'node').trim();
     if (!typeName) return;
     const sender = '@you:demo';
     const ts = Date.now();
@@ -319,6 +350,7 @@ function GraphView({ room, state, onEmit, scrubber }) {
   const types = Array.from(new Set(nodes.map(n => n.type))).sort();
 
   if (!room) return <div className="tv-empty">select a room</div>;
+  if (!entityType) return <div className="tv-empty">pick a set to graph</div>;
 
   return (
     <div className="graph-view">
@@ -352,9 +384,13 @@ function GraphView({ room, state, onEmit, scrubber }) {
           {mode === 'addEntity' && (
             <>
               <span>click empty canvas to drop a new </span>
-              <select value={addEntityType} onChange={e => setAddEntityType(e.target.value)}>
-                {(state.schema?.tables || ['node']).map(t => <option key={t} value={t}>{t}</option>)}
-              </select>
+              {entityType && entityType !== '_connections' ? (
+                <b>{entityType}</b>
+              ) : (
+                <select value={addEntityType} onChange={e => setAddEntityType(e.target.value)}>
+                  {(state.schema?.tables || ['node']).map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+              )}
               <span> · emits <b>INS</b></span>
               <button className="gv-cancel" onClick={() => setMode('select')}>esc</button>
             </>
@@ -576,7 +612,9 @@ function GraphView({ room, state, onEmit, scrubber }) {
 
         {nodes.length === 0 && (
           <div className="tv-empty" style={{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
-            no entities yet — emit INS to create nodes
+            {entityType && entityType !== '_connections'
+              ? `no ${entityType} rows yet — emit INS to create nodes`
+              : 'no entities yet — emit INS to create nodes'}
           </div>
         )}
       </div>

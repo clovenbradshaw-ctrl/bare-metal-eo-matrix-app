@@ -778,6 +778,7 @@ function App() {
               state={state}
               onEmit={onEmit}
               scrubber={scrubberEl}
+              entityType={selection.tableId}
             />
           )}
           {selection.kind === 'slice' && selection.sliceKind === 'timeline' && (
