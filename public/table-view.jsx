@@ -1245,61 +1245,121 @@ function flattenSchema(obj, prefix = '') {
 // "Creating a table" in a projection is just writing _schema.* to the room.
 // ─────────────────────────────────────────────────────────────────────────
 
-function CreateTableForm({ state, room, onEmit, onCancel, defaultName = '', defaultPartitions = '' }) {
-  const [name, setName]                 = React.useState(defaultName);
-  const [partitions, setPartitions]     = React.useState(defaultPartitions);
-  const [extraFields, setExtraFields]   = React.useState('');
-  const existing = state.schema?.tables || [];
+function CreateTableForm({ state, room, onEmit, onCancel, defaultName = '' }) {
+  const [name, setName]   = React.useState(defaultName);
+  const [fields, setFields] = React.useState([
+    { name: 'Name', type: 'text' },
+    { name: '',     type: 'text' },
+  ]);
+  const nameRef = React.useRef(null);
+  React.useEffect(() => { nameRef.current?.focus(); nameRef.current?.select(); }, []);
+
+  const existing  = state.schema?.tables || [];
+  const trimmed   = name.trim();
+  const collides  = trimmed && existing.includes(trimmed);
+  const canCreate = !!trimmed && !collides;
+
+  function updateField(i, patch) { setFields(fs => fs.map((f, j) => j === i ? { ...f, ...patch } : f)); }
+  function addField()           { setFields(fs => [...fs, { name: '', type: 'text' }]); }
+  function removeField(i)       { setFields(fs => fs.filter((_, j) => j !== i)); }
 
   function commit() {
-    const tableName = name.trim();
-    if (!tableName) return;
-    const newTables = existing.includes(tableName) ? existing : [...existing, tableName];
+    if (!canCreate) return;
+    const ME = window.MatrixEngine || { OP: TV_OP };
+    const tableName = trimmed;
 
-    // 1. Declare table in _schema.tables
-    onEmit(TV_OP.DEF, { anchor: null, path: '_schema.tables', value: newTables });
+    // De-dupe field names; fall back to "Field N" if blank.
+    const seen = new Set();
+    const cleanFields = fields.map((f, i) => {
+      let n = (f.name || '').trim() || (i === 0 ? 'Name' : `Field ${i + 1}`);
+      let suffix = 2;
+      const original = n;
+      while (seen.has(n)) { n = `${original} ${suffix++}`; }
+      seen.add(n);
+      const out = { name: n, type: f.type };
+      if (f.type === 'select' || f.type === 'multiselect') out.options = [];
+      return out;
+    });
 
-    // 2. Declare fields — at minimum, a title text field
-    const fields = [{ name: 'title', type: 'text' }];
-    for (const tok of extraFields.split(',').map(s => s.trim()).filter(Boolean)) {
-      // syntax: "name:type" or just "name"
-      const [n, t] = tok.split(':').map(s => s.trim());
-      fields.push({ name: n, type: t || 'text' });
-    }
-    onEmit(TV_OP.DEF, { anchor: null, path: `_schema.fields.${tableName}`, value: fields });
-
-    // 3. Optional partitions
-    const parts = partitions.split(',').map(s => s.trim()).filter(Boolean);
-    if (parts.length) {
-      onEmit(TV_OP.DEF, { anchor: null, path: `_schema.partitions.${tableName}`, value: parts });
+    // 1. declare table
+    onEmit(TV_OP.DEF, { anchor: null, path: '_schema.tables', value: existing.includes(tableName) ? existing : [...existing, tableName] });
+    // 2. declare fields
+    onEmit(TV_OP.DEF, { anchor: null, path: `_schema.fields.${tableName}`, value: cleanFields });
+    // 3. seed one empty row so the user lands on a typeable grid, not an empty state.
+    if (ME.makeAnchor && ME.OP) {
+      const ts = Date.now();
+      const anchor = ME.makeAnchor(tableName, {}, '@you:demo', ts);
+      onEmit(ME.OP.INS, { anchor, entity_type: tableName, payload: {} });
     }
 
     onCancel();
   }
 
+  function onNameKey(e) {
+    if (e.key === 'Enter' && canCreate) { e.preventDefault(); commit(); }
+    if (e.key === 'Escape')             { e.preventDefault(); onCancel(); }
+  }
+
   return (
-    <div className="op-form" style={{margin:'12px 0',borderLeftColor:'var(--triad-significance)'}}>
-      <div className="hint">
-        <b>create set</b> · writes <span className="kbd">DEF _schema.*</span> into the log so the shape is part of the data, not the code.
+    <div className="ct-form">
+      <div className="ct-head">
+        <div className="ct-eyebrow">new set</div>
+        <input
+          ref={nameRef}
+          className="ct-name-input"
+          value={name}
+          onChange={e => setName(e.target.value)}
+          onKeyDown={onNameKey}
+          placeholder="table name · e.g. tasks, contacts, invoices"
+        />
+        {collides && (
+          <div className="ct-warn">a set called <b>{trimmed}</b> already exists in this room.</div>
+        )}
       </div>
-      <div className="row">
-        <label>name</label>
-        <input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="task" />
+
+      <div className="ct-fields-head">
+        <span>fields</span>
+        <span className="ct-fields-sub">add more columns later from the grid · the first field is the primary identifier</span>
       </div>
-      <div className="row">
-        <label>partitions</label>
-        <input value={partitions} onChange={e => setPartitions(e.target.value)} placeholder="todo, doing, done · optional · enables kanban" />
+
+      <div className="ct-fields">
+        {fields.map((f, i) => (
+          <div key={i} className={`ct-field-row ${i === 0 ? 'primary' : ''}`}>
+            <span className="ct-field-num" title={i === 0 ? 'primary field' : `field ${i + 1}`}>
+              {i === 0 ? '★' : i + 1}
+            </span>
+            <input
+              className="ct-field-name"
+              value={f.name}
+              onChange={e => updateField(i, { name: e.target.value })}
+              placeholder={i === 0 ? 'Name' : `Field ${i + 1}`}
+            />
+            <select
+              className="ct-field-type"
+              value={f.type}
+              onChange={e => updateField(i, { type: e.target.value })}
+              title={FIELD_TYPES.find(t => t.value === f.type)?.hint || ''}
+            >
+              {FIELD_TYPES.map(t => (
+                <option key={t.value} value={t.value}>{t.label}</option>
+              ))}
+            </select>
+            <button
+              className="ct-field-remove"
+              onClick={() => removeField(i)}
+              disabled={fields.length === 1}
+              title={fields.length === 1 ? "can't remove the only field" : 'remove field'}
+            >×</button>
+          </div>
+        ))}
+        <button className="ct-add-field" onClick={addField}>+ add field</button>
       </div>
-      <div className="row">
-        <label>extra fields</label>
-        <input value={extraFields} onChange={e => setExtraFields(e.target.value)} placeholder="priority:select, estimate_h:number · optional" />
-      </div>
-      <div className="hint" style={{marginTop:2}}>
-        will emit: <span className="kbd">DEF</span> _schema.tables · _schema.fields.{name || '…'} {partitions && ` · _schema.partitions.${name || '…'}`}
-      </div>
-      <div className="actions">
-        <button onClick={commit}>create</button>
-        <button className="ghost" onClick={onCancel}>cancel</button>
+
+      <div className="ct-actions">
+        <button className="ct-cancel" onClick={onCancel}>cancel</button>
+        <button className="ct-create" onClick={commit} disabled={!canCreate}>
+          create {trimmed ? `"${trimmed}"` : 'set'}
+        </button>
       </div>
     </div>
   );
@@ -1326,7 +1386,7 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
     ...tables.map(t => ({ kind: 'entity', name: t, declared: declared.includes(t), rows: observed.includes(t) ? Object.values(state.entities).filter(e => e._type === t).length : 0 })),
     ...(hasSynthesis ? [{ kind: 'syntheses', name: '_synthesis', declared: false, rows: Object.values(state.entities).filter(e => e._type === '_synthesis').length }] : []),
     ...(state.connections.length > 0 ? [{ kind: 'connections', name: '_connections', declared: !!state.schema?.links, rows: state.connections.length }] : []),
-    ...(Object.keys(state.schema || {}).length > 0 ? [{ kind: 'schema', name: '_schema', declared: true, rows: Object.keys(state.schema || {}).length }] : []),
+    // _schema isn't its own set — every set carries its own schema, reachable by clicking the set name in the sidebar.
   ];
 
   const fallback = tabs.find(t => t.kind === 'entity' && t.rows > 0)

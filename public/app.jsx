@@ -469,6 +469,7 @@ function App() {
   const [membersDialogRoomId, setMembersDialogRoomId] = useState(null);
 
   const [customSlices, setCustomSlices] = useState({});
+  const [csvImport, setCsvImport] = useState(null); // {id, file, roomId} | null
   // Demo mode has no homeserver to push room renames to, so we keep the
   // user's chosen names in-memory and merge them into the rooms list.
   const [demoTitleOverrides, setDemoTitleOverrides] = useDemoTitleOverrides();
@@ -661,7 +662,11 @@ function App() {
                 title={stale ? 'reconnect to the homeserver to manage members' : 'manage members of this space'}
                 disabled={stale}
               >members</button>
-              <window.ImportButton roomId={currentRoomId} disabled={stale} />
+              <window.ImportButton
+                roomId={currentRoomId}
+                disabled={stale}
+                onCsvFile={(file) => setCsvImport({ id: Date.now(), file, roomId: currentRoomId })}
+              />
             </>
           );
         })()}
@@ -813,6 +818,15 @@ function App() {
           />
         );
       })()}
+
+      {csvImport && window.CsvImportModal && (
+        <window.CsvImportModal
+          csvImport={csvImport}
+          state={state}
+          onEmit={onEmit}
+          onClose={() => setCsvImport(null)}
+        />
+      )}
     </div>
   );
 }
