@@ -19,7 +19,9 @@
 import './idbScope.js';
 import * as sdk from 'matrix-js-sdk';
 import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/index.js';
-import { vault, sessionKey, rememberLastUser, forgetLastUser, getLastUser } from './vault.js';
+import { deriveRecoveryKeyFromPassphrase } from 'matrix-js-sdk/lib/crypto-api/key-passphrase.js';
+import { vault, sessionKey, rememberLastUser, forgetLastUser, getLastUser,
+         storeSecret, loadSecret } from './vault.js';
 import { wipeAllRoomData } from './store.js';
 import { clearAll as clearOutbox } from './outbox.js';
 import { watchSync } from './network.js';
@@ -38,6 +40,14 @@ let recoveryKeyProvider = null;
 let recoveryKeyDisplayer = null;
 export function setRecoveryKeyProvider(fn) { recoveryKeyProvider = fn; }
 export function setRecoveryKeyDisplayer(fn) { recoveryKeyDisplayer = fn; }
+
+// In-memory password cache, alive only for the span of a login()/unlock()
+// flow. Used by `getSecretStorageKey` to derive the SSSS key from the
+// account's stored passphrase parameters without prompting the user.
+// Cleared as soon as the secure-backup setup finishes, and on lock/logout.
+let _currentPassword = null;
+const VAULT_SECRET_SSSS_KEY = 'ssss_private_key_b64';
+const VAULT_SECRET_RECOVERY_KEY = 'recovery_key_encoded';
 
 export function getClient() { return client; }
 
@@ -154,19 +164,70 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesToB64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
 async function getSecretStorageKey({ keys }) {
+  const keyId = Object.keys(keys)[0];
+  if (!keyId) return null;
+  const keyInfo = keys[keyId];
+  const uid = vault.getUserId();
+
+  // Fast path: a previous successful login stashed the raw SSSS key in
+  // the vault. Use it directly so the user never sees a prompt.
+  if (uid) {
+    const stashed = await loadSecret(uid, VAULT_SECRET_SSSS_KEY);
+    if (stashed) {
+      try { return [keyId, b64ToBytes(stashed)]; }
+      catch { /* fall through */ }
+    }
+  }
+
+  // Password-derived path: account_data carries the PBKDF2 salt+iterations
+  // for the SSSS key. If the user's Matrix password is currently in scope
+  // (login or unlock flow), derive the key transparently and cache it.
+  if (_currentPassword && keyInfo?.passphrase?.algorithm === 'm.pbkdf2'
+      && keyInfo.passphrase.salt && keyInfo.passphrase.iterations) {
+    try {
+      const privateKey = await deriveRecoveryKeyFromPassphrase(
+        _currentPassword,
+        keyInfo.passphrase.salt,
+        keyInfo.passphrase.iterations,
+      );
+      if (uid) {
+        try { await storeSecret(uid, VAULT_SECRET_SSSS_KEY, bytesToB64(privateKey)); }
+        catch { /* non-fatal */ }
+      }
+      return [keyId, privateKey];
+    } catch (e) {
+      progress(`Passphrase-derived secret-storage key failed: ${e.message}`);
+    }
+  }
+
+  // Last resort: ask the user for their encoded recovery key.
   if (!recoveryKeyProvider) {
     progress('Recovery key required but no UI provider registered');
     return null;
   }
-  const keyId = Object.keys(keys)[0];
-  if (!keyId) return null;
-
   const encoded = await recoveryKeyProvider();
   if (!encoded) return null;
 
   try {
     const privateKey = decodeRecoveryKey(encoded.trim());
+    if (uid) {
+      try { await storeSecret(uid, VAULT_SECRET_SSSS_KEY, bytesToB64(privateKey)); }
+      catch { /* non-fatal */ }
+    }
     return [keyId, privateKey];
   } catch (e) {
     progress(`Recovery key invalid: ${e.message}`);
@@ -195,6 +256,132 @@ async function discoverBaseUrl(rawHs, mxid) {
     progress(`Discovery skipped: ${e.message}`);
   }
   return rawHs.replace(/\/+$/, '');
+}
+
+// ── Secure backup (cross-signing + SSSS + key backup) ──
+
+/**
+ * Idempotent setup of cross-signing, secret storage, and key backup.
+ *
+ * Three scenarios converge into one call:
+ *   - Fresh account: creates cross-signing keys, creates SSSS with a
+ *     passphrase = the user's Matrix password, creates a new key backup
+ *     version, stashes the encoded recovery key in the local vault.
+ *   - Returning device, vault intact: a fast no-op; just makes sure
+ *     this device is cross-signed and the backup engine is running.
+ *   - Post-wipe re-login: SSSS exists on the server but the local
+ *     crypto store is fresh. The password derives the SSSS key (via
+ *     the server-stored PBKDF2 parameters); the SDK pulls cross-signing
+ *     and backup secrets out of SSSS; we restore the Megolm key backup
+ *     so historical messages decrypt; this device gets cross-signed.
+ *
+ * The password is held in module state for the duration of this call
+ * because `getSecretStorageKey` may fire multiple times during bootstrap.
+ *
+ * Failures are non-fatal — the user can still send and read live messages.
+ */
+async function ensureSecureBackup(password, userId) {
+  if (!client) return;
+  const crypto = client.getCrypto?.();
+  if (!crypto) return;
+
+  _currentPassword = password;
+  try {
+    const ssssOnServer = await client.secretStorage.hasKey();
+
+    progress(ssssOnServer ? 'Linking secure backup…' : 'Initializing secure backup…');
+
+    // Bootstrap cross-signing. If keys already exist on the server, this
+    // pulls them out of SSSS into the local store (via getSecretStorageKey).
+    // If they don't, it creates and uploads them; UIA below replays the
+    // Matrix password we already have.
+    await crypto.bootstrapCrossSigning({
+      authUploadDeviceSigningKeys: async (makeRequest) => {
+        const user = userId.startsWith('@') ? userId.slice(1).split(':')[0] : userId;
+        await makeRequest({
+          type: 'm.login.password',
+          identifier: { type: 'm.id.user', user },
+          password,
+          // Some homeservers require user/password at the top level too.
+          user,
+        });
+      },
+    });
+
+    let generatedKey = null;
+    await crypto.bootstrapSecretStorage({
+      setupNewKeyBackup: !ssssOnServer,
+      createSecretStorageKey: ssssOnServer ? undefined : async () => {
+        generatedKey = await crypto.createRecoveryKeyFromPassphrase(password);
+        return generatedKey;
+      },
+    });
+
+    if (generatedKey?.encodedPrivateKey) {
+      // Stash the key in the local vault so users can view it later from
+      // a settings screen if they want a copy outside the browser. We
+      // deliberately do NOT surface it on first login — the user's Matrix
+      // password derives the same SSSS key on demand, so the recovery key
+      // is a belt-and-suspenders backup, not a thing every user has to
+      // memorise during onboarding.
+      try {
+        await storeSecret(userId, VAULT_SECRET_RECOVERY_KEY, generatedKey.encodedPrivateKey);
+        if (generatedKey.privateKey) {
+          await storeSecret(userId, VAULT_SECRET_SSSS_KEY, bytesToB64(generatedKey.privateKey));
+        }
+      } catch (e) {
+        progress(`Could not stash recovery key locally: ${e.message}`);
+      }
+    }
+
+    // Make sure the locally-stored SSSS key is up to date when the server
+    // already had one (post-wipe path).
+    if (ssssOnServer) {
+      try {
+        await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
+      } catch (e) {
+        progress(`Loading session backup key: ${e.message}`);
+      }
+    }
+
+    // Pull historical Megolm keys down from the server backup so old
+    // encrypted rooms decrypt. Cheap if the backup is empty; potentially
+    // long if the user has years of history. Don't fail login if it
+    // stumbles partway through.
+    const backupInfo = await crypto.getKeyBackupInfo();
+    if (backupInfo) {
+      try {
+        await crypto.restoreKeyBackup();
+        progress('Historical message keys restored');
+      } catch (e) {
+        progress(`Key backup restore: ${e.message}`);
+      }
+    }
+
+    // Start the engine so future-received Megolm keys flow up to the
+    // server backup automatically.
+    try { await crypto.checkKeyBackupAndEnable(); } catch {}
+
+    // Sign this device with the master cross-signing key so other devices
+    // trust it. Idempotent if the device is already signed.
+    try {
+      const deviceId = client.getDeviceId();
+      if (deviceId) await crypto.crossSignDevice(deviceId);
+    } catch (e) {
+      progress(`Cross-signing this device: ${e.message}`);
+    }
+  } catch (e) {
+    progress(`Secure backup setup failed (continuing): ${e.message}`);
+  } finally {
+    _currentPassword = null;
+  }
+}
+
+/** Read the local copy of the user's encoded recovery key, if any. */
+export async function getStashedRecoveryKey(userId) {
+  if (!userId) userId = vault.getUserId();
+  if (!userId) return null;
+  return loadSecret(userId, VAULT_SECRET_RECOVERY_KEY);
 }
 
 // ── Vault-encrypted session storage ──
@@ -294,6 +481,8 @@ export async function login(homeserver, username, password) {
   _watchSyncUnsub = watchSync(client);
   await waitForSync(client);
   progress('Sync ready');
+
+  await ensureSecureBackup(password, resp.user_id);
 
   return { client, userId: resp.user_id, deviceId: resp.device_id };
 }
@@ -395,7 +584,18 @@ export async function unlock(userId, password) {
     return { userId, online: false, needsLogin: true };
   }
   const state = c.getSyncState && c.getSyncState();
-  return { userId, online: state === 'PREPARED' || state === 'SYNCING', needsLogin: false };
+  const online = state === 'PREPARED' || state === 'SYNCING';
+
+  // We have the password in scope right now. If secret storage isn't
+  // ready locally (post-wipe re-login on the same homeserver), this
+  // derives the SSSS key from the password, pulls cross-signing and
+  // backup secrets out of SSSS, and restores the Megolm key backup.
+  if (online) {
+    try { await ensureSecureBackup(password, userId); }
+    catch (e) { progress(`Secure backup link skipped: ${e.message}`); }
+  }
+
+  return { userId, online, needsLogin: false };
 }
 
 /**
