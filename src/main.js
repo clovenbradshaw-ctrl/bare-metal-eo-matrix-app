@@ -27,7 +27,7 @@ import { fold, foldFrom, initial, stateHash } from './fold.js';
 import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          loadTimelineSince, invite, getMembers, myPowerLevel, kickMember,
          setMemberPowerLevel, onMembersChange, acceptInvite, onRoomChanges,
-         onDecrypted, onLocalEchoUpdated, EventStatus,
+         onDecrypted, onLocalEchoUpdated, EventStatus, setArchived,
          setName as mxSetRoomName, getDisplayName as mxGetDisplayName } from './rooms.js';
 import { EventStore } from './store.js';
 import { vault, getLastUser } from './vault.js';
@@ -385,6 +385,7 @@ function listRooms() {
       membership: r.membership,
       roomType: r.roomType,
       inviter: r.inviter,
+      archived: !!r.archived,
     }));
   }
   return roomManifest.map(r => ({
@@ -397,7 +398,13 @@ function listRooms() {
     roomType: r.roomType,
     inviter: null,
     offlineCache: true,
+    archived: false,
   }));
+}
+
+async function archiveRoom(roomId, archived = true) {
+  await setArchived(roomId, archived);
+  notify('rooms');
 }
 
 async function createWorkspace(name) {
@@ -739,6 +746,7 @@ window.MatrixLive = {
   // Rooms
   listRooms,
   createRoom: createWorkspace,
+  archiveRoom,
   joinRoom,
   openRoom,
   getEventsForRoom,
