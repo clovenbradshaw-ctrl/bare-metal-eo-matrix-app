@@ -18,6 +18,7 @@
  */
 import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
+         tryAutoUnlock, wipeLocalData,
          setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
@@ -54,6 +55,7 @@ let unsubRoomChanges = null;
 let netState = 'offline';
 let activeSession = null;               // { mxid, homeserver, device_id, ... }
 let progressLog = [];                   // ring buffer of recent log lines
+let booting = true;                     // true until cold-boot auto-restore settles
 
 // In-memory mirror of the persisted room manifest. Lets `listRooms`
 // return something useful when the SDK hasn't synced yet (offline boot,
@@ -332,7 +334,7 @@ async function reconnect(password) {
   return await afterAuth(refreshedId, hs);
 }
 
-async function logout() {
+async function tearDownLiveState() {
   if (outboxFlusher) { outboxFlusher.stop(); outboxFlusher = null; }
   if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
   if (manifestSaveTimer) { clearTimeout(manifestSaveTimer); manifestSaveTimer = null; }
@@ -344,7 +346,22 @@ async function logout() {
   sentEventToLocalId.clear();
   roomManifest = [];
   roomManifestKey = '';
+}
+
+async function logout() {
+  await tearDownLiveState();
   await mxLogout();
+  activeSession = null;
+  notify('session');
+}
+
+/**
+ * Hard reset: signs out AND wipes every byte of local state. Use when
+ * the user explicitly asks to clear local data.
+ */
+async function clearLocalData() {
+  await tearDownLiveState();
+  await wipeLocalData();
   activeSession = null;
   notify('session');
 }
@@ -712,11 +729,13 @@ window.MatrixLive = {
   login: loginWithMatrix,
   reconnect,
   logout,
+  clearLocalData,
   hasLocalAccount,
   getLastUser,
   getSession: () => activeSession,
   isAuthed: () => !!activeSession,
   isStale: () => !!(activeSession && activeSession.stale),
+  isBooting: () => booting,
   // Rooms
   listRooms,
   createRoom: createWorkspace,
@@ -754,6 +773,31 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-// Vault is locked at cold boot; the login screen handles unlock/login.
-// Surface the last-remembered user so the UI can pre-fill it.
-notify('session');
+// Cold-boot auto-restore. If a previous unlock in this tab stashed the
+// vault key in sessionStorage, we resume the Matrix session without
+// returning to the login screen. The first `notify('session')` fires
+// either when restore succeeds or when we conclude there's nothing to
+// resume, so the React layer can mount immediately and show a "resuming"
+// state instead of flashing the login portal.
+(async () => {
+  try {
+    const result = await tryAutoUnlock();
+    if (result) {
+      const c = getClient();
+      const hs = c?.getHomeserverUrl?.() || '';
+      // Having a client at all is enough to call afterAuth — that
+      // matches how loginWithMatrix routes the unlock path. If the
+      // sync state is still RECONNECTING we'll show as online with
+      // the network watcher; afterAuthStale is only for the no-client
+      // case (vault unlocked but no usable Matrix token).
+      if (c) await afterAuth(result.userId, hs);
+      else   await afterAuthStale(result.userId, hs);
+    }
+  } catch (e) {
+    console.warn('[bridge] auto-restore failed:', e);
+    logProgress('Auto-restore failed: ' + (e?.message || e));
+  } finally {
+    booting = false;
+    notify('session');
+  }
+})();

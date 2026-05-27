@@ -14,9 +14,12 @@
  * token is wiped from disk on full logout.
  */
 
+// Must run before matrix-js-sdk opens its IDB store, so it sees the
+// scoped names instead of the global `matrix-js-sdk::*` ones.
+import './idbScope.js';
 import * as sdk from 'matrix-js-sdk';
 import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/index.js';
-import { vault, sessionKey, rememberLastUser, forgetLastUser } from './vault.js';
+import { vault, sessionKey, rememberLastUser, forgetLastUser, getLastUser } from './vault.js';
 import { wipeAllRoomData } from './store.js';
 import { clearAll as clearOutbox } from './outbox.js';
 import { watchSync } from './network.js';
@@ -39,15 +42,49 @@ export function setRecoveryKeyDisplayer(fn) { recoveryKeyDisplayer = fn; }
 export function getClient() { return client; }
 
 const CRYPTO_STORE_NAME = 'matrix-js-sdk::matrix-sdk-crypto';
+const CRYPTO_OWNER_KEY = 'eomx:crypto-owner';
 
 function clearCryptoStore() {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     progress('Clearing stale crypto store…');
     const req = indexedDB.deleteDatabase(CRYPTO_STORE_NAME);
-    req.onsuccess = () => { progress('Crypto store cleared'); resolve(); };
-    req.onerror = () => { progress('Crypto store clear failed'); reject(req.error); };
-    req.onblocked = () => { progress('Crypto store clear blocked — closing connections'); resolve(); };
+    let blockedTimer = null;
+    const settle = () => {
+      if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+      resolve();
+    };
+    req.onsuccess = () => { progress('Crypto store cleared'); settle(); };
+    req.onerror = () => {
+      progress('Crypto store clear failed: ' + (req.error?.message || 'unknown'));
+      settle();
+    };
+    // onblocked means another connection is still open. Don't resolve
+    // synchronously — that would race the caller's next initRustCrypto
+    // against an in-flight delete and produce confusing failures. Wait
+    // briefly for the lingering connection to close, then give up.
+    req.onblocked = () => {
+      progress('Crypto store delete blocked — waiting for connections to close');
+      blockedTimer = setTimeout(() => {
+        progress('Crypto store delete still blocked — proceeding anyway');
+        settle();
+      }, 3000);
+    };
   });
+}
+
+/**
+ * Pre-empt the "account in the store doesn't match" failure by wiping
+ * the crypto store before init when we know it belongs to a different
+ * user. Avoids hitting the exception-based retry path inside
+ * initCryptoWithRetry, which has worse timing characteristics.
+ */
+async function ensureCryptoStoreOwner(userId) {
+  const prior = localStorage.getItem(CRYPTO_OWNER_KEY);
+  if (prior && prior !== userId) {
+    progress(`Crypto store belonged to ${prior}; resetting for ${userId}`);
+    await clearCryptoStore();
+  }
+  localStorage.setItem(CRYPTO_OWNER_KEY, userId);
 }
 
 function isCryptoStoreMismatch(err) {
@@ -278,15 +315,14 @@ export async function login(homeserver, username, password) {
     progress('Unlocking local vault…');
     const ok = await vault.unlock(resp.user_id, password);
     if (!ok) {
-      // Password changed on the server; reset the vault so the new
-      // password becomes the unlock. This loses access to any locally
-      // encrypted data — surface clearly to the caller.
-      progress('Vault password mismatch — rotating to current password (local data will be reset)');
+      // Password changed on the server; the old key can't decrypt this
+      // user's local data anymore. Reset the vault so the new password
+      // becomes the unlock. The OPFS room files and outbox entries are
+      // left in place — they're dead bytes (unreadable without the old
+      // key) but other users' files on this device stay intact.
+      progress('Vault password mismatch — rotating to current password (prior local data is no longer readable)');
       vault.wipe(resp.user_id);
       wipeManifest(resp.user_id);
-      try { await wipeAllRoomData(); } catch {}
-      try { await wipeMediaCache(); } catch {}
-      try { await clearOutbox(); } catch {}
       await vault.initialize(resp.user_id, password);
     }
   }
@@ -310,6 +346,7 @@ export async function login(homeserver, username, password) {
     cryptoCallbacks: { getSecretStorageKey },
   });
 
+  await ensureCryptoStoreOwner(resp.user_id);
   progress('Initializing encryption…');
   await initCryptoWithRetry(client);
 
@@ -361,6 +398,7 @@ export async function restoreSession(userId) {
     deviceId,
     cryptoCallbacks: { getSecretStorageKey },
   });
+  await ensureCryptoStoreOwner(sid);
   progress('Restoring session…');
   try {
     await initCryptoWithRetry(client);
@@ -435,6 +473,39 @@ export async function unlock(userId, password) {
 }
 
 /**
+ * Cold-boot auto-restore. If a previous unlock in this tab stashed the
+ * vault key in sessionStorage, adopt it back into the vault and bring
+ * the Matrix client online. Returns null when there's nothing to
+ * resume (no stash, no last user, or the stash is stale).
+ *
+ * sessionStorage is per-tab, so closing the tab/browser forgets the
+ * key and the next launch requires the password again.
+ */
+export async function tryAutoUnlock() {
+  const lastUser = getLastUser();
+  if (!lastUser) return null;
+  if (!vault.hasMeta(lastUser)) return null;
+
+  const adopted = await vault.tryAdoptStashedKey(lastUser);
+  if (!adopted) return null;
+
+  progress('Resuming session…');
+
+  let online = false;
+  try {
+    const c = await restoreSession(lastUser);
+    if (c) {
+      const state = c.getSyncState && c.getSyncState();
+      online = state === 'PREPARED' || state === 'SYNCING';
+    }
+  } catch (e) {
+    progress(`Auto-restore: ${e.message}`);
+  }
+
+  return { userId: lastUser, online };
+}
+
+/**
  * Lock the device: clear the in-memory key + stop the client, but
  * keep the encrypted session token, OPFS data, and outbox on disk.
  * The user can re-enter their password to resume.
@@ -449,11 +520,43 @@ export async function lock() {
 }
 
 /**
- * Full logout: server-side logout, wipe encrypted session, wipe vault
- * metadata, wipe OPFS room data, wipe outbox, drop the crypto store.
- * Everything on disk for this user is gone after this resolves.
+ * Sign out: revoke the access token on the server, drop the cached
+ * session token, and lock the vault. Local data (OPFS rooms, media,
+ * outbox, vault metadata, room manifest) is kept on disk so the same
+ * user can sign back in later without losing their workspace, and so
+ * a different user signing in on this device doesn't blow away the
+ * previous user's encrypted-at-rest data.
+ *
+ * The crypto store is left alone; if a different user signs in next,
+ * `initCryptoWithRetry` detects the mismatch and rebuilds from the
+ * server's key backup.
+ *
+ * Call `wipeLocalData()` separately for a full device clean.
  */
 export async function logout() {
+  const uid = vault.getUserId();
+  if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
+  if (client) {
+    try { client.stopClient(); } catch {}
+    try { await client.logout(true); } catch {}
+    client = null;
+  }
+  if (uid) dropSession(uid);
+  vault.lock();
+  // Keep `getLastUser()` so the login form can pre-fill the username.
+  // The next sign-in will re-derive the vault key from the password.
+}
+
+/**
+ * Destructive wipe: removes every byte of local state this app owns —
+ * OPFS room files, media cache, outbox, every vault, every saved
+ * session, room manifests, and the matrix-js-sdk crypto store. The
+ * `getLastUser()` hint is forgotten too.
+ *
+ * Call this when the user explicitly asks to "clear local data" or
+ * when the local vault has been irrecoverably corrupted.
+ */
+export async function wipeLocalData() {
   const uid = vault.getUserId();
   if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
   if (client) {
@@ -470,6 +573,7 @@ export async function logout() {
   try { await wipeMediaCache(); } catch {}
   try { await clearOutbox(); } catch {}
   try { await clearCryptoStore(); } catch {}
+  localStorage.removeItem(CRYPTO_OWNER_KEY);
   forgetLastUser();
 }
 
