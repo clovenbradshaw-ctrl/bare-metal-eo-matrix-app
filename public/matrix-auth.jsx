@@ -21,27 +21,58 @@ try { localStorage.removeItem(LEGACY_SPACES_KEY); } catch {}
 // ─────────────────────────────────────────────────────────────────────────
 
 function loadSession() {
+  // Real Matrix sessions live in the bridge (`MatrixLive`); they auto-
+  // restore at cold boot via the IndexedDB pickle key, so we surface
+  // whatever the bridge currently has. Demo sessions are pure UI state
+  // and stay in localStorage.
   try {
+    const live = window.MatrixLive?.getSession?.();
+    if (live) return live;
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const s = JSON.parse(raw);
-    // Real Matrix sessions require an unlocked vault, which is gone after
-    // a cold reload — fall back to the login screen instead of pretending
-    // we are authed. Demo sessions are pure UI state and safe to keep.
     if (s && !s.demo) return null;
     return s;
   } catch { return null; }
 }
 function saveSession(s) {
   // Only persist demo sessions. Real sessions are tied to the bridge's
-  // in-memory client + vault key and shouldn't survive a reload.
+  // in-memory client; the bridge persists the access token separately
+  // (IndexedDB pickle key).
   if (s && s.demo) localStorage.setItem(SESSION_KEY, JSON.stringify(s));
   else             localStorage.removeItem(SESSION_KEY);
 }
 
 function useSession() {
   const [session, setSession] = useState(loadSession);
+
   useEffect(() => { saveSession(session); }, [session]);
+
+  // Mirror the bridge's session into React state. The bridge auto-
+  // restores at startup; this hook picks that up so the user lands on
+  // the workbench instead of the LoginScreen after a cold reload.
+  useEffect(() => {
+    const ML = window.MatrixLive;
+    if (!ML?.subscribe) return;
+    const sync = () => {
+      const live = ML.getSession?.();
+      setSession(prev => {
+        // Keep demo sessions visible if the bridge has nothing to say.
+        if (!live) return prev && prev.demo ? prev : null;
+        // Identity object so React skips re-renders when nothing changed.
+        if (prev && !prev.demo && prev.mxid === live.mxid &&
+            prev.stale === live.stale && prev.vaultLocked === live.vaultLocked) {
+          return prev;
+        }
+        return live;
+      });
+    };
+    sync();
+    return ML.subscribe((reason) => {
+      if (reason === 'session') sync();
+    });
+  }, []);
+
   return [session, setSession];
 }
 

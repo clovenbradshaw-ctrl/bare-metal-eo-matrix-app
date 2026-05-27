@@ -18,7 +18,9 @@
  */
 import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
-         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
+         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider,
+         tryAutoRestore, getEncryptionStatus, onEncryptionStatus,
+         retryKeyBackupRestore } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
 import { fold, foldFrom, initial, stateHash } from './fold.js';
@@ -627,6 +629,12 @@ setRecoveryKeyProvider(() => new Promise((resolve) => {
   }
 }));
 
+// ── Encryption-status surface ──
+//
+// The React banner subscribes via `subscribe('encryption')`; the client
+// layer pushes status changes here.
+onEncryptionStatus(() => notify('encryption'));
+
 // ── Public surface ──
 window.MatrixLive = {
   NAMESPACE, ROOM_TYPE,
@@ -662,6 +670,9 @@ window.MatrixLive = {
   getPendingCount: pendingCount,
   outboxList: outboxListAll,
   outboxRemove,
+  // Encryption status (for the "history locked" banner)
+  getEncryptionStatus,
+  retryKeyBackup: retryKeyBackupRestore,
   // Subscription
   subscribe: (fn) => { subscribers.add(fn); return () => subscribers.delete(fn); },
   // Progress log
@@ -676,6 +687,43 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-// Vault is locked at cold boot; the login screen handles unlock/login.
-// Surface the last-remembered user so the UI can pre-fill it.
-notify('session');
+// ── Cold-boot auto-restore ──
+//
+// If the last-known user has a session stored in IndexedDB (encrypted
+// with the pickle key), bring up the Matrix client silently. The vault
+// remains locked — OPFS-cached events stay unreadable until the user
+// types their password — but the SDK rehydrates rooms via /sync, so the
+// user lands on their workspace without a re-login prompt.
+//
+// Failures here are non-fatal: the LoginScreen renders as before.
+(async () => {
+  try {
+    const restored = await tryAutoRestore();
+    if (!restored) {
+      notify('session');
+      return;
+    }
+    activeSession = {
+      mxid: restored.userId,
+      homeserver: restored.client.getHomeserverUrl?.() || '',
+      device_id: restored.client.getDeviceId?.() || null,
+      signed_in_at: Date.now(),
+      stale: false,
+      // Flag for the UI: we have a Matrix client but the vault is locked,
+      // so outbox writes and OPFS reads need a password unlock first.
+      vaultLocked: !vault.isUnlocked() || vault.getUserId() !== restored.userId,
+    };
+    if (outboxFlusher) outboxFlusher.stop();
+    outboxFlusher = makeOutboxFlusher();
+    outboxFlusher.start();
+    if (unsubRoomChanges) unsubRoomChanges();
+    unsubRoomChanges = onRoomChanges(() => {
+      refreshManifestFromLive();
+      notify('rooms');
+    });
+    notify('session');
+  } catch (e) {
+    console.warn('[bridge] auto-restore failed:', e);
+    notify('session');
+  }
+})();
