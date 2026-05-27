@@ -19,7 +19,8 @@
 import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
          tryAutoUnlock, wipeLocalData,
-         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
+         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider,
+         getStashedRecoveryKey } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
 import { planDatasetFromFile } from './dataset.js';
@@ -763,6 +764,10 @@ window.MatrixLive = {
   subscribe: (fn) => { subscribers.add(fn); return () => subscribers.delete(fn); },
   // Progress log
   getProgressLog: () => progressLog.slice(),
+  // Recovery key — opt-in surface for a settings UI to display the
+  // encoded recovery key to the user. Returns null until secure backup
+  // has been set up for this user on this device.
+  getRecoveryKey: () => getStashedRecoveryKey(),
 };
 
 // ── Service worker (PWA shell) ──

@@ -259,6 +259,13 @@ class Vault {
    */
   wipe(userId) {
     localStorage.removeItem(metaKey(userId));
+    // Sweep any encrypted secret entries we stashed for this user — they
+    // would otherwise become unreadable bytes after the vault key changes.
+    const prefix = `vault_secret:${userId}:`;
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(prefix)) localStorage.removeItem(k);
+    }
     if (this._userId === userId) {
       this._key = null;
       this._userId = null;
@@ -328,6 +335,36 @@ export async function decryptFromB64(b64Str) {
 /** Per-user encrypted-session key in localStorage. */
 export function sessionKey(userId) {
   return `mx_session_enc:${userId}`;
+}
+
+/**
+ * Encrypted-at-rest secret stash. Small string values keyed by
+ * (userId, name) and AES-GCM encrypted with the vault key. Used for
+ * non-critical caches like a copy of the Matrix recovery key — losing
+ * the vault loses the stash, that's fine, the server-side SSSS is the
+ * source of truth.
+ */
+function secretKey(userId, name) {
+  return `vault_secret:${userId}:${name}`;
+}
+
+export async function storeSecret(userId, name, value) {
+  if (!vault.isUnlocked() || vault.getUserId() !== userId) {
+    throw new Error('Vault locked');
+  }
+  localStorage.setItem(secretKey(userId, name), await encryptToB64(value));
+}
+
+export async function loadSecret(userId, name) {
+  if (!vault.isUnlocked() || vault.getUserId() !== userId) return null;
+  const raw = localStorage.getItem(secretKey(userId, name));
+  if (!raw) return null;
+  try { return await decryptFromB64(raw); }
+  catch { return null; }
+}
+
+export function removeSecret(userId, name) {
+  localStorage.removeItem(secretKey(userId, name));
 }
 
 /** Public list of users that have a vault on this device. */
