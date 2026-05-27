@@ -2,10 +2,8 @@
  * rooms.js — Room management
  *
  * Rooms are tables. Room membership is access control.
- * E2EE scope is per-room. Each room is an independent data boundary.
  *
  * Rooms created by this module get:
- *   - m.room.encryption enabled (Megolm, handled by the SDK)
  *   - A state event marking them as app rooms (for discovery)
  *   - Private visibility (invite-only)
  */
@@ -33,11 +31,6 @@ export async function createRoom(name, roomType, meta = {}) {
     visibility: 'private',
     preset: 'private_chat',
     initial_state: [
-      {
-        type: 'm.room.encryption',
-        state_key: '',
-        content: { algorithm: 'm.megolm.v1.aes-sha2' },
-      },
       {
         type: META_TYPE(),
         state_key: '',
@@ -309,7 +302,6 @@ export async function loadMore(roomId, limit = 50) {
 
 /**
  * Invite a user to a room.
- * The SDK shares Megolm keys with new members automatically.
  *
  * @param {string} roomId
  * @param {string} userId - Full MXID, e.g. "@kevin:app.aminoimmigration.com"
