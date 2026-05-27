@@ -14,6 +14,9 @@
  * token is wiped from disk on full logout.
  */
 
+// Must run before matrix-js-sdk opens its IDB store, so it sees the
+// scoped names instead of the global `matrix-js-sdk::*` ones.
+import './idbScope.js';
 import * as sdk from 'matrix-js-sdk';
 import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/index.js';
 import { vault, sessionKey, rememberLastUser, forgetLastUser, getLastUser } from './vault.js';
@@ -39,15 +42,49 @@ export function setRecoveryKeyDisplayer(fn) { recoveryKeyDisplayer = fn; }
 export function getClient() { return client; }
 
 const CRYPTO_STORE_NAME = 'matrix-js-sdk::matrix-sdk-crypto';
+const CRYPTO_OWNER_KEY = 'eomx:crypto-owner';
 
 function clearCryptoStore() {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     progress('Clearing stale crypto store…');
     const req = indexedDB.deleteDatabase(CRYPTO_STORE_NAME);
-    req.onsuccess = () => { progress('Crypto store cleared'); resolve(); };
-    req.onerror = () => { progress('Crypto store clear failed'); reject(req.error); };
-    req.onblocked = () => { progress('Crypto store clear blocked — closing connections'); resolve(); };
+    let blockedTimer = null;
+    const settle = () => {
+      if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+      resolve();
+    };
+    req.onsuccess = () => { progress('Crypto store cleared'); settle(); };
+    req.onerror = () => {
+      progress('Crypto store clear failed: ' + (req.error?.message || 'unknown'));
+      settle();
+    };
+    // onblocked means another connection is still open. Don't resolve
+    // synchronously — that would race the caller's next initRustCrypto
+    // against an in-flight delete and produce confusing failures. Wait
+    // briefly for the lingering connection to close, then give up.
+    req.onblocked = () => {
+      progress('Crypto store delete blocked — waiting for connections to close');
+      blockedTimer = setTimeout(() => {
+        progress('Crypto store delete still blocked — proceeding anyway');
+        settle();
+      }, 3000);
+    };
   });
+}
+
+/**
+ * Pre-empt the "account in the store doesn't match" failure by wiping
+ * the crypto store before init when we know it belongs to a different
+ * user. Avoids hitting the exception-based retry path inside
+ * initCryptoWithRetry, which has worse timing characteristics.
+ */
+async function ensureCryptoStoreOwner(userId) {
+  const prior = localStorage.getItem(CRYPTO_OWNER_KEY);
+  if (prior && prior !== userId) {
+    progress(`Crypto store belonged to ${prior}; resetting for ${userId}`);
+    await clearCryptoStore();
+  }
+  localStorage.setItem(CRYPTO_OWNER_KEY, userId);
 }
 
 function isCryptoStoreMismatch(err) {
@@ -309,6 +346,7 @@ export async function login(homeserver, username, password) {
     cryptoCallbacks: { getSecretStorageKey },
   });
 
+  await ensureCryptoStoreOwner(resp.user_id);
   progress('Initializing encryption…');
   await initCryptoWithRetry(client);
 
@@ -360,6 +398,7 @@ export async function restoreSession(userId) {
     deviceId,
     cryptoCallbacks: { getSecretStorageKey },
   });
+  await ensureCryptoStoreOwner(sid);
   progress('Restoring session…');
   try {
     await initCryptoWithRetry(client);
@@ -534,6 +573,7 @@ export async function wipeLocalData() {
   try { await wipeMediaCache(); } catch {}
   try { await clearOutbox(); } catch {}
   try { await clearCryptoStore(); } catch {}
+  localStorage.removeItem(CRYPTO_OWNER_KEY);
   forgetLastUser();
 }
 
