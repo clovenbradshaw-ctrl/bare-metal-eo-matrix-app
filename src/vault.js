@@ -18,6 +18,12 @@
  * without the password.
  */
 
+import {
+  storeVaultKey as pickleStoreVaultKey,
+  loadVaultKey as pickleLoadVaultKey,
+  dropVaultKey as pickleDropVaultKey,
+} from './pickleKey.js';
+
 const PBKDF2_ITERATIONS = 250_000;
 const SALT_BYTES = 16;
 const IV_BYTES = 12;
@@ -185,28 +191,101 @@ class Vault {
   }
 
   /**
-   * Stash the current key into sessionStorage so a tab refresh can re-adopt
-   * it without prompting for the password again. Tab close / browser quit
-   * clears sessionStorage, which is exactly the persistence boundary we want.
+   * Stash the current key in two places:
+   *
+   *   - sessionStorage (tab refresh path; cleared on tab/browser close)
+   *   - IndexedDB, wrapped under a non-extractable pickle key
+   *     (browser-restart path; persists until sign-out or wipe)
+   *
+   * The IDB path lets a cold browser launch re-adopt the vault key
+   * without re-prompting for the password — the same UX Element Web
+   * gets with its pickle key. Either path is sufficient; we try
+   * sessionStorage first because it's synchronous and faster.
    */
   async _stashKey() {
     if (!this._key || !this._userId) return;
+    let rawBytes = null;
     try {
       const raw = await crypto.subtle.exportKey('raw', this._key);
-      const bytes = new Uint8Array(raw);
+      rawBytes = new Uint8Array(raw);
+    } catch (e) {
+      // Key isn't extractable (shouldn't happen — we derive with `true`)
+      // or WebCrypto isn't available — refresh persistence just won't
+      // work in that case.
+      console.warn('[vault] export for stash failed:', e?.message || e);
+      return;
+    }
+
+    try {
       sessionStorage.setItem(SESSION_STASH_KEY, JSON.stringify({
         userId: this._userId,
-        key: b64(bytes),
+        key: b64(rawBytes),
       }));
     } catch (e) {
-      // Non-extractable key, sessionStorage disabled, or quota — refresh
-      // persistence just won't work in that case.
-      console.warn('[vault] stash failed:', e?.message || e);
+      console.warn('[vault] sessionStorage stash failed:', e?.message || e);
+    }
+
+    try {
+      await pickleStoreVaultKey(this._userId, rawBytes);
+    } catch (e) {
+      console.warn('[vault] IDB pickle stash failed:', e?.message || e);
     }
   }
 
+  /**
+   * Clear the sessionStorage stash. Does NOT touch the IDB pickle stash —
+   * "lock" should not destroy the durable copy, only the tab-scoped one.
+   * Use `wipe()` for that.
+   */
   _clearStash() {
     try { sessionStorage.removeItem(SESSION_STASH_KEY); } catch {}
+  }
+
+  /**
+   * Restore the vault from the IDB pickle stash (browser-restart path).
+   * Returns true on success.
+   *
+   * The stashed key bytes are verified against the on-disk vault meta
+   * before we expose it as "unlocked".
+   */
+  async tryAdoptKeyFromIdb(expectedUserId) {
+    if (!expectedUserId) return false;
+    const meta = loadMeta(expectedUserId);
+    if (!meta) return false;
+
+    let keyBytes;
+    try {
+      keyBytes = await pickleLoadVaultKey(expectedUserId);
+    } catch {
+      return false;
+    }
+    if (!keyBytes) return false;
+
+    try {
+      const key = await crypto.subtle.importKey(
+        'raw', keyBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
+      );
+      const plain = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: meta.verifierIv }, key, meta.verifierCt
+      );
+      if (decoder.decode(new Uint8Array(plain)) !== `verify:${expectedUserId}`) {
+        // Verifier mismatch — IDB stash belongs to a different vault
+        // (rotated password, manually wiped meta, etc.). Drop it.
+        await pickleDropVaultKey(expectedUserId);
+        return false;
+      }
+      this._key = key;
+      this._userId = expectedUserId;
+      // Re-stash so sessionStorage picks up too, restoring the fast path
+      // for subsequent refreshes in this tab.
+      await this._stashKey();
+      this._notify();
+      return true;
+    } catch (e) {
+      console.warn('[vault] IDB adopt failed:', e?.message || e);
+      try { await pickleDropVaultKey(expectedUserId); } catch {}
+      return false;
+    }
   }
 
   /**
@@ -265,6 +344,9 @@ class Vault {
       this._clearStash();
       this._notify();
     }
+    // Drop the IDB pickle stash for this user too — it's tied to this
+    // vault's verifier and useless once the meta is gone.
+    pickleDropVaultKey(userId).catch(() => {});
   }
 
   /**

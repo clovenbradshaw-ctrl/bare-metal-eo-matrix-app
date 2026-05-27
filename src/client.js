@@ -25,6 +25,7 @@ import { clearAll as clearOutbox } from './outbox.js';
 import { watchSync } from './network.js';
 import { wipeMediaCache } from './media.js';
 import { wipeManifest } from './roomManifest.js';
+import { wipePickleKey } from './pickleKey.js';
 
 let client = null;
 let _watchSyncUnsub = null;
@@ -174,14 +175,39 @@ async function getSecretStorageKey({ keys }) {
   }
 }
 
+// ── Encryption status (consumed by the UI banner) ──
+// 'unknown'   — not yet checked
+// 'ok'        — cross-signing ready, key backup attached
+// 'verifying' — bootstrap / restore in progress
+// 'history-locked' — backup exists on server but we couldn't restore it
+//                    (user needs to enter recovery key)
+// 'no-backup' — account has no key backup yet (first-ever login)
+let _encryptionStatus = 'unknown';
+const _encryptionListeners = new Set();
+export function getEncryptionStatus() { return _encryptionStatus; }
+export function onEncryptionStatus(fn) {
+  _encryptionListeners.add(fn);
+  return () => _encryptionListeners.delete(fn);
+}
+function setEncryptionStatus(s) {
+  if (_encryptionStatus === s) return;
+  _encryptionStatus = s;
+  for (const fn of _encryptionListeners) {
+    try { fn(s); } catch (e) { console.warn('[matrix] encryption listener failed:', e); }
+  }
+}
+
 async function ensureEncryptionSetUp({ userMxid, password }) {
   const crypto = client.getCrypto();
   if (!crypto) return;
+
+  setEncryptionStatus('verifying');
 
   if (await crypto.isCrossSigningReady()) {
     try { await crypto.checkKeyBackupAndEnable(); } catch (e) {
       progress(`Key backup check failed: ${e.message}`);
     }
+    setEncryptionStatus('ok');
     return;
   }
 
@@ -189,21 +215,37 @@ async function ensureEncryptionSetUp({ userMxid, password }) {
 
   if (accountHasCrossSigning) {
     progress('Restoring encryption keys from recovery…');
-    await crypto.bootstrapCrossSigning({});
-    try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (e) {
-      progress(`Could not load backup key: ${e.message}`);
-    }
+    let backupRestored = false;
     try {
-      await crypto.restoreKeyBackup();
+      await crypto.bootstrapCrossSigning({});
+      try {
+        await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
+      } catch (e) {
+        progress(`Could not load backup key: ${e.message}`);
+        throw new Error('history-locked');
+      }
+      try {
+        await crypto.restoreKeyBackup();
+        backupRestored = true;
+      } catch (e) {
+        progress(`Key backup restore failed: ${e.message}`);
+        throw new Error('history-locked');
+      }
+      try { await crypto.checkKeyBackupAndEnable(); } catch {}
     } catch (e) {
-      progress(`Key backup restore failed: ${e.message}`);
+      if (e.message === 'history-locked') {
+        setEncryptionStatus('history-locked');
+        return;
+      }
+      throw e;
     }
-    try { await crypto.checkKeyBackupAndEnable(); } catch {}
+    setEncryptionStatus(backupRestored ? 'ok' : 'history-locked');
     return;
   }
 
   if (!password) {
     progress('Skipping encryption setup: no password available (login again to enable history backup)');
+    setEncryptionStatus('no-backup');
     return;
   }
 
@@ -233,6 +275,32 @@ async function ensureEncryptionSetUp({ userMxid, password }) {
     await recoveryKeyDisplayer(generatedKey.encodedPrivateKey);
   } else {
     progress(`Recovery key: ${generatedKey.encodedPrivateKey}`);
+  }
+
+  setEncryptionStatus('ok');
+}
+
+/**
+ * Retry the key-backup restore path with the recovery key the user just
+ * entered. Invoked from the EncryptionBanner; the recovery-key provider
+ * (in `public/recovery-modal.jsx`) shows the prompt modal as part of
+ * `loadSessionBackupPrivateKeyFromSecretStorage`'s callback chain.
+ */
+export async function retryKeyBackupRestore() {
+  if (!client) throw new Error('Not signed in');
+  const crypto = client.getCrypto();
+  if (!crypto) throw new Error('Crypto not initialized');
+  setEncryptionStatus('verifying');
+  try {
+    await crypto.bootstrapCrossSigning({});
+    await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
+    await crypto.restoreKeyBackup();
+    try { await crypto.checkKeyBackupAndEnable(); } catch {}
+    setEncryptionStatus('ok');
+    return true;
+  } catch (e) {
+    setEncryptionStatus('history-locked');
+    throw e;
   }
 }
 
@@ -351,7 +419,7 @@ export async function login(homeserver, username, password) {
   await initCryptoWithRetry(client);
 
   progress('Starting sync…');
-  await client.startClient({ initialSyncLimit: 100 });
+  await client.startClient({ initialSyncLimit: 1000 });
   if (_watchSyncUnsub) _watchSyncUnsub();
   _watchSyncUnsub = watchSync(client);
   await waitForSync(client);
@@ -408,11 +476,13 @@ export async function restoreSession(userId) {
 
   let sessionExpired = false;
   try {
-    await client.startClient({ initialSyncLimit: 100 });
+    await client.startClient({ initialSyncLimit: 1000 });
     if (_watchSyncUnsub) _watchSyncUnsub();
     _watchSyncUnsub = watchSync(client);
-    // Best-effort wait for sync — short timeout so offline boots fast.
-    try { await waitForSync(client, 12000); }
+    // 30s tolerates slow homeservers and large initial syncs without
+    // false-positive "stale" demotion; if the server is actually
+    // unreachable, getSyncState() settles on ERROR sooner.
+    try { await waitForSync(client, 30000); }
     catch (e) {
       if (/Session expired/i.test(e.message)) sessionExpired = true;
       progress(`Sync deferred (${e.message}); local data available`);
@@ -473,20 +543,29 @@ export async function unlock(userId, password) {
 }
 
 /**
- * Cold-boot auto-restore. If a previous unlock in this tab stashed the
- * vault key in sessionStorage, adopt it back into the vault and bring
- * the Matrix client online. Returns null when there's nothing to
- * resume (no stash, no last user, or the stash is stale).
+ * Cold-boot auto-restore. Tries two stashes in order:
  *
- * sessionStorage is per-tab, so closing the tab/browser forgets the
- * key and the next launch requires the password again.
+ *   1. sessionStorage  (tab refresh — fast path)
+ *   2. IDB pickle key  (browser restart — wrapped under a non-extractable
+ *                       AES key, persists until sign-out / wipe)
+ *
+ * Both verify the adopted key against on-disk vault meta before exposing
+ * the vault as unlocked. Returns null when there's nothing to resume.
+ *
+ * Decoupling the two stashes from the session blob itself means a
+ * browser-restart auto-restore comes up with the vault UNLOCKED — which
+ * is what the outbox / OPFS path needs to write data. Earlier iterations
+ * left the vault locked on browser-restart and saves silently failed.
  */
 export async function tryAutoUnlock() {
   const lastUser = getLastUser();
   if (!lastUser) return null;
   if (!vault.hasMeta(lastUser)) return null;
 
-  const adopted = await vault.tryAdoptStashedKey(lastUser);
+  let adopted = await vault.tryAdoptStashedKey(lastUser);
+  if (!adopted) {
+    adopted = await vault.tryAdoptKeyFromIdb(lastUser);
+  }
   if (!adopted) return null;
 
   progress('Resuming session…');
@@ -557,7 +636,12 @@ export async function logout() {
  * when the local vault has been irrecoverably corrupted.
  */
 export async function wipeLocalData() {
-  const uid = vault.getUserId();
+  // Capture the user id BEFORE wiping — `vault.getUserId()` clears on
+  // `vault.wipe()`, but we still want to wipe the IDB pickle stash for
+  // that user (vault.wipe already triggers a best-effort drop, but
+  // belt-and-suspenders here covers the auto-restore-failed case where
+  // vault was never adopted in this tab).
+  const uid = vault.getUserId() || getLastUser();
   if (_watchSyncUnsub) { _watchSyncUnsub(); _watchSyncUnsub = null; }
   if (client) {
     try { client.stopClient(); } catch {}
@@ -568,12 +652,14 @@ export async function wipeLocalData() {
     dropSession(uid);
     wipeManifest(uid);
     vault.wipe(uid);
+    try { await wipePickleKey(uid); } catch {}
   }
   try { await wipeAllRoomData(); } catch {}
   try { await wipeMediaCache(); } catch {}
   try { await clearOutbox(); } catch {}
   try { await clearCryptoStore(); } catch {}
   localStorage.removeItem(CRYPTO_OWNER_KEY);
+  setEncryptionStatus('unknown');
   forgetLastUser();
 }
 

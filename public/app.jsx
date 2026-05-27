@@ -492,12 +492,18 @@ function App() {
   const state = useMemo(() => ME.fold(allEvents.slice(0, effectiveCursor)), [allEvents, effectiveCursor]);
 
   // Gate the app on auth (or demo session) — every hook is above this line.
-  // While the bridge is still trying to resume a session from the
-  // sessionStorage vault stash, show a splash instead of flashing the
-  // login portal.
+  // RecoveryHost mounts unconditionally so the recovery-key save modal
+  // can fire during the bridge's encryption bootstrap (which runs as
+  // part of the login flow, before the React-side session state flips).
   if (!session) {
-    if (booting) return <window.BootSplash />;
-    return <window.LoginScreen onSignIn={(s) => setSession(s)} />;
+    return (
+      <>
+        <window.RecoveryHost />
+        {booting
+          ? <window.BootSplash />
+          : <window.LoginScreen onSignIn={(s) => setSession(s)} />}
+      </>
+    );
   }
 
   async function handleSignOut() {
@@ -629,6 +635,9 @@ function App() {
 
   return (
     <div className="shell">
+      <window.RecoveryHost />
+      {isLive && <window.EncryptionBanner />}
+      {isLive && <window.VaultUnlockBanner session={session} />}
       <div className="topbar">
         <window.IdentityChip
           session={session}

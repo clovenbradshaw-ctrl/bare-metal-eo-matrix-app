@@ -19,7 +19,9 @@
 import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
          tryAutoUnlock, wipeLocalData,
-         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
+         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider,
+         getEncryptionStatus, onEncryptionStatus,
+         retryKeyBackupRestore } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
 import { planDatasetFromFile } from './dataset.js';
@@ -722,6 +724,10 @@ setRecoveryKeyProvider(() => new Promise((resolve) => {
   }
 }));
 
+// Bridge encryption-status changes into the React subscription stream.
+// EncryptionBanner subscribes via `subscribe('encryption')`.
+onEncryptionStatus(() => notify('encryption'));
+
 // ── Public surface ──
 window.MatrixLive = {
   NAMESPACE, ROOM_TYPE,
@@ -759,6 +765,9 @@ window.MatrixLive = {
   getPendingCount: pendingCount,
   outboxList: outboxListAll,
   outboxRemove,
+  // Encryption status (for the "history locked" banner)
+  getEncryptionStatus,
+  retryKeyBackup: retryKeyBackupRestore,
   // Subscription
   subscribe: (fn) => { subscribers.add(fn); return () => subscribers.delete(fn); },
   // Progress log
