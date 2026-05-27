@@ -90,13 +90,7 @@ function buildSets(state) {
       ],
     });
   }
-  if (Object.keys(state.schema || {}).length > 0) {
-    meta.push({
-      id: '_schema', name: '_schema', kind: 'meta',
-      rows: Object.keys(state.schema).length, declared: true,
-      slices: [{ id: '_schema.table', kind: 'table', name: 'table', tableId: '_schema' }],
-    });
-  }
+  // _schema isn't a top-level set — each set has its own schema, opened by clicking the set name above.
   if (state._violations && state._violations.length > 0) {
     meta.push({
       id: '_violations', name: '_violations', kind: 'meta',

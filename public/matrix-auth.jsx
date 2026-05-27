@@ -461,14 +461,22 @@ function IdentityChip({ session, onSignOut }) {
 // the homeserver only stores ciphertext.
 // ─────────────────────────────────────────────────────────────────────────
 
-function ImportButton({ roomId, disabled }) {
+function ImportButton({ roomId, disabled, onCsvFile }) {
   const inputRef = useRef(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const ML = window.MatrixLive;
 
   async function handleFile(file) {
-    if (!file || !ML?.importFile) return;
+    if (!file) return;
+    // CSVs go through the airtable-style importer (preview + field mapping +
+    // efficient per-row INS). Other files just stream straight to media.
+    const isCsv = /\.csv$/i.test(file.name) || file.type === 'text/csv';
+    if (isCsv && typeof onCsvFile === 'function') {
+      onCsvFile(file);
+      return;
+    }
+    if (!ML?.importFile) return;
     setErr(null);
     setBusy(true);
     try {

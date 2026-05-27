@@ -41,7 +41,7 @@
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
-body{font-family:var(--mono);background:var(--bg);color:var(--text);font-size:13.5px;line-height:1.6;overflow:hidden;-webkit-font-smoothing:antialiased}
+body{font-family:var(--mono);background:var(--bg);color:var(--text);font-size:13.5px;line-height:1.6;overflow:hidden;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column}
 button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
 input,textarea,select{font:inherit;color:inherit;background:#fff;border:1px solid var(--border);border-radius:0;padding:5px 8px;outline:none;font-size:12.5px}
 input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0 1px #000}
@@ -51,7 +51,7 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 ::-webkit-scrollbar-thumb:hover{background:#888}
 
 /* ── App shell ────────────────────────────────────────────────────────── */
-.shell{display:grid;grid-template-rows:auto 1fr;height:100vh;background:var(--bg)}
+.shell{display:grid;grid-template-rows:auto 1fr;flex:1;min-height:0;background:var(--bg)}
 .shell-body{display:grid;grid-template-columns:236px 1fr;min-height:0;overflow:hidden}
 
 /* ── Sidebar (left rail · tables & slices) ───────────────────────────── */
@@ -912,11 +912,125 @@ table.dbgrid tr.add-row td.add-row-gutter{width:120px;padding:10px 6px;text-alig
   .tv-tab .trows{display:none}
 }
 
-.desktop-only-notice{margin:0;padding:6px 12px;background:var(--signal);color:#fff;font-size:11.5px;text-align:center;letter-spacing:.3px}
+/* ── New-set (create table) form — airtable-style inline builder ──────── */
+.ct-form{margin:18px 24px 24px;background:#fff;border:1px solid var(--border-strong);font-family:var(--mono);display:flex;flex-direction:column;max-width:780px}
+.ct-head{padding:16px 20px 14px;border-bottom:1px solid var(--border)}
+.ct-eyebrow{font-size:10.5px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);font-weight:700;margin-bottom:8px}
+.ct-name-input{width:100%;font-family:var(--mono);font-size:18px;font-weight:700;color:var(--text-bright);padding:6px 10px;border:1px solid var(--border-strong);outline:none;background:#fff;border-radius:0}
+.ct-name-input:focus{border-color:#000}
+.ct-warn{display:block;margin-top:6px;font-size:11px;color:var(--triad-significance);letter-spacing:.2px}
+.ct-warn b{color:var(--triad-significance);font-weight:700}
+.ct-fields-head{display:flex;align-items:baseline;justify-content:space-between;padding:14px 20px 6px;font-size:10.5px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);font-weight:700}
+.ct-fields-sub{text-transform:none;font-size:11px;letter-spacing:0;color:var(--text-faint);font-weight:400;font-style:italic;max-width:50%;text-align:right}
+.ct-fields{display:flex;flex-direction:column;padding:0 20px 10px}
+.ct-field-row{display:grid;grid-template-columns:24px 1fr 200px 28px;gap:8px;align-items:center;padding:5px 0;border-bottom:1px dashed var(--border)}
+.ct-field-row:last-of-type{border-bottom:none}
+.ct-field-row.primary .ct-field-num{color:var(--triad-significance)}
+.ct-field-num{font-size:11px;color:var(--text-faint);text-align:center;font-weight:600}
+.ct-field-name{font-family:var(--mono);font-size:13px;padding:5px 9px;border:1px solid var(--border);background:#fff;color:var(--text-bright);border-radius:0;outline:none}
+.ct-field-name:focus{border-color:#000}
+.ct-field-type{font-family:var(--mono);font-size:12px;padding:5px 8px;border:1px solid var(--border);background:#fff;color:var(--text);cursor:pointer;border-radius:0;outline:none}
+.ct-field-type:focus{border-color:#000}
+.ct-field-remove{width:24px;height:24px;background:transparent;border:1px solid transparent;color:var(--text-faint);cursor:pointer;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center}
+.ct-field-remove:hover:not(:disabled){background:#fff;color:var(--triad-significance);border-color:var(--triad-significance)}
+.ct-field-remove:disabled{cursor:not-allowed;opacity:.25}
+.ct-add-field{align-self:flex-start;margin-top:10px;padding:6px 14px;background:transparent;border:1px dashed var(--border-strong);color:var(--text-dim);font-family:var(--mono);font-size:11.5px;text-transform:lowercase;letter-spacing:.3px;cursor:pointer;font-weight:600}
+.ct-add-field:hover{border-style:solid;border-color:#000;color:var(--text-bright);background:var(--surface-2)}
+.ct-actions{display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--border);background:var(--surface-2)}
+.ct-cancel{padding:7px 16px;background:#fff;border:1px solid var(--border-strong);color:var(--text-dim);font-family:var(--mono);font-size:12px;cursor:pointer;font-weight:600;text-transform:lowercase;letter-spacing:.3px}
+.ct-cancel:hover{border-color:#000;color:var(--text-bright)}
+.ct-create{padding:7px 18px;background:#000;border:1px solid #000;color:#fff;font-family:var(--mono);font-size:12px;cursor:pointer;font-weight:700;text-transform:lowercase;letter-spacing:.3px}
+.ct-create:hover:not(:disabled){background:#222}
+.ct-create:disabled{background:var(--text-faint);border-color:var(--text-faint);cursor:not-allowed}
+
+/* ── CSV import modal (airtable-style) ────────────────────────────────── */
+.csv-modal-backdrop{position:fixed;inset:0;background:rgba(20,20,20,.45);display:flex;align-items:flex-start;justify-content:center;padding:32px 20px;z-index:100;overflow:auto;animation:proj-fade .12s ease}
+.csv-modal{background:#fff;border:1px solid #000;width:min(1080px,calc(100vw - 40px));max-height:calc(100vh - 64px);display:flex;flex-direction:column;font-family:var(--mono);box-shadow:0 24px 60px -16px rgba(0,0,0,.4);animation:proj-rise .14s ease}
+.csv-head{display:flex;align-items:flex-start;justify-content:space-between;padding:16px 22px 14px;border-bottom:1px solid var(--border);background:linear-gradient(180deg,#fff 0%,var(--surface-2) 100%)}
+.csv-eyebrow{font-size:10.5px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);font-weight:700;margin-bottom:5px}
+.csv-filename{font-size:18px;font-weight:700;color:var(--text-bright);letter-spacing:.1px}
+.csv-fileinfo{font-size:11.5px;color:var(--text-dim);margin-top:3px}
+.csv-close{width:30px;height:30px;background:transparent;border:1px solid transparent;color:var(--text-dim);font-size:18px;line-height:1;cursor:pointer;font-family:var(--mono)}
+.csv-close:hover:not(:disabled){border-color:#000;color:var(--text-bright)}
+.csv-close:disabled{opacity:.3;cursor:not-allowed}
+
+.csv-body{padding:6px 22px 16px;overflow:auto;display:flex;flex-direction:column;gap:14px;flex:1;min-height:0}
+.csv-section{display:flex;flex-direction:column;gap:8px;padding-top:10px}
+.csv-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:14px}
+.csv-section-label{font-size:10.5px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);font-weight:700}
+.csv-header-toggle{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-dim);cursor:pointer}
+.csv-header-toggle input{accent-color:#000;cursor:pointer}
+
+.csv-dest-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.csv-dest-opt{display:flex;align-items:center;gap:10px;padding:11px 14px;background:#fff;border:1px solid var(--border-strong);cursor:pointer;font-size:12.5px;color:var(--text)}
+.csv-dest-opt.on{border-color:#000;background:var(--surface-2)}
+.csv-dest-opt.disabled{opacity:.4;cursor:not-allowed}
+.csv-dest-opt input[type="radio"]{accent-color:#000;cursor:pointer;margin:0}
+.csv-dest-opt input[type="radio"]:disabled{cursor:not-allowed}
+.csv-dest-name{font-weight:600;color:var(--text-bright);white-space:nowrap}
+.csv-dest-input,.csv-dest-select{flex:1;font-family:var(--mono);font-size:13px;padding:5px 8px;border:1px solid var(--border);background:#fff;color:var(--text-bright);border-radius:0;outline:none;min-width:0}
+.csv-dest-input:focus,.csv-dest-select:focus{border-color:#000}
+.csv-dest-input:disabled,.csv-dest-select:disabled{background:var(--surface-3);color:var(--text-faint);cursor:not-allowed}
+.csv-warn{font-size:10.5px;color:var(--triad-significance);text-transform:uppercase;letter-spacing:.8px;font-weight:700;white-space:nowrap}
+
+.csv-map{display:flex;flex-direction:column;border:1px solid var(--border-strong);background:#fff;max-height:320px;overflow:auto}
+.csv-map-row{display:grid;grid-template-columns:minmax(140px,1.4fr) 18px 1.4fr 130px 72px;gap:10px;align-items:center;padding:7px 12px;border-bottom:1px solid var(--border);font-size:12.5px}
+.csv-map-row:last-child{border-bottom:none}
+.csv-map-row.skip{background:var(--surface-3);color:var(--text-faint)}
+.csv-map-row.skip .csv-col-name,.csv-map-row.skip .csv-col-preview{color:var(--text-faint);text-decoration:line-through}
+.csv-map-head{position:sticky;top:0;background:var(--surface-2);font-size:10.5px;text-transform:uppercase;letter-spacing:1.2px;color:var(--text-dim);font-weight:700;padding:8px 12px;border-bottom:1px solid var(--border-strong);z-index:2}
+.csv-map-head .csv-map-arrow{text-align:center}
+.csv-map-csvcol{display:flex;flex-direction:column;min-width:0;gap:1px}
+.csv-col-name{font-weight:700;color:var(--text-bright);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.csv-col-preview{font-size:11px;color:var(--text-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-style:italic}
+.csv-map-arrow{color:var(--text-faint);text-align:center}
+.csv-map-target{display:flex;gap:6px;align-items:center;min-width:0}
+.csv-map-newname{flex:1;font-family:var(--mono);font-size:12.5px;padding:4px 8px;border:1px solid var(--border);background:#fff;color:var(--text-bright);border-radius:0;outline:none;min-width:0}
+.csv-map-newname:focus{border-color:#000}
+.csv-map-targetsel{flex:1;font-family:var(--mono);font-size:12.5px;padding:4px 8px;border:1px solid var(--border);background:#fff;color:var(--text-bright);border-radius:0;outline:none;min-width:0}
+.csv-map-targetsel:focus{border-color:#000}
+.csv-map-undo{padding:3px 7px;font-size:10.5px;background:transparent;border:1px solid var(--border);color:var(--text-dim);cursor:pointer;font-family:var(--mono);white-space:nowrap}
+.csv-map-undo:hover{border-color:#000;color:var(--text-bright)}
+.csv-map-type select{width:100%;font-family:var(--mono);font-size:12px;padding:4px 8px;border:1px solid var(--border);background:#fff;color:var(--text);border-radius:0;outline:none;cursor:pointer}
+.csv-map-type select:focus{border-color:#000}
+.csv-map-type select:disabled{background:var(--surface-3);color:var(--text-faint);cursor:not-allowed}
+.csv-map-skip{width:100%;padding:4px 8px;font-size:11px;background:#fff;border:1px solid var(--border);color:var(--text-dim);cursor:pointer;font-family:var(--mono);font-weight:600;text-transform:lowercase;letter-spacing:.2px}
+.csv-map-skip:hover{border-color:#000;color:var(--text-bright)}
+
+.csv-preview-wrap{border:1px solid var(--border-strong);background:#fff;overflow:auto;max-height:220px}
+table.csv-preview{width:100%;border-collapse:collapse;font-size:11.5px}
+table.csv-preview th{position:sticky;top:0;background:var(--surface-2);border-bottom:1px solid var(--border-strong);border-right:1px solid var(--border);padding:6px 10px;text-align:left;font-family:var(--mono);font-weight:700;font-size:11px;color:var(--text-bright);white-space:nowrap;vertical-align:top}
+table.csv-preview th.skip{background:var(--surface-3);color:var(--text-faint)}
+.csv-prev-target{font-weight:700;color:var(--text-bright);text-transform:lowercase}
+.csv-prev-src{font-size:10px;color:var(--text-faint);font-weight:400;margin-top:1px;font-style:italic}
+table.csv-preview td{padding:5px 10px;border-bottom:1px solid var(--border);border-right:1px solid var(--border);color:var(--text);font-family:var(--mono);white-space:nowrap;max-width:240px;overflow:hidden;text-overflow:ellipsis}
+table.csv-preview td.skip{background:var(--surface-3);color:var(--text-faint)}
+table.csv-preview tr:last-child td{border-bottom:none}
+
+.csv-state-block{padding:36px 20px;display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--text-dim);font-size:13px;text-align:center}
+.csv-state-block.csv-state-error{color:var(--triad-significance)}
+.csv-state-block.csv-state-done{color:var(--triad-existence)}
+.csv-state-glyph{font-size:30px;line-height:1;color:var(--text-faint)}
+.csv-state-block.csv-state-error .csv-state-glyph{color:var(--triad-significance)}
+.csv-state-block.csv-state-done .csv-state-glyph{color:var(--triad-existence)}
+.csv-state-sub{font-size:11.5px;color:var(--text-faint);max-width:520px;line-height:1.5}
+.csv-progress{width:280px;height:6px;background:var(--surface-3);border:1px solid var(--border);margin-top:6px;overflow:hidden}
+.csv-progress-fill{height:100%;background:#000;transition:width .15s linear}
+
+.csv-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 22px;border-top:1px solid var(--border);background:var(--surface-2);flex:0 0 auto}
+.csv-foot-note{font-size:11px;color:var(--text-dim);display:flex;gap:14px;align-items:baseline;flex-wrap:wrap}
+.csv-foot-evt b{color:var(--text-bright);font-weight:700}
+.csv-foot-evt-detail{color:var(--text-faint);font-size:10.5px}
+.csv-foot-actions{display:flex;gap:8px}
+.csv-cancel{padding:8px 16px;background:#fff;border:1px solid var(--border-strong);color:var(--text-dim);font-family:var(--mono);font-size:12px;cursor:pointer;font-weight:600;text-transform:lowercase;letter-spacing:.3px}
+.csv-cancel:hover:not(:disabled){border-color:#000;color:var(--text-bright)}
+.csv-cancel:disabled{opacity:.4;cursor:not-allowed}
+.csv-import{padding:8px 18px;background:#000;border:1px solid #000;color:#fff;font-family:var(--mono);font-size:12px;cursor:pointer;font-weight:700;text-transform:lowercase;letter-spacing:.3px}
+.csv-import:hover:not(:disabled){background:#222}
+.csv-import:disabled{background:var(--text-faint);border-color:var(--text-faint);cursor:not-allowed}
 </style>
 </head>
 <body>
-<p class="desktop-only-notice">⚠️ Desktop only — not optimized for mobile.</p>
 <div id="root"></div>
 
 <!--
@@ -933,6 +1047,7 @@ table.dbgrid tr.add-row td.add-row-gutter{width:120px;padding:10px 6px;text-alig
 <script src="engine.js"></script>
 <script type="text/babel" data-presets="react" src="tweaks-panel.jsx"></script>
 <script type="text/babel" data-presets="react" src="matrix-auth.jsx"></script>
+<script type="text/babel" data-presets="react" src="csv-import.jsx"></script>
 <script type="text/babel" data-presets="react" src="sidebar.jsx"></script>
 <script type="text/babel" data-presets="react" src="entity-timeline.jsx"></script>
 <script type="text/babel" data-presets="react" src="db-view.jsx"></script>
