@@ -323,12 +323,63 @@ export async function hoistLargeFields(content) {
 // ── Read (receiving side) ──
 
 /**
+ * Build the ordered list of download attempts for an mxc URI.
+ *
+ * Synapse 1.100+ (enforced by default in recent releases) serves media
+ * only from the *authenticated* endpoint — `/_matrix/client/v1/media/
+ * download/...` — which requires the access token in an Authorization
+ * header. A plain unauthenticated `fetch` of the legacy `/_matrix/media/
+ * v3/download/...` URL gets a 401/404 there.
+ *
+ * This matters specifically after a cache wipe: during a normal session
+ * blobs resolve from the local OPFS mirror and never hit the network, so
+ * the unauthenticated path silently "worked". Once the mirror is gone the
+ * re-download is the only source of truth, and on an authenticated-media
+ * homeserver it must carry the token — otherwise imported rows (which are
+ * materialised from the source blob, not stored as events) never come
+ * back even though the schema does.
+ *
+ * We try the authenticated endpoint first (with the token) and fall back
+ * to the legacy unauthenticated one for older servers. On an SDK build
+ * that predates the `useAuthentication` argument the first entry collapses
+ * to the legacy URL — harmless, the Bearer header is simply ignored.
+ */
+function mediaDownloadAttempts(client, mxc) {
+  const attempts = [];
+  const token = typeof client.getAccessToken === 'function' ? client.getAccessToken() : null;
+
+  let authedUrl = null;
+  try {
+    // (mxc, width, height, resizeMethod, allowDirectLinks, allowRedirects, useAuthentication)
+    authedUrl = client.mxcUrlToHttp(mxc, undefined, undefined, undefined, true, undefined, true);
+  } catch { /* older SDK signature — fall through to the legacy URL */ }
+  if (authedUrl && token) {
+    attempts.push({ url: authedUrl, init: { headers: { Authorization: `Bearer ${token}` } } });
+  }
+
+  let legacyUrl = null;
+  try {
+    legacyUrl = client.mxcUrlToHttp(mxc, undefined, undefined, undefined, true);
+  } catch { /* ignore */ }
+  // Only add the legacy URL when it's actually different from the authed
+  // one (older SDKs return the same string for both calls).
+  if (legacyUrl && legacyUrl !== authedUrl) {
+    attempts.push({ url: legacyUrl, init: {} });
+  } else if (legacyUrl && !attempts.length) {
+    attempts.push({ url: legacyUrl, init: {} });
+  }
+
+  return attempts;
+}
+
+/**
  * Fetch the plaintext bytes referenced by a `__media` envelope.
  * Tries the local mirror first; falls back to the homeserver media
- * store, decrypting if the envelope is v2.
+ * store (authenticated endpoint first, then legacy), decrypting if the
+ * envelope is v2.
  *
  * Returns null when the bytes cannot be obtained (offline + no cache,
- * or fetch failure).
+ * or every download attempt failed).
  */
 export async function getMediaBytes(ref) {
   if (!ref || !ref.mxc) return null;
@@ -339,26 +390,32 @@ export async function getMediaBytes(ref) {
   const client = getClient();
   if (!client) return null;
 
-  const url = client.mxcUrlToHttp(ref.mxc, undefined, undefined, undefined, true);
-  if (!url) return null;
+  const attempts = mediaDownloadAttempts(client, ref.mxc);
+  if (!attempts.length) return null;
 
-  try {
-    const resp = await fetch(url);
-    if (!resp.ok) return null;
-    const downloaded = new Uint8Array(await resp.arrayBuffer());
-    let plaintext;
-    if (ref.__media === 2 && ref.file) {
-      plaintext = await decryptAttachment(downloaded, ref.file);
-    } else {
-      // Legacy plaintext upload.
-      plaintext = downloaded;
+  for (const { url, init } of attempts) {
+    try {
+      const resp = await fetch(url, init);
+      if (!resp.ok) {
+        console.warn(`[media] download ${resp.status} for ${ref.mxc} via ${url}`);
+        continue;
+      }
+      const downloaded = new Uint8Array(await resp.arrayBuffer());
+      let plaintext;
+      if (ref.__media === 2 && ref.file) {
+        plaintext = await decryptAttachment(downloaded, ref.file);
+      } else {
+        // Legacy plaintext upload.
+        plaintext = downloaded;
+      }
+      await cacheMediaBytes(ref.mxc, plaintext);
+      return plaintext;
+    } catch (e) {
+      console.warn('[media] download failed:', e?.message || e);
+      // Try the next endpoint before giving up.
     }
-    await cacheMediaBytes(ref.mxc, plaintext);
-    return plaintext;
-  } catch (e) {
-    console.warn('[media] download failed:', e?.message || e);
-    return null;
   }
+  return null;
 }
 
 /**
