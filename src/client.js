@@ -31,6 +31,26 @@ import { wipeManifest } from './roomManifest.js';
 let client = null;
 let _watchSyncUnsub = null;
 
+// Sync options tuned for a small idle footprint. matrix-js-sdk's default
+// MemoryStore holds the user's *entire* Matrix account in RAM — every joined
+// room's state, and for E2EE the device list of every member of every
+// encrypted room. For an account in large/public rooms that is the bulk of
+// the tab's memory, and it sits there even when the app shows nothing.
+//
+//   - lazyLoadMembers: don't pull or track member lists during sync; load
+//     them on demand (only when a member list is actually opened). This is
+//     the single biggest reduction for member-heavy accounts. Encryption
+//     still works — the crypto layer loads targets before sending.
+//   - initialSyncLimit 1: this app reads history from its own OPFS store and
+//     paginates the tail on demand, so the SDK never needs to hold a per-room
+//     timeline. Keep the initial burst to the minimum across all rooms.
+//   - disablePresence: we never render presence; skip processing it.
+const SYNC_OPTS = {
+  initialSyncLimit: 1,
+  lazyLoadMembers: true,
+  disablePresence: true,
+};
+
 let progress = (msg) => console.log('[matrix]', msg);
 export function setProgress(fn) {
   progress = (msg) => { console.log('[matrix]', msg); fn(msg); };
@@ -476,10 +496,7 @@ export async function login(homeserver, username, password) {
   await initCryptoWithRetry(client);
 
   progress('Starting sync…');
-  // Keep the initial per-room timeline small: the SDK holds these events in
-  // memory for every joined room, and this app reads history from its own
-  // OPFS store (paginating the tail on demand) rather than the SDK cache.
-  await client.startClient({ initialSyncLimit: 20 });
+  await client.startClient(SYNC_OPTS);
   if (_watchSyncUnsub) _watchSyncUnsub();
   _watchSyncUnsub = watchSync(client);
   await waitForSync(client);
@@ -532,7 +549,7 @@ export async function restoreSession(userId) {
 
   let sessionExpired = false;
   try {
-    await client.startClient({ initialSyncLimit: 20 });
+    await client.startClient(SYNC_OPTS);
     if (_watchSyncUnsub) _watchSyncUnsub();
     _watchSyncUnsub = watchSync(client);
     // Best-effort wait for sync — short timeout so offline boots fast.

@@ -26,7 +26,7 @@ import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getName
 import { planLazyImport } from './dataset.js';
 import { fold, foldFrom, initial, stateHash } from './fold.js';
 import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
-         loadTimelineSince, invite, getMembers, myPowerLevel, kickMember,
+         loadTimelineSince, invite, getMembers, loadRoomMembers, myPowerLevel, kickMember,
          setMemberPowerLevel, onMembersChange, acceptInvite, onRoomChanges,
          onDecrypted, onLocalEchoUpdated, EventStatus,
          setName as mxSetRoomName, getDisplayName as mxGetDisplayName } from './rooms.js';
@@ -790,6 +790,42 @@ async function setUserPowerLevel(roomId, userId, level) {
 function membersOf(roomId) { return getMembers(roomId); }
 function myPowerLevelIn(roomId) { return myPowerLevel(roomId); }
 
+// Pull a room's full member list into the SDK on demand (members are
+// lazy-loaded to keep idle memory down). Notifies so the open members view
+// re-renders with the complete list once it arrives.
+async function loadMembers(roomId) {
+  await loadRoomMembers(roomId);
+  notify('members');
+}
+
+// Diagnostic: a rough breakdown of where in-memory state lives, so memory
+// can be reasoned about from the console (window.MatrixLive.getSdkStats()).
+// `sdkRooms` is every room the SDK syncs (all of the account's rooms, not
+// just this app's workspaces); `sdkLiveEvents` is decrypted MatrixEvents the
+// SDK holds across live timelines; `heldEvents` is this app's own committed
+// op-events across open rooms.
+function getSdkStats() {
+  const client = getClient();
+  let sdkRooms = 0, sdkLiveEvents = 0, membersLoaded = 0;
+  if (client) {
+    const rooms = client.getRooms();
+    sdkRooms = rooms.length;
+    for (const r of rooms) {
+      try { sdkLiveEvents += r.getLiveTimeline().getEvents().length; } catch {}
+      try { if (r.membersLoaded?.()) membersLoaded++; } catch {}
+    }
+  }
+  let heldEvents = 0;
+  for (const arr of roomEvents.values()) heldEvents += arr.length;
+  return {
+    sdkRooms,
+    sdkLiveEvents,
+    roomsWithMembersLoaded: membersLoaded,
+    openRooms: openOrder.length,
+    heldEvents,
+  };
+}
+
 async function renameRoom(roomId, name) {
   const clean = String(name || '').trim();
   if (!clean) throw new Error('Name required');
@@ -848,6 +884,7 @@ window.MatrixLive = {
   setUserPowerLevel,
   renameRoom,
   membersOf,
+  loadMembers,
   myPowerLevelIn,
   getMyDisplayName,
   // File import / media
@@ -855,6 +892,7 @@ window.MatrixLive = {
   readMedia,
   // Memory governor
   getMemoryStats: () => memory.getStats(),
+  getSdkStats,
   setMemoryBudget: (bytes) => memory.setBudget(bytes),
   onMemoryPressure: (fn) => memory.onPressure(fn),
   checkMemory: () => memory.checkPressure(),

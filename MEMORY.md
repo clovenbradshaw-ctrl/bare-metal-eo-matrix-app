@@ -10,6 +10,7 @@ actually reports heap pressure.
 
 | Source | Growth | Status |
 |--------|--------|--------|
+| **matrix-js-sdk sync store** — every room in the account + E2EE member/device lists | scales with the *whole account*, not just this app's rooms | **cut** by lazy-load + minimal sync (below) |
 | `roomEvents` in `src/main.js` — committed op-events per visited room | one array per room, forever | **bounded** by LRU (below) |
 | `EventStore._eventIdSet` — per-event dedup key per open room | one entry per event × open rooms | **bounded** by LRU |
 | matrix-js-sdk live timeline — decrypted `MatrixEvent` objects | one per synced/paginated event, kept forever | **released** on room close / heavy seed |
@@ -17,6 +18,42 @@ actually reports heap pressure.
 | Media blobs | streamed to OPFS, not retained in JS heap | bounded |
 | Demo store | localStorage-backed (~5 MB ceiling) | bounded |
 | `@babel/standalone`, React, crypto WASM | one-time load | fixed cost |
+
+### The matrix-js-sdk sync store is the idle elephant
+
+The surprising one: even with **nothing open**, the SDK runs a full Matrix
+sync and keeps the user's *entire account* in its in-memory `MemoryStore` —
+every joined room's state, and for end-to-end-encrypted rooms the **device
+list of every member of every room**. For an account that's in a few large
+or public rooms this is easily one to several GB, none of which is this
+app's data. The app's own folded workspace state is tiny by comparison (it
+really is just a CSV-sized fold); the SDK underneath it is what's heavy.
+
+Mitigations in `src/client.js` (`SYNC_OPTS`), none of which touch what the
+UI shows:
+
+* **`lazyLoadMembers: true`** — the biggest lever. The SDK no longer pulls
+  or tracks member lists during sync; they load on demand only when a member
+  list is opened (`loadRoomMembers` / `MatrixLive.loadMembers`). Sending to
+  encrypted rooms still works — the crypto layer loads its targets first.
+* **`initialSyncLimit: 1`** — history comes from OPFS, so the SDK never needs
+  a per-room timeline. Keep the initial sync burst to the minimum.
+* **`disablePresence: true`** — presence is never rendered; skip it.
+
+Use `window.MatrixLive.getSdkStats()` to see the breakdown live:
+`{ sdkRooms, sdkLiveEvents, roomsWithMembersLoaded, openRooms, heldEvents }`.
+
+Further levers, deliberately **not** taken here because they carry trade-offs
+worth a decision:
+
+* **`IndexedDBStore`** instead of `MemoryStore` would page sync state to disk
+  and shrink the resident set, but it writes room metadata (names,
+  membership, your room list) to IndexedDB in **plaintext** — at odds with
+  this app's vault-encrypted-at-rest design. (Encrypted event bodies stay
+  ciphertext either way.)
+* **Sliding sync (MSC3575)** would let the client request *only* this app's
+  workspace rooms instead of syncing the whole account — the real fix for
+  accounts in many unrelated rooms — but it needs homeserver support.
 
 The dominant *unbounded* sink was the first one: switching between rooms
 used to leave every visited room's events, dedup set, and SDK timeline
