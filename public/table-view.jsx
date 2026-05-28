@@ -600,6 +600,53 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     setColMenu({ creating: true, x: r.left - 220, y: r.bottom });
   }
 
+  // ── Row virtualization ───────────────────────────────────────────────
+  // A non-virtualized grid happily renders a few hundred rows, but a CSV
+  // import can materialize tens of thousands — building that many <tr>s at
+  // once locks up (or crashes) the tab. For large tables we render only the
+  // rows in (and near) the viewport, padding the scroll height with spacer
+  // rows above and below. Small tables take the simple path unchanged.
+  const VIRTUAL_THRESHOLD = 200;
+  const OVERSCAN = 12;
+  const virtualize = rows.length > VIRTUAL_THRESHOLD;
+  const [rowH, setRowH] = useState(34);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportH, setViewportH] = useState(0);
+  const firstRowRef = useRef(null);
+
+  useEffect(() => {
+    if (!virtualize) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const sync = () => { setScrollTop(el.scrollTop); setViewportH(el.clientHeight); };
+    sync();
+    const onScroll = () => setScrollTop(el.scrollTop);
+    el.addEventListener('scroll', onScroll, { passive: true });
+    const ro = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(() => setViewportH(el.clientHeight)) : null;
+    ro?.observe(el);
+    return () => { el.removeEventListener('scroll', onScroll); ro?.disconnect(); };
+  }, [virtualize]);
+
+  // Calibrate the row-height estimate from the first rendered data row.
+  useEffect(() => {
+    if (!virtualize) return;
+    const h = firstRowRef.current?.getBoundingClientRect().height;
+    if (h && Math.abs(h - rowH) > 1) setRowH(h);
+  });
+
+  const vh = viewportH || 600;
+  let startIdx = 0;
+  let endIdx = rows.length;
+  if (virtualize) {
+    startIdx = Math.max(0, Math.floor(scrollTop / rowH) - OVERSCAN);
+    endIdx = Math.min(rows.length, startIdx + Math.ceil(vh / rowH) + OVERSCAN * 2);
+  }
+  const visibleRows = virtualize ? rows.slice(startIdx, endIdx) : rows;
+  const padTop = virtualize ? startIdx * rowH : 0;
+  const padBottom = virtualize ? (rows.length - endIdx) * rowH : 0;
+  const spacerCols = (showFormula ? 1 : 0) + (partitioned ? 1 : 0) + linkedTypes.length + cols.length + 1;
+
   function commitRename() {
     if (!renamingField) return;
     const { oldName, draft } = renamingField;
@@ -809,8 +856,13 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             </tr>
           </thead>
           <tbody>
-            {rows.map((r, rIdx) => (
-              <tr key={r._anchor}>
+            {virtualize && padTop > 0 && (
+              <tr aria-hidden="true" className="virt-spacer"><td colSpan={spacerCols} style={{ height: padTop, padding: 0, border: 0 }} /></tr>
+            )}
+            {visibleRows.map((r, vIdx) => {
+              const rIdx = startIdx + vIdx;
+              return (
+              <tr key={r._anchor} ref={vIdx === 0 ? firstRowRef : undefined}>
                 {showFormula && (
                   <td
                     className="cell anchor anchor-link formula"
@@ -865,7 +917,11 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                   entityAnchor: r._anchor,
                 })}>⏚</td>
               </tr>
-            ))}
+              );
+            })}
+            {virtualize && padBottom > 0 && (
+              <tr aria-hidden="true" className="virt-spacer"><td colSpan={spacerCols} style={{ height: padBottom, padding: 0, border: 0 }} /></tr>
+            )}
 
             {/* Heat-map summary row */}
             {heatOn && rows.length > 0 && (
