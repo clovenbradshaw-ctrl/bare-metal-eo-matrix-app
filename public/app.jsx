@@ -496,6 +496,61 @@ function App() {
 
   const state = useMemo(() => ME.fold(allEvents.slice(0, effectiveCursor)), [allEvents, effectiveCursor]);
 
+  // Large CSV imports don't emit one event per row — a 10k-row sheet would
+  // blow past Matrix's per-event size limit. The importer instead stores
+  // the source blob in the media store and leaves a single `import` entity
+  // carrying the field plan. We reconstruct the row records here, on demand,
+  // and merge them into the state every data view renders from. Without this
+  // step the import shows up as a lone `import` entity and the rows never
+  // become records.
+  const importRowsRef = useRef({});        // import anchor -> row entity[]
+  const inFlightRef   = useRef(new Set());
+  const [importRowsVersion, setImportRowsVersion] = useState(0);
+
+  const importEntities = useMemo(() => Object.values(state.entities || {}).filter(
+    e => e?._type === 'import' && e.derived_set && Array.isArray(e.field_plan)
+  ), [state]);
+
+  useEffect(() => {
+    const CI = window.CsvImport;
+    if (!CI?.materializeImportRows) return;
+    let cancelled = false;
+    (async () => {
+      for (const imp of importEntities) {
+        const a = imp._anchor;
+        if (importRowsRef.current[a] || inFlightRef.current.has(a)) continue;
+        inFlightRef.current.add(a);
+        try {
+          const rows = await CI.materializeImportRows(imp);
+          if (cancelled) return;
+          importRowsRef.current[a] = rows || [];
+          setImportRowsVersion(v => v + 1);
+        } catch (e) {
+          console.warn('[app] could not materialize import rows:', e);
+        } finally {
+          inFlightRef.current.delete(a);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [importEntities]);
+
+  // State the data views render from: the folded state plus any rows
+  // reconstructed from imported source blobs. Real folded entities win on
+  // anchor collisions, so editing a materialized row (which emits real
+  // events) takes precedence over the reconstructed copy.
+  const renderState = useMemo(() => {
+    const byAnchor = importRowsRef.current;
+    // Only inject rows whose import entity exists at the current cursor, so
+    // time-travelling before an import doesn't conjure its rows.
+    const anchors = Object.keys(byAnchor).filter(a => state.entities?.[a]);
+    if (!anchors.length) return state;
+    const entities = {};
+    for (const a of anchors) for (const row of byAnchor[a]) entities[row._anchor] = row;
+    Object.assign(entities, state.entities);
+    return { ...state, entities };
+  }, [state, importRowsVersion]);
+
   // Gate the app on auth (or demo session) — every hook is above this line.
   // While the bridge is still trying to resume a session from the
   // sessionStorage vault stash, show a splash instead of flashing the
@@ -734,7 +789,7 @@ function App() {
       <div className="shell-body">
         <window.Sidebar
           room={rooms.find(r => r.id === currentRoomId)}
-          state={state}
+          state={renderState}
           selection={selection}
           setSelection={setSelection}
           customSlices={customSlices}
@@ -793,7 +848,7 @@ function App() {
           {selection.kind === 'slice' && (selection.sliceKind === 'table') && (
             <window.TableView
               room={rooms.find(r => r.id === currentRoomId)}
-              state={state}
+              state={renderState}
               onEmit={onEmit}
               tweaks={tweaks}
               scrubber={scrubberEl}
@@ -804,7 +859,7 @@ function App() {
           {selection.kind === 'slice' && selection.sliceKind === 'schema' && (
             <window.TableSchemaView
               room={rooms.find(r => r.id === currentRoomId)}
-              state={state}
+              state={renderState}
               entityType={selection.tableId}
               scrubber={scrubberEl}
               onEmit={onEmit}
@@ -813,7 +868,7 @@ function App() {
           {selection.kind === 'slice' && selection.sliceKind === 'kanban' && (
             <window.AppView
               room={rooms.find(r => r.id === currentRoomId)}
-              state={state}
+              state={renderState}
               onEmit={onEmit}
               scrubber={scrubberEl}
               forceTable={selection.tableId}
@@ -823,7 +878,7 @@ function App() {
           {selection.kind === 'slice' && selection.sliceKind === 'notebook' && (
             <window.AppView
               room={rooms.find(r => r.id === currentRoomId)}
-              state={state}
+              state={renderState}
               onEmit={onEmit}
               scrubber={scrubberEl}
               forceTable={selection.tableId}
@@ -833,7 +888,7 @@ function App() {
           {selection.kind === 'slice' && selection.sliceKind === 'graph' && (
             <window.GraphView
               room={rooms.find(r => r.id === currentRoomId)}
-              state={state}
+              state={renderState}
               onEmit={onEmit}
               scrubber={scrubberEl}
               entityType={selection.tableId}
@@ -842,7 +897,7 @@ function App() {
           {selection.kind === 'slice' && selection.sliceKind === 'timeline' && (
             <window.EntityTimelineView
               room={rooms.find(r => r.id === currentRoomId)}
-              state={state}
+              state={renderState}
               entityType={selection.tableId}
               entityAnchor={selection.entityAnchor}
               scrubber={scrubberEl}
