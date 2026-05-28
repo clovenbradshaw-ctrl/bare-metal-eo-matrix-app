@@ -480,7 +480,9 @@ function ImportButton({ roomId, disabled, onCsvFile }) {
     setErr(null);
     setBusy(true);
     try {
-      await ML.importFile(roomId, file);
+      // materialize:false → no per-row INS explosion; the source blob
+      // stays in media and any row materialization is lazy at view time.
+      await ML.importFile(roomId, file, { materialize: false });
     } catch (e) {
       console.warn('[import] failed:', e);
       setErr(e?.message || 'import failed');

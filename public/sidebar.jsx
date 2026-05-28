@@ -53,8 +53,21 @@ function buildSets(state) {
   ));
   const userSets = Array.from(new Set([...declared, ...observed]));
 
+  // Import entities (hidden from the set list) declare a `derived_set` +
+  // `rows_imported` count. Folded rows live in state.entities; imported
+  // rows are materialized lazily by the table view but the count is
+  // already on the import entity, so the sidebar can show it without
+  // touching the source blob.
+  const importedRowsBySet = {};
+  for (const e of Object.values(state.entities)) {
+    if (e?._type === 'import' && e.derived_set && typeof e.rows_imported === 'number') {
+      importedRowsBySet[e.derived_set] = (importedRowsBySet[e.derived_set] || 0) + e.rows_imported;
+    }
+  }
+
   const sets = userSets.map(name => {
     const rows = Object.values(state.entities).filter(e => e._type === name);
+    const importedRowCount = importedRowsBySet[name] || 0;
     const hasPartitions = !!(state.schema?.partitions?.[name]) || rows.some(r => state.partitions[r._anchor]);
     const hasConnections = state.connections.some(c => {
       const s = state.entities[c.source]; const t = state.entities[c.target];
@@ -68,7 +81,7 @@ function buildSets(state) {
         ? [{ id: `${name}.notebook`, kind: 'notebook', name: 'notebook', tableId: name }] : []),
     ];
     return {
-      id: name, name, kind: 'entity', rows: rows.length,
+      id: name, name, kind: 'entity', rows: rows.length + importedRowCount,
       declared: declared.includes(name),
       hasPartitions, hasConnections,
       slices,
