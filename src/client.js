@@ -23,6 +23,7 @@ import { deriveRecoveryKeyFromPassphrase } from 'matrix-js-sdk/lib/crypto-api/ke
 import { vault, sessionKey, rememberLastUser, forgetLastUser, getLastUser,
          storeSecret, loadSecret } from './vault.js';
 import { wipeAllRoomData } from './store.js';
+import { wipeImportRowCache } from './importCache.js';
 import { clearAll as clearOutbox } from './outbox.js';
 import { watchSync } from './network.js';
 import { wipeMediaCache } from './media.js';
@@ -678,9 +679,9 @@ export async function logout() {
 
 /**
  * Destructive wipe: removes every byte of local state this app owns —
- * OPFS room files, media cache, outbox, every vault, every saved
- * session, room manifests, and the matrix-js-sdk crypto store. The
- * `getLastUser()` hint is forgotten too.
+ * OPFS room files, media cache, the materialised import-row cache,
+ * outbox, every vault, every saved session, room manifests, and the
+ * matrix-js-sdk crypto store. The `getLastUser()` hint is forgotten too.
  *
  * Call this when the user explicitly asks to "clear local data" or
  * when the local vault has been irrecoverably corrupted.
@@ -700,6 +701,7 @@ export async function wipeLocalData() {
   }
   try { await wipeAllRoomData(); } catch {}
   try { await wipeMediaCache(); } catch {}
+  try { await wipeImportRowCache(); } catch {}
   try { await clearOutbox(); } catch {}
   try { await clearCryptoStore(); } catch {}
   localStorage.removeItem(CRYPTO_OWNER_KEY);

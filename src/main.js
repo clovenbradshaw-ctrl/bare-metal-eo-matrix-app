@@ -36,6 +36,7 @@ import { OutboxFlusher, listAll as outboxListAll, pendingCount,
          onChange as onOutboxChange, remove as outboxRemove } from './outbox.js';
 import { onNetworkChange, getNetworkState } from './network.js';
 import { uploadFile as mediaUploadFile, getMediaBytes } from './media.js';
+import { loadImportRows, saveImportRows } from './importCache.js';
 import { loadManifest, saveManifest } from './roomManifest.js';
 import * as memory from './memory.js';
 
@@ -873,6 +874,10 @@ window.MatrixLive = {
   // File import / media
   importFile: importFileToRoom,
   readMedia,
+  // Materialised import rows, persisted to OPFS (vault-encrypted, binary)
+  // so a table's rows survive a media-cache wipe and skip the re-parse.
+  loadImportRows,
+  saveImportRows,
   // Memory governor
   getMemoryStats: () => memory.getStats(),
   setMemoryBudget: (bytes) => memory.setBudget(bytes),
