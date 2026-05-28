@@ -110,6 +110,16 @@ function isRowObject(v) {
  * preserving insertion order from the first row that introduced each key.
  */
 export function collectJsonHeaders(rows, sampleSize = 200) {
+  return collectJsonColumns(rows, sampleSize).map(c => c.name);
+}
+
+/**
+ * Like collectJsonHeaders, but returns `{ raw, name }` pairs so a caller
+ * can map a normalized schema field name back to the original JSON key it
+ * came from. Needed by the lazy importer: rows are reconstructed from the
+ * source blob by reading `row[raw]`, not the sanitized field name.
+ */
+export function collectJsonColumns(rows, sampleSize = 200) {
   const seen = new Set();
   const ordered = [];
   for (const r of rows.slice(0, sampleSize)) {
@@ -118,7 +128,8 @@ export function collectJsonHeaders(rows, sampleSize = 200) {
       if (!seen.has(k)) { seen.add(k); ordered.push(k); }
     }
   }
-  return normalizeHeaders(ordered);
+  const normalized = normalizeHeaders(ordered);
+  return ordered.map((raw, i) => ({ raw, name: normalized[i] }));
 }
 
 // ── Type inference ─────────────────────────────────────────────────────────
@@ -308,4 +319,55 @@ export async function planDatasetFromFile(file, { existingTables = [], rowCap = 
     totalRows: allRows.length,
     shape,
   };
+}
+
+/**
+ * Plan a *lazy* dataset import: infer the schema and a per-field extraction
+ * plan, but do NOT materialise any rows. The source file is stored once as a
+ * blob; rows are reconstructed on demand from that blob (see
+ * csv-import.jsx's materializeImportRows). This is how a 10k-row import
+ * becomes a handful of events instead of one INS + N DEFs per row.
+ *
+ * Returns { setName, fields, fieldPlan, shape, totalRows } or null when the
+ * file is neither CSV nor JSON.
+ *
+ * `fieldPlan` entries tell the materialiser how to pull each field out of a
+ * parsed row:
+ *   - CSV  → { name, type, csvIdx }   (positional)
+ *   - JSON → { name, type, jsonKey }  (the original, pre-normalized key)
+ */
+export async function planLazyImport(file, { existingTables = [] } = {}) {
+  if (!file) return null;
+  const csv = isCsvFile(file);
+  const json = !csv && isJsonFile(file);
+  if (!csv && !json) return null;
+
+  const text = await file.text();
+  let fields, fieldPlan, shape, totalRows;
+
+  if (csv) {
+    const parsed = parseCsv(text);
+    if (parsed.headers.length === 0) return null;
+    fields = inferFields(parsed.headers, parsed.rows);
+    fieldPlan = fields.map((f, idx) => ({ name: f.name, type: f.type, csvIdx: idx }));
+    shape = 'csv';
+    totalRows = parsed.rows.length;
+  } else {
+    const parsed = parseJsonDataset(text);
+    const cols = collectJsonColumns(parsed.rows).slice(0, MAX_FIELDS);
+    if (cols.length === 0) return null;
+    const sample = parsed.rows.slice(0, 200);
+    fields = cols.map(c => ({
+      name: c.name,
+      type: inferColumnType(sample.map(r => (isRowObject(r) ? r[c.raw] : undefined))),
+    }));
+    fieldPlan = cols.map((c, idx) => ({ name: c.name, type: fields[idx].type, jsonKey: c.raw }));
+    shape = 'json';
+    totalRows = parsed.rows.length;
+  }
+
+  const baseName = slugifySetName(file.name || 'set');
+  const setName = uniqueSetName(baseName, existingTables);
+
+  return { setName, fields, fieldPlan, shape, totalRows };
 }

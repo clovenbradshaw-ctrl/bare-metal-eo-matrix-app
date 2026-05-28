@@ -469,8 +469,10 @@ function ImportButton({ roomId, disabled, isLive, onCsvFile }) {
 
   async function handleFile(file) {
     if (!file) return;
-    // CSVs go through the airtable-style importer (preview + field mapping +
-    // efficient per-row INS). Other files just stream straight to media.
+    // CSVs go through the airtable-style importer (preview + field mapping).
+    // Other files stream straight to media; CSV/JSON datasets additionally
+    // get a lazy derived set (one import entity + schema, rows materialized
+    // on read) — no per-row events either way.
     const isCsv = /\.csv$/i.test(file.name) || file.type === 'text/csv';
     if (isCsv && typeof onCsvFile === 'function') {
       onCsvFile(file);
