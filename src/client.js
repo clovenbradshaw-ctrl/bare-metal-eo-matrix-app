@@ -471,7 +471,7 @@ function dropSession(userId) {
 
 // ── Public API ──
 
-export async function login(homeserver, username, password) {
+export async function login(homeserver, username, password, { persist = false } = {}) {
   const user = username.replace(/^@/, '').split(':')[0];
 
   progress('Resolving homeserver…');
@@ -495,10 +495,10 @@ export async function login(homeserver, username, password) {
   // key never leaves memory; the password is only used here for KDF.
   if (!vault.hasMeta(resp.user_id)) {
     progress('Initializing local vault…');
-    await vault.initialize(resp.user_id, password);
+    await vault.initialize(resp.user_id, password, { persist });
   } else if (!vault.isUnlocked() || vault.getUserId() !== resp.user_id) {
     progress('Unlocking local vault…');
-    const ok = await vault.unlock(resp.user_id, password);
+    const ok = await vault.unlock(resp.user_id, password, { persist });
     if (!ok) {
       // Password changed on the server; the old key can't decrypt this
       // user's local data anymore. Reset the vault so the new password
@@ -508,7 +508,7 @@ export async function login(homeserver, username, password) {
       progress('Vault password mismatch — rotating to current password (prior local data is no longer readable)');
       vault.wipe(resp.user_id);
       wipeManifest(resp.user_id);
-      await vault.initialize(resp.user_id, password);
+      await vault.initialize(resp.user_id, password, { persist });
     }
   }
 
@@ -628,8 +628,8 @@ export async function restoreSession(userId) {
  * network. Returns { userId, online } where online indicates whether
  * sync reached a ready state.
  */
-export async function unlock(userId, password) {
-  const ok = await vault.unlock(userId, password);
+export async function unlock(userId, password, { persist = false } = {}) {
+  const ok = await vault.unlock(userId, password, { persist });
   if (!ok) throw new Error('Invalid password');
   rememberLastUser(userId);
 
