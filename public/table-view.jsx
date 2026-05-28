@@ -1446,6 +1446,26 @@ function FormulaEditor({ value, entityType, state, onCommit }) {
   );
 }
 
+// Distinct, sorted values present in the records for one field of an entity
+// type. Multiselect cells hold arrays, so those are flattened; empty / null
+// values are skipped. Used to show "what's actually in the data" when editing
+// a select field's options.
+function collectFieldValues(state, entityType, fieldName) {
+  if (!fieldName || !state || !state.entities) return [];
+  const set = new Set();
+  for (const e of Object.values(state.entities)) {
+    if (!e || e._type !== entityType) continue;
+    const v = e[fieldName];
+    if (v == null || v === '') continue;
+    if (Array.isArray(v)) {
+      for (const x of v) { if (x != null && x !== '') set.add(String(x)); }
+    } else {
+      set.add(String(v));
+    }
+  }
+  return [...set].sort();
+}
+
 // Inline params editor that lives inside the column popover.
 // Formula → autocompleting editor  ·  Rollup → 3 selects  ·  Select/Multiselect → chips + add
 function ColMenuParams({ menu, state, entityType, linkedTypes, onPatch }) {
@@ -1515,6 +1535,13 @@ function ColMenuParams({ menu, state, entityType, linkedTypes, onPatch }) {
   if (t === 'select' || t === 'multiselect') {
     const opts = menu.options || [];
     const removeOption = (o) => onPatch({ options: opts.filter(x => x !== o) });
+    // Distinct values actually present in the data for this field. A schema's
+    // declared options can drift from reality (CSV imports, hand edits), so we
+    // surface every value found in the records and let the user register the
+    // ones that aren't options yet.
+    const dataValues = collectFieldValues(state, entityType, menu.name);
+    const missing = dataValues.filter(v => !opts.includes(v));
+    const addOption = (v) => { if (v && !opts.includes(v)) onPatch({ options: [...opts, v] }); };
     return (
       <div className="ctm-params">
         <div className="ctm-section-label">options</div>
@@ -1540,6 +1567,31 @@ function ColMenuParams({ menu, state, entityType, linkedTypes, onPatch }) {
             }
           }}
         />
+        {missing.length > 0 && (
+          <>
+            <div className="ctm-section-label">
+              found in data
+              <button
+                className="ctm-add-all"
+                title="add every value found in the data as an option"
+                onClick={() => onPatch({ options: [...opts, ...missing] })}
+              >add all</button>
+            </div>
+            <div className="ctm-chips">
+              {missing.map(v => (
+                <button
+                  key={v}
+                  className="ctm-chip ctm-chip-suggested"
+                  title="click to add as an option"
+                  onClick={() => addOption(v)}
+                >
+                  {v}
+                  <span className="ctm-chip-plus" aria-hidden="true">+</span>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
       </div>
     );
   }
