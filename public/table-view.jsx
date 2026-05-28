@@ -1963,6 +1963,35 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
                             }}
                             placeholder={r.kind === 'partition' ? 'backlog, doing, done' : r.rawType === 'formula' ? 'RECORD_ID()  ·  UPPER({Name})  ·  CONCATENATE({title}, \" (\", {status}, \")\")' : 'value-a, value-b, value-c'}
                           />
+                          {(r.rawType === 'select' || r.rawType === 'multiselect') && (() => {
+                            // Surface the values actually present in the data so options can be
+                            // reconciled with reality. Chips not yet in the draft are clickable;
+                            // onMouseDown keeps the input focused so its onBlur won't commit first.
+                            const tokens = draft.split(',').map(s => s.trim()).filter(Boolean);
+                            const missing = collectFieldValues(state, entityType, r.fieldName).filter(v => !tokens.includes(v));
+                            if (missing.length === 0) return null;
+                            return (
+                              <div className="schema-found-in-data">
+                                <span className="schema-found-label">in data:</span>
+                                {missing.map(v => (
+                                  <button
+                                    key={v}
+                                    type="button"
+                                    className="param-chip param-chip-suggested"
+                                    title="click to add as an option"
+                                    onMouseDown={e => {
+                                      e.preventDefault();
+                                      setDraft(d => {
+                                        const cur = d.split(',').map(s => s.trim()).filter(Boolean);
+                                        if (cur.includes(v)) return d;
+                                        return [...cur, v].join(', ');
+                                      });
+                                    }}
+                                  >{v}<span className="ctm-chip-plus" aria-hidden="true">+</span></button>
+                                ))}
+                              </div>
+                            );
+                          })()}
                         </td>
                       ) : (
                         <td
