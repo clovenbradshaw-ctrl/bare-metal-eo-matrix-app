@@ -5,16 +5,17 @@
  *   1. user picks a .csv file (or drops one)
  *   2. parse client-side (RFC 4180-ish, handles quotes + escapes + \r\n)
  *   3. one screen: destination (new set / existing set) + field mapping + preview
- *   4. on commit, emit:
+ *   4. on commit, emit ONLY:
  *        - DEF _schema.tables           (only if creating a new set)
  *        - DEF _schema.fields.<set>     (only when fields change)
- *        - INS per row, with the FULL row payload  ←  N events for N rows
- *      The engine spreads INS.payload into the entity at fold time
- *      (engine.js line 96), so packing the whole row into one INS is
- *      exactly equivalent to one INS + many DEFs, just ~12× cheaper.
+ *        - INS one `import` entity carrying the field plan + has_header flag
+ *      No per-row events. A 10k-row sheet is ~3 events, not ~70k. The rows
+ *      are reconstructed lazily from the source blob at render time by
+ *      materializeImportRows (below).
  *
- *   5. in parallel, ship the original blob to the media store via
- *      ML.importFile so the source CSV is recoverable.
+ *   5. ship the original blob to the media store via ML.importFile (with
+ *      materialize:false) so the source CSV is the system of record for the
+ *      rows and the import is reproducible.
  *
  * Mounting: app.jsx owns the modal state and renders
  *   <window.CsvImportModal csvImport={…} state={…} onEmit={…} onClose={…} />
@@ -559,17 +560,52 @@
 
   /* ── Lazy row materialization ────────────────────────────────────────
    *
-   * The new csv-import flow emits 1 INS for the import entity + schema
-   * DEFs — but NO per-row events. The rows live in the source CSV which
-   * is preserved in the homeserver's media store. This function fetches
-   * those bytes, parses + coerces them with the field plan stored on the
-   * import entity, and returns synthetic row entities (stable
-   * `${importAnchor}#r${idx}` anchors) the table view can render.
+   * Imports emit 1 INS for the import entity + schema DEFs — but NO per-row
+   * events. The rows live in the source CSV / JSON which is preserved in the
+   * homeserver's media store. This function fetches those bytes, parses +
+   * coerces them with the field plan stored on the import entity, and
+   * returns synthetic row entities (stable `${importAnchor}#r${idx}`
+   * anchors) the table view can render.
+   *
+   * The field plan tells us how to pull each field out of a parsed row:
+   *   - CSV  rows are positional arrays → read `row[f.csvIdx]`
+   *   - JSON rows are objects           → read `row[f.jsonKey]`
    *
    * Source blobs are immutable, so we cache parsed results in-memory for
    * the page lifetime keyed by import anchor.
    */
   const importRowCache = new Map();
+
+  /* Minimal JSON dataset parser, mirroring src/dataset.js parseJsonDataset:
+   * array of objects → rows; array of primitives → { value }; object whose
+   * first array-of-objects property → those rows; otherwise the doc itself
+   * is one row. */
+  function parseJsonRows(text) {
+    const data = JSON.parse(text);
+    const isRowObj = v => v && typeof v === 'object' && !Array.isArray(v);
+    if (Array.isArray(data)) {
+      if (data.length === 0) return [];
+      if (isRowObj(data[0])) return data;
+      return data.map(v => ({ value: v }));
+    }
+    if (data && typeof data === 'object') {
+      for (const k of Object.keys(data)) {
+        const v = data[k];
+        if (Array.isArray(v) && v.length > 0 && isRowObj(v[0])) return v;
+      }
+      return [data];
+    }
+    return [{ value: data }];
+  }
+
+  /* Coerce a JSON value: objects/arrays/numbers/booleans pass through as-is;
+   * strings fall back to the CSV-style string coercion. */
+  function coerceJsonValue(value, type) {
+    if (value === null || value === undefined || value === '') return undefined;
+    if (typeof value === 'object') return value;
+    if (typeof value === 'boolean' || typeof value === 'number') return value;
+    return coerce(value, type);
+  }
 
   async function materializeImportRows(importEntity) {
     if (!importEntity || !importEntity._anchor) return [];
@@ -594,13 +630,21 @@
     else if (bytes instanceof ArrayBuffer) text = new TextDecoder().decode(new Uint8Array(bytes));
     else                                   return [];
 
-    let parsed;
-    try { parsed = parseCSV(text); }
-    catch (e) { console.warn('[csv-import] parse failed:', e); return []; }
-    if (!Array.isArray(parsed) || parsed.length === 0) return [];
+    const isJson = importEntity.shape === 'json';
 
-    const hasHeader = importEntity.has_header !== false;
-    const dataRows  = hasHeader ? parsed.slice(1) : parsed;
+    let dataRows;
+    if (isJson) {
+      try { dataRows = parseJsonRows(text); }
+      catch (e) { console.warn('[csv-import] json parse failed:', e); return []; }
+    } else {
+      let parsed;
+      try { parsed = parseCSV(text); }
+      catch (e) { console.warn('[csv-import] parse failed:', e); return []; }
+      if (!Array.isArray(parsed) || parsed.length === 0) return [];
+      const hasHeader = importEntity.has_header !== false;
+      dataRows = hasHeader ? parsed.slice(1) : parsed;
+    }
+    if (!Array.isArray(dataRows) || dataRows.length === 0) return [];
 
     const rows = dataRows.map((raw, i) => {
       const out = {
@@ -613,7 +657,9 @@
         _materialized: importEntity._anchor,
       };
       for (const f of fieldPlan) {
-        const v = coerce(raw[f.csvIdx], f.type);
+        const v = isJson
+          ? coerceJsonValue(raw?.[f.jsonKey], f.type)
+          : coerce(raw[f.csvIdx], f.type);
         if (v !== undefined && v !== null && v !== '') out[f.name] = v;
       }
       return out;

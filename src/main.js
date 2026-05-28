@@ -23,7 +23,7 @@ import { login as mxLogin, unlock as mxUnlock,
          getStashedRecoveryKey } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
-import { planDatasetFromFile } from './dataset.js';
+import { planLazyImport } from './dataset.js';
 import { fold, foldFrom, initial, stateHash } from './fold.js';
 import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          loadTimelineSince, invite, getMembers, myPowerLevel, kickMember,
@@ -558,10 +558,14 @@ async function emit(roomId, op, content) {
 // so the homeserver only ever sees opaque bytes.
 //
 // Layout: every import creates an `import` entity with the file ref +
-// metadata. For CSV / JSON we additionally parse the bytes, infer a
-// schema, and emit it as a derived set so the rows are addressable as
-// data, not just a blob. Callers can opt out by passing
-// `materialize: false`.
+// metadata. For CSV / JSON we additionally infer a schema and record a
+// per-field extraction plan on that entity, then declare the derived set.
+// The rows themselves are NOT emitted as events — they live in the uploaded
+// blob and are reconstructed lazily on read (csv-import.jsx's
+// materializeImportRows). A 10k-row import therefore costs a handful of
+// events, not one INS + N DEFs per row. Callers can opt out of the dataset
+// treatment with `materialize: false` (e.g. the CSV modal, which builds its
+// own field plan from the user's column mapping and passes it via payload).
 async function importFileToRoom(roomId, file, opts = {}) {
   if (!roomId) throw new Error('importFileToRoom needs a roomId');
   if (!file) throw new Error('importFileToRoom needs a file');
@@ -572,14 +576,14 @@ async function importFileToRoom(roomId, file, opts = {}) {
   const entityType = opts.entityType || 'import';
   const displayName = opts.name || file.name || 'file';
 
-  // Parse before upload so we can fail fast on malformed CSV/JSON and
-  // so the derived set name is in hand by the time we DEF the import
-  // entity. Parsing reads the file bytes from a fresh stream — uploading
-  // does not consume the File.
+  // Plan before upload so we can fail soft on malformed CSV/JSON and so the
+  // derived set name is in hand by the time we INS the import entity.
+  // Planning reads the file bytes from a fresh stream — uploading does not
+  // consume the File.
   let plan = null;
   if (opts.materialize !== false) {
     try {
-      plan = await planDatasetFromFile(file, {
+      plan = await planLazyImport(file, {
         existingTables: existingTablesIn(roomId),
       });
     } catch (e) {
@@ -595,17 +599,28 @@ async function importFileToRoom(roomId, file, opts = {}) {
     name: displayName,
     size: ref.size,
     mime: ref.mime,
+    ...(plan ? {
+      derived_set: plan.setName,
+      rows_imported: plan.totalRows,
+      has_header: true,
+      shape: plan.shape,
+      field_plan: plan.fieldPlan,
+    } : {}),
     ...(opts.payload || {}),
   };
   const anchor = await ins(roomId, entityType, payload);
   await def(roomId, anchor, 'file', ref);
   await def(roomId, anchor, 'imported_at', new Date().toISOString());
 
+  // Declare the derived set's schema so the table view knows its columns
+  // before any row is materialized. No per-row events.
   if (plan) {
-    await materializeDataset(roomId, plan, anchor);
-    await def(roomId, anchor, 'derived_set', plan.setName);
-    await def(roomId, anchor, 'rows_imported', plan.rows.length);
-    if (plan.truncated) await def(roomId, anchor, 'truncated', true);
+    const tables = existingTablesIn(roomId);
+    if (!tables.includes(plan.setName)) {
+      await defSchema(roomId, 'tables', [...tables, plan.setName]);
+    }
+    await defSchema(roomId, `fields.${plan.setName}`, plan.fields);
+    logProgress(`Set "${plan.setName}" ready · ${plan.totalRows} rows materialize on demand`);
   }
 
   notify('events');
@@ -630,38 +645,6 @@ function existingTablesIn(roomId) {
     console.warn('[import] could not read existing tables:', e);
     return [];
   }
-}
-
-// Declare the derived set's schema, then emit one INS + N DEFs per row.
-// Rows are emitted serially through the outbox so order is preserved;
-// the optimistic hook surfaces them in the UI as they enqueue.
-async function materializeDataset(roomId, plan, importAnchor) {
-  const tables = existingTablesIn(roomId);
-  if (!tables.includes(plan.setName)) {
-    await defSchema(roomId, 'tables', [...tables, plan.setName]);
-  }
-  await defSchema(roomId, `fields.${plan.setName}`, plan.fields);
-
-  logProgress(`Building set "${plan.setName}" · ${plan.rows.length} rows × ${plan.fields.length} fields`);
-  let rowCount = 0;
-  for (const row of plan.rows) {
-    const rowAnchor = await ins(roomId, plan.setName, {});
-    for (const f of plan.fields) {
-      if (row[f.name] !== undefined && row[f.name] !== null) {
-        await def(roomId, rowAnchor, f.name, row[f.name]);
-      }
-    }
-    rowCount++;
-    if (rowCount % 50 === 0) {
-      logProgress(`  …${rowCount}/${plan.rows.length} rows`);
-    }
-    // Link the first row back to the source import entity so the
-    // provenance edge is observable in graph projections.
-    if (rowCount === 1 && importAnchor) {
-      try { await con(roomId, importAnchor, rowAnchor, 'derived'); } catch {}
-    }
-  }
-  logProgress(`Set "${plan.setName}" ready · ${rowCount} rows`);
 }
 
 /**

@@ -476,7 +476,10 @@ export async function login(homeserver, username, password) {
   await initCryptoWithRetry(client);
 
   progress('Starting sync…');
-  await client.startClient({ initialSyncLimit: 100 });
+  // Keep the initial per-room timeline small: the SDK holds these events in
+  // memory for every joined room, and this app reads history from its own
+  // OPFS store (paginating the tail on demand) rather than the SDK cache.
+  await client.startClient({ initialSyncLimit: 20 });
   if (_watchSyncUnsub) _watchSyncUnsub();
   _watchSyncUnsub = watchSync(client);
   await waitForSync(client);
@@ -529,7 +532,7 @@ export async function restoreSession(userId) {
 
   let sessionExpired = false;
   try {
-    await client.startClient({ initialSyncLimit: 100 });
+    await client.startClient({ initialSyncLimit: 20 });
     if (_watchSyncUnsub) _watchSyncUnsub();
     _watchSyncUnsub = watchSync(client);
     // Best-effort wait for sync — short timeout so offline boots fast.

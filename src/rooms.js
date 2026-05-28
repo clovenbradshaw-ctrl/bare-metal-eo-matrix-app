@@ -258,27 +258,66 @@ export function onLocalEchoUpdated(roomId, handler) {
 export { EventStatus };
 
 /**
- * Load the full timeline, then return only events newer than `sinceTs`.
- * Used for delta sync: the store has everything up to `sinceTs`, so we
- * only need the tail.
+ * Load timeline events newer than `sinceTs` and return them.
+ * Used for delta sync: the OPFS store already has everything up to
+ * `sinceTs`, so we only need the tail.
+ *
+ * Critically, this paginates backwards *only as far as the cursor* rather
+ * than walking the entire room history. matrix-js-sdk keeps every event it
+ * paginates in the room's in-memory live timeline for the life of the
+ * session, so paging the full history of a large room (this app stores one
+ * event per record/cell edit) pulls hundreds of MB — often gigabytes — of
+ * decrypted MatrixEvent objects into RAM and never releases them. The
+ * persisted store is the source of truth for history; the SDK only needs to
+ * surface what arrived since we last looked.
  *
  * @param {string} roomId
  * @param {number} sinceTs - Timestamp (ms) of last stored event
- * @returns {{ total: number, newEvents: Array }} Total timeline size + new events only
+ * @returns {{ total: number, newEvents: Array }} Loaded timeline size + new events only
  */
 export async function loadTimelineSince(roomId, sinceTs) {
-  const total = await loadFullTimeline(roomId);
+  const client = getClient();
+  if (!client) return { total: 0, newEvents: [] };
+  const room = client.getRoom(roomId);
+  if (!room) return { total: 0, newEvents: [] };
+
+  const timeline = room.getLiveTimeline();
+
+  // First load (empty store): we genuinely need the whole history to seed
+  // the store. This is a one-time cost; subsequent opens take the cheap
+  // delta path below.
   if (sinceTs <= 0) {
-    return { total, newEvents: getTimeline(roomId) };
+    let hasMore = true;
+    while (hasMore) {
+      hasMore = await client.paginateEventTimeline(timeline, { backwards: true, limit: 100 });
+    }
+    const all = timeline.getEvents();
+    return { total: all.length, newEvents: all };
   }
 
-  const all = getTimeline(roomId);
+  // Delta load: page backwards until the oldest loaded event predates the
+  // cursor, then stop — everything older is already persisted. In the
+  // common case the events already present from sync are all older than the
+  // cursor, so we paginate nothing at all.
+  const olderThanCursor = (ev) => {
+    const ts = typeof ev?.getTs === 'function' ? ev.getTs() : ev?.origin_server_ts || 0;
+    return ts < sinceTs;
+  };
+
+  let hasMore = true;
+  while (hasMore) {
+    const oldest = timeline.getEvents()[0];
+    if (oldest && olderThanCursor(oldest)) break;
+    hasMore = await client.paginateEventTimeline(timeline, { backwards: true, limit: 100 });
+  }
+
+  const all = timeline.getEvents();
   const newEvents = all.filter(e => {
     const ts = typeof e.getTs === 'function' ? e.getTs() : e.origin_server_ts || 0;
     return ts >= sinceTs;
   });
 
-  return { total, newEvents };
+  return { total: all.length, newEvents };
 }
 
 /**
