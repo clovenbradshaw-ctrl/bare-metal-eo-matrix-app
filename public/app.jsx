@@ -44,6 +44,33 @@ function clearDemoStore() {
   try { localStorage.removeItem(DEMO_STORE_KEY); } catch {}
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Last-page memory · remembers which space (room) and slice/tab you were on
+// so a reload drops you back where you left off instead of the launchpad.
+// ─────────────────────────────────────────────────────────────────────────
+
+const LAST_PAGE_KEY = 'matrix-events.lastPage.v1';
+
+function loadLastPage() {
+  try {
+    const raw = localStorage.getItem(LAST_PAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch { return null; }
+}
+
+function saveLastPage(currentRoomId, selection) {
+  try {
+    localStorage.setItem(LAST_PAGE_KEY, JSON.stringify({ currentRoomId, selection }));
+  } catch {}
+}
+
+function clearLastPage() {
+  try { localStorage.removeItem(LAST_PAGE_KEY); } catch {}
+}
+
 function useEventStore(initialDemo) {
   const [byRoom, setByRoom] = useState(() => {
     const saved = loadDemoStore();
@@ -433,7 +460,9 @@ function App() {
 
   // Live source (real Matrix via the bridge); only active when authed real.
   const isLive = !!session && !session.demo;
-  const [currentRoomId, setCurrentRoomId] = useState(null);
+  // Restore the space we were last in (see saveLastPage), so a reload lands
+  // back on that room rather than the launchpad.
+  const [currentRoomId, setCurrentRoomId] = useState(() => loadLastPage()?.currentRoomId ?? null);
   const liveStore = useLiveStore(isLive, currentRoomId);
 
   // Pick the active source and pin the engine namespace synchronously, so
@@ -448,9 +477,13 @@ function App() {
   // that room (e.g. demo data cleared, room deleted on another device).
   // We deliberately do NOT auto-select a room — landing on the welcome
   // screen is the desired flow.
+  //
+  // Guard on roomIds.length: when a restored space (see loadLastPage) hasn't
+  // synced in yet, byRoom is momentarily empty — don't nuke the restore
+  // before the source has had a chance to load its rooms.
   useEffect(() => {
     if (!session) return;
-    if (currentRoomId && !byRoom[currentRoomId]) {
+    if (currentRoomId && roomIds.length && !byRoom[currentRoomId]) {
       setCurrentRoomId(null);
     }
   }, [session, isLive, roomIds.join('|')]);
@@ -459,7 +492,18 @@ function App() {
     ? ['PREPARED', 'SYNCING'].includes(window.MatrixLive.getSyncState?.())
     : false;
 
-  const [selection, setSelection] = useState({ kind: 'slice', sliceId: 'task.table', tableId: 'task', sliceKind: 'table' });
+  const [selection, setSelection] = useState(() =>
+    loadLastPage()?.selection
+    || { kind: 'slice', sliceId: 'task.table', tableId: 'task', sliceKind: 'table' });
+
+  // Remember which space + slice/tab we're on so the next reload restores it.
+  // Skipped while signed out so signing out (which clears currentRoomId)
+  // doesn't wipe the room we want to return to on the next sign-in.
+  useEffect(() => {
+    if (!session) return;
+    saveLastPage(currentRoomId, selection);
+  }, [session, currentRoomId, selection]);
+
   const [cursor, setCursor] = useState(Infinity);
   const [highlight, setHighlight] = useState(null);
   const [ephemerals, setEphemerals] = useState([]);
@@ -914,6 +958,7 @@ function App() {
         onLoadSeed={() => { demoStore.loadSeed(); setDemoOn(true); setCursor(Infinity); }}
         onClearAll={() => {
           demoStore.clearAll();
+          clearLastPage();
           setDemoTitleOverrides({});
           setDemoOn(false);
           setCursor(Infinity);
