@@ -406,6 +406,19 @@ function useLiveStore(enabled, currentRoomId) {
     }
   }, [enabled, ML, currentRoomId, tick]);
 
+  // Release the previously-open room when navigating away (to another room
+  // or back to the welcome screen). openRoom already evicts other rooms, but
+  // this also frees the last room when the user lands on the launcher, so
+  // sitting idle there holds no room history in memory. Keyed on the room id
+  // only — not `tick` — so live updates don't churn the active room.
+  const prevRoomRef = useRef(null);
+  useEffect(() => {
+    if (!enabled || !ML) return;
+    const prev = prevRoomRef.current;
+    prevRoomRef.current = currentRoomId;
+    if (prev && prev !== currentRoomId) ML.closeRoom?.(prev);
+  }, [enabled, ML, currentRoomId]);
+
   if (!enabled || !ML) {
     return { byRoom: {}, rooms: [], emit: null, createRoom: null };
   }
