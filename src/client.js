@@ -31,6 +31,33 @@ import { wipeManifest } from './roomManifest.js';
 let client = null;
 let _watchSyncUnsub = null;
 
+// matrix-js-sdk logs at DEBUG by default, which floods the console with every
+// HTTP request, perf mark, and crypto trace. We don't want any of that. Pass
+// this quiet logger to createClient: it drops trace/debug/info, forwards
+// real warnings/errors, and filters a couple of known-benign warnings the SDK
+// emits constantly for rooms whose `m.room.create` event isn't loaded under
+// our minimal sync (`[getVersion]` / `[getType]` "does not have an
+// m.room.create event"). Children (getChild) stay quiet too.
+const QUIET_PATTERNS = [
+  'does not have an m.room.create event',
+  'No membership changes detected',
+];
+function makeQuietLogger() {
+  const noop = () => {};
+  const passes = (msg) => {
+    const first = typeof msg[0] === 'string' ? msg[0] : '';
+    return !QUIET_PATTERNS.some((p) => first.includes(p));
+  };
+  const self = {
+    trace: noop, debug: noop, info: noop, log: noop,
+    warn: (...m) => { if (passes(m)) console.warn(...m); },
+    error: (...m) => { if (passes(m)) console.error(...m); },
+    getChild: () => self,
+  };
+  return self;
+}
+const QUIET_LOGGER = makeQuietLogger();
+
 // Sync options tuned for a small idle footprint. matrix-js-sdk's default
 // MemoryStore holds the user's *entire* Matrix account in RAM — every joined
 // room's state, and for E2EE the device list of every member of every
@@ -497,6 +524,7 @@ export async function login(homeserver, username, password) {
     userId: resp.user_id,
     deviceId: resp.device_id,
     cryptoCallbacks: { getSecretStorageKey },
+    logger: QUIET_LOGGER,
   });
 
   await ensureCryptoStoreOwner(resp.user_id);
@@ -547,6 +575,7 @@ export async function restoreSession(userId) {
     userId: sid,
     deviceId,
     cryptoCallbacks: { getSecretStorageKey },
+    logger: QUIET_LOGGER,
   });
   await ensureCryptoStoreOwner(sid);
   progress('Restoring session…');

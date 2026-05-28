@@ -237,12 +237,22 @@ function makeOutboxFlusher() {
 // transaction_id flows through onTimeline → reconcilePendingByTxn), which is
 // independent of whatever the local timeline holds. So dropping the timeline
 // costs nothing but frees the bytes.
+const SDK_TIMELINE_RESET_THRESHOLD = 400;
 function shedSdkTimelines() {
   const client = getClient();
   if (!client) return false;
   let freed = false;
   for (const room of client.getRooms()) {
-    try { room.resetLiveTimeline(null, null); freed = true; } catch {}
+    try {
+      // Only reset rooms that have actually accumulated a meaningful timeline
+      // (the active room during a bulk write). Resetting recreates the
+      // timeline — which re-reads the room version etc. — so blindly doing it
+      // to every quiet background room every interval was wasteful and noisy.
+      if (room.getLiveTimeline().getEvents().length > SDK_TIMELINE_RESET_THRESHOLD) {
+        room.resetLiveTimeline(null, null);
+        freed = true;
+      }
+    } catch {}
   }
   return freed;
 }
