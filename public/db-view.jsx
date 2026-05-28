@@ -443,17 +443,22 @@ function DbView({ rooms, currentRoomId, setCurrentRoomId, createRoom, eventsUpTo
           <EphemeralLane ephemerals={ephemerals} />
           <div className="col-body" id="tl-body">
             {allEvents.length === 0 && <div className="tl-empty">no events yet — emit one below</div>}
-            {allEvents.map((ev, i) => (
+            {[...allEvents].map((ev, _i, arr) => {
+              // most-recent-first: render reversed but keep idx tied to actual log position
+              const i = arr.length - 1 - _i;
+              const ev2 = arr[i];
+              return (
               <TimelineRow
-                key={ev.event_id}
-                event={ev}
+                key={ev2.event_id}
+                event={ev2}
                 idx={i}
                 scrubbed={i === cursor - 1 && cursor > 0}
                 future={i >= cursor}
-                isViolation={violationEvtIds.has(ev.event_id)}
+                isViolation={violationEvtIds.has(ev2.event_id)}
                 onClick={() => setCursor(i + 1)}
               />
-            ))}
+              );
+            })}
           </div>
           <OpPalette entities={state.entities} onEmit={onEmit} onEphemeral={onEphemeral} />
         </div>

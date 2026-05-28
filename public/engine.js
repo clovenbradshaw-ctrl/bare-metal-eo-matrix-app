@@ -90,7 +90,47 @@ function dispatch(state, event) {
 
   switch (op) {
     case OP.INS: {
-      const { anchor, entity_type, payload } = content;
+      const { anchor, entity_type, payload, rows } = content;
+      // Bulk import — one event carrying many rows. Each row gets its own
+      // entity, but the source-of-truth is the single event. Bulk events
+      // also leave behind the original "import" entity at `anchor` so the
+      // import shows up in the timeline / file index.
+      if (Array.isArray(rows) && entity_type) {
+        // Optional: materialize an "import" wrapper at `anchor` so the file
+        // upload shows in the log/audit.
+        if (anchor) {
+          state.entities[anchor] = {
+            ...(payload || {}),
+            _anchor: anchor,
+            _type: payload?._type || 'import',
+            _created: ts,
+            _sender: sender,
+            _eventId: eventId,
+            _hwm: OP.INS.order,
+            _writes: {},
+            _bulkCount: rows.length,
+            _bulkTarget: entity_type,
+          };
+        }
+        for (let i = 0; i < rows.length; i++) {
+          const r = rows[i];
+          const rAnchor = r._anchor || r.anchor || makeAnchor(entity_type, r, sender, ts + i);
+          if (!rAnchor) continue;
+          const { _anchor: __a, anchor: __ax, ...row } = r;
+          state.entities[rAnchor] = {
+            ...row,
+            _anchor: rAnchor,
+            _type: entity_type,
+            _created: ts,
+            _sender: sender,
+            _eventId: eventId,
+            _hwm: OP.INS.order,
+            _writes: {},
+            _importedFrom: anchor || null,
+          };
+        }
+        break;
+      }
       if (!anchor) break;
       state.entities[anchor] = {
         ...payload,

@@ -42,6 +42,7 @@
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
 body{font-family:var(--mono);background:var(--bg);color:var(--text);font-size:13.5px;line-height:1.6;overflow:hidden;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column}
+#root{flex:1;min-height:0;display:flex;flex-direction:column}
 button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
 input,textarea,select{font:inherit;color:inherit;background:#fff;border:1px solid var(--border);border-radius:0;padding:5px 8px;outline:none;font-size:12.5px}
 input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0 1px #000}
@@ -194,6 +195,8 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 
 .view-area{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;background:var(--bg)}
 .topbar{display:flex;align-items:center;gap:12px;padding:9px 16px;border-bottom:1px solid var(--border-strong);background:var(--surface);min-height:46px;flex-wrap:wrap}
+.topbar > *{white-space:nowrap}
+.topbar > .spacer{white-space:normal}
 .brand{font-weight:700;font-size:14px;color:var(--text-bright);letter-spacing:.2px;white-space:nowrap}
 .brand .sub{color:var(--text-dim);font-weight:400;margin-left:8px;font-size:12px}
 
@@ -219,8 +222,20 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .room-picker .panel .new-room button{padding:3px 10px;background:#000;color:#fff;border:1px solid #000;font-size:11px}
 .topbar-members{padding:5px 11px;font-size:12px;color:var(--text-bright);background:#fff;border:1px solid var(--border-strong);cursor:pointer;min-height:28px;font-weight:500;text-transform:lowercase;letter-spacing:.3px}
 .topbar-members:hover{border-color:#000;background:#000;color:#fff}
+.topbar-import{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;font-size:12px;color:var(--text-bright);background:#fff;border:1px solid var(--border-strong);cursor:pointer;min-height:28px;font-weight:500;text-transform:lowercase;letter-spacing:.3px;white-space:nowrap;flex-shrink:0;font-family:var(--mono)}
+.topbar-import:hover:not(:disabled){border-color:#000;background:#000;color:#fff}
+.topbar-import:disabled{opacity:.5;cursor:not-allowed}
+.topbar-import i.ph{font-size:13px;line-height:1}
 .topbar-spaces{padding:5px 11px;font-size:12px;color:var(--text-bright);background:#fff;border:1px solid var(--border-strong);cursor:pointer;min-height:28px;font-weight:600;text-transform:lowercase;letter-spacing:.3px;font-family:var(--mono)}
 .topbar-spaces:hover{border-color:#000;background:#000;color:#fff}
+
+/* ── Time-travel toggle (replaces always-on scrubber) ────────────────── */
+.topbar-timetravel{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;font-size:11.5px;color:var(--text-dim);background:#fff;border:1px solid var(--border-strong);cursor:pointer;min-height:28px;font-weight:600;text-transform:lowercase;letter-spacing:.3px;font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap;flex-shrink:0}
+.topbar-timetravel:hover{border-color:#000;color:var(--text-bright)}
+.topbar-timetravel.on{background:#000;color:#fff;border-color:#000}
+.topbar-timetravel.scrubbed:not(.on){border-color:var(--signal);color:var(--signal)}
+.topbar-timetravel .tt-glyph{font-size:13px;line-height:1}
+.topbar-timetravel .tt-label{font-size:11px;letter-spacing:.4px}
 
 .modes{display:flex;gap:0;flex-wrap:wrap}
 .modes button{padding:5px 13px;font-size:12px;color:var(--text);background:#fff;border:1px solid var(--border-strong);border-left-width:0;text-transform:lowercase;letter-spacing:.3px;cursor:pointer;white-space:nowrap;font-weight:500}
@@ -340,6 +355,11 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .frame .arrow{color:var(--text-dim);margin:0 8px}
 
 /* ── Ephemeral lane ───────────────────────────────────────────────────── */
+/* Global live-activity rail — overlaid bottom-right; floats over content so
+   it doesn't interact with the shell grid. Empty state hides the rail
+   entirely (no DOM in app.jsx when no ephemerals). */
+.eph-rail{position:fixed;right:14px;bottom:14px;display:flex;flex-direction:column;align-items:flex-end;gap:5px;z-index:60;pointer-events:none;max-width:min(360px,calc(100vw - 28px))}
+.eph-rail .eph-flash{pointer-events:auto;background:#fff;box-shadow:0 4px 14px -6px rgba(0,0,0,.25);font-variant-numeric:tabular-nums}
 .eph-lane{display:flex;align-items:center;gap:12px;padding:6px 14px;border-bottom:1px solid var(--border);background:#fdf4d8;min-height:30px;font-size:12px;border-left:3px solid var(--signal)}
 .eph-lane.empty{background:transparent;border-left-color:transparent;border-bottom:1px dashed var(--border)}
 .eph-lane .eph-label{font-size:10.5px;text-transform:uppercase;letter-spacing:1.4px;color:var(--signal);min-width:68px;font-weight:700}
@@ -398,7 +418,12 @@ table.dbgrid{border-collapse:collapse;font-size:12.5px;font-family:var(--mono);m
 table.dbgrid th,table.dbgrid td{padding:7px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border);border-right:1px solid var(--border);white-space:nowrap}
 table.dbgrid th:last-child,table.dbgrid td:last-child{border-right:none}
 table.dbgrid thead th{background:var(--surface-3);color:var(--text);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:1.3px;position:sticky;top:0;border-bottom:2px solid var(--border-strong)}
-table.dbgrid thead th .ty{font-size:10.5px;color:var(--triad-structure);text-transform:none;letter-spacing:.2px;margin-left:6px;font-weight:600}
+table.dbgrid thead th .ty{font-size:10.5px;color:var(--triad-structure);text-transform:none;letter-spacing:.2px;margin-left:6px;font-weight:600;display:inline-flex;align-items:center;vertical-align:middle}
+table.dbgrid thead th .ty i.ph{font-size:13px;line-height:1;color:var(--triad-structure)}
+table.dbgrid thead th.pk .ty i.ph,
+table.dbgrid thead th.unschematized .ty i.ph{color:inherit}
+.col-type-menu-row .ctm-icon{font-size:14px;line-height:1;color:var(--triad-structure)}
+.col-type-menu-row.on .ctm-icon{color:#fff}
 table.dbgrid thead th.pk{color:var(--text-bright)}
 table.dbgrid thead th.unschematized{color:var(--signal)}
 table.dbgrid thead th.unschematized .ty{color:var(--signal)}
@@ -436,6 +461,59 @@ table.dbgrid.schema-grid .schema-add-row select.schema-type-picker{background:#f
 table.dbgrid.schema-grid tr:hover .schema-remove-btn{color:var(--text-dim);border-color:var(--border)}
 .schema-remove-btn:hover{color:var(--red)!important;border-color:var(--red)!important}
 .param-chip{display:inline-block;padding:1px 6px;border:1px solid var(--border);background:#fff;color:var(--text-bright);font-size:11px;font-weight:500;margin-right:4px;margin-bottom:2px}
+
+/* ── Column-type right-click menu (airtable-style) ──────────────────── */
+.col-type-menu{position:fixed;z-index:200;background:#fff;border:1px solid #000;box-shadow:0 18px 40px -10px rgba(0,0,0,.35),0 2px 6px rgba(0,0,0,.18);font-family:var(--mono);min-width:240px;max-width:300px;display:flex;flex-direction:column;animation:proj-rise .14s ease-out}
+.col-type-menu-head{padding:8px 11px;border-bottom:1px solid var(--border);background:linear-gradient(180deg,#fff,var(--surface-2));display:flex;flex-direction:column;gap:2px}
+.col-type-menu-head .ctm-eyebrow{font-size:9.5px;text-transform:uppercase;letter-spacing:1.3px;color:var(--text-dim);font-weight:700}
+.col-type-menu-head .ctm-name{font-size:12px;color:var(--text-bright);font-weight:700}
+.col-type-menu-row{display:grid;grid-template-columns:18px auto 1fr;align-items:baseline;gap:7px;padding:6px 11px;background:transparent;border:none;color:var(--text);cursor:pointer;font-family:var(--mono);font-size:12px;text-align:left;border-bottom:1px solid var(--surface-3)}
+.col-type-menu-row:last-child{border-bottom:none}
+.col-type-menu-row:hover{background:var(--surface-2)}
+.col-type-menu-row.on{background:#000;color:#fff}
+.col-type-menu-row.on .ctm-hint{color:#bbb}
+.col-type-menu-row .ctm-glyph{font-size:10px;color:var(--text-faint);text-align:center}
+.col-type-menu-row.on .ctm-glyph{color:#fff}
+.col-type-menu-row .ctm-label{font-weight:600}
+.col-type-menu-row .ctm-hint{font-size:10.5px;color:var(--text-dim);font-style:italic;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.col-type-menu .ctm-name-input{width:100%;font-family:var(--mono);font-size:13px;font-weight:700;padding:5px 8px;border:1px solid var(--border-strong);background:#fff;color:var(--text-bright);outline:none;margin-top:4px}
+.col-type-menu .ctm-name-input:focus{border-color:#000}
+.col-type-menu .ctm-section-label{padding:7px 11px 4px;font-size:9.5px;text-transform:uppercase;letter-spacing:1.3px;color:var(--text-dim);font-weight:700;background:var(--surface-2);border-top:1px solid var(--border)}
+.col-type-menu .ctm-params{padding:8px 11px 10px;border-top:1px solid var(--border);background:var(--surface-2);display:flex;flex-direction:column;gap:6px}
+.ctm-formula{width:100%;font-family:var(--mono);font-size:11.5px;padding:6px 8px;border:1px solid var(--border-strong);background:#fff;outline:none;resize:vertical;min-height:48px}
+.ctm-formula:focus{border-color:#000}
+.ctm-hint-line{font-size:10.5px;color:var(--text-faint);font-style:italic}
+.ctm-rollup-grid{display:grid;grid-template-columns:auto 1fr;gap:5px 8px;align-items:center}
+.ctm-rollup-grid label{font-size:10px;text-transform:uppercase;letter-spacing:1.1px;color:var(--text-dim);font-weight:700}
+.ctm-rollup-grid select{font-family:var(--mono);font-size:11.5px;padding:3px 6px;border:1px solid var(--border-strong);background:#fff}
+.ctm-rollup-grid select:focus{border-color:#000}
+.ctm-chips{display:flex;flex-wrap:wrap;gap:4px;min-height:22px}
+.ctm-chip{display:inline-flex;align-items:center;gap:4px;padding:1px 6px;background:#fff;border:1px solid var(--border-strong);font-family:var(--mono);font-size:11.5px;color:var(--text-bright)}
+.ctm-chip-x{background:transparent;border:none;color:var(--text-faint);cursor:pointer;font-size:13px;padding:0;line-height:1;font-family:var(--mono)}
+.ctm-chip-x:hover{color:var(--red)}
+.ctm-empty{font-size:10.5px;color:var(--text-faint);font-style:italic}
+.ctm-option-input{width:100%;font-family:var(--mono);font-size:11.5px;padding:4px 8px;border:1px dashed var(--border-strong);background:#fff;outline:none}
+.ctm-option-input:focus{border-style:solid;border-color:#000}
+
+/* ── Formula autocomplete popover ─────────────────────────────────────── */
+.ctm-formula-wrap{position:relative}
+.ctm-suggest{position:absolute;top:100%;left:0;right:0;margin-top:4px;background:#fff;border:1px solid #000;box-shadow:0 14px 28px -10px rgba(0,0,0,.4);z-index:5;max-height:240px;overflow:auto;display:flex;flex-direction:column}
+.ctm-suggest-row{display:grid;grid-template-columns:16px auto 1fr;align-items:baseline;gap:7px;padding:4px 9px;background:#fff;border:none;border-bottom:1px solid var(--surface-3);font-family:var(--mono);font-size:11.5px;color:var(--text);cursor:pointer;text-align:left;width:100%}
+.ctm-suggest-row:last-child{border-bottom:none}
+.ctm-suggest-row:hover, .ctm-suggest-row.active{background:#000;color:#fff}
+.ctm-suggest-row i.ph{font-size:12px;line-height:1;color:var(--triad-structure)}
+.ctm-suggest-row:hover i.ph, .ctm-suggest-row.active i.ph{color:#fff}
+.ctm-suggest-row .cs-name{font-weight:700}
+.ctm-suggest-row .cs-hint{font-size:10.5px;color:var(--text-dim);font-style:italic;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ctm-suggest-row.active .cs-hint, .ctm-suggest-row:hover .cs-hint{color:#bbb}
+.ctm-hint-line code{background:var(--surface-3);padding:0 4px;font-family:var(--mono);font-style:normal;color:var(--text-bright);border:1px solid var(--border)}
+
+/* ── Stable column widths so adding a column doesn't jump existing ones ─ */
+table.dbgrid th, table.dbgrid td.cell{min-width:120px}
+table.dbgrid th.pk, table.dbgrid td.anchor{min-width:90px}
+table.dbgrid th.add-col, table.dbgrid td.add-col-spacer{min-width:0;width:48px}
+table.dbgrid thead th.editable{cursor:pointer}
+table.dbgrid thead th.editable:hover{background:var(--surface-2)}
 
 .schema-foot{margin-top:16px;padding:13px 16px;background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--triad-significance);display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--text);line-height:1.55}
 .schema-foot b{color:var(--text-bright);font-weight:700}
@@ -532,7 +610,6 @@ table.dbgrid td.cell.anchor.anchor-link:hover{color:var(--triad-structure);text-
 .tl-card-agent{color:var(--text-dim);font-size:10.5px;margin-top:3px;font-style:italic}
 table.dbgrid td.cell{cursor:default}
 table.dbgrid td.cell.linked{padding:3px 6px}
-table.dbgrid td.cell.readonly{cursor:default;color:var(--text-dim)}
 table.dbgrid td.cell.editing{padding:0}
 table.dbgrid td.cell.editing input{width:100%;border:1px solid #000;background:#fff;font-family:var(--mono);font-size:11.5px;padding:4px 10px;color:var(--text-bright)}
 table.dbgrid tr.jumped{background:#f3f3f3!important;animation:jumpFlash 1.5s ease-out}
@@ -655,6 +732,65 @@ table.dbgrid tr.add-row td.add-row-gutter{width:120px;padding:10px 6px;text-alig
 .kcol-add button{padding:3px 8px;background:#000;border:1px solid #000;color:#fff;font-size:10.5px}
 
 .card{background:#fff;border:1px solid var(--border);padding:9px 11px;cursor:grab;display:flex;flex-direction:column;gap:5px;position:relative}
+
+/* ── Kanban toolbar (fields / filter / count) ─────────────────────────── */
+.kanban-toolbar{display:flex;align-items:center;gap:10px;padding:8px 16px;border-bottom:1px solid var(--border);background:var(--surface-2);position:relative;flex-shrink:0}
+.kanban-toolbar .kt-group{position:relative}
+.kt-btn{display:inline-flex;align-items:center;gap:6px;padding:4px 11px;font-size:11.5px;color:var(--text);background:#fff;border:1px solid var(--border-strong);cursor:pointer;font-weight:600;font-family:var(--mono);letter-spacing:.2px}
+.kt-btn:hover{border-color:#000}
+.kt-btn.on{background:#000;color:#fff;border-color:#000}
+.kt-btn i.ph{font-size:13px;line-height:1}
+.kt-badge{font-size:10px;padding:0 5px;border:1px solid var(--border);background:var(--surface-2);font-weight:500;font-variant-numeric:tabular-nums}
+.kt-btn.on .kt-badge{background:#000;border-color:#fff}
+.kt-menu{position:absolute;top:100%;left:0;margin-top:4px;min-width:240px;max-width:300px;background:#fff;border:1px solid #000;box-shadow:0 18px 40px -10px rgba(0,0,0,.35);z-index:50;display:flex;flex-direction:column;animation:proj-rise .14s ease-out}
+.kt-menu-eyebrow{padding:7px 11px;border-bottom:1px solid var(--border);background:var(--surface-2);font-size:9.5px;text-transform:uppercase;letter-spacing:1.3px;color:var(--text-dim);font-weight:700}
+.kt-menu-row{display:flex;align-items:center;gap:8px;padding:6px 11px;background:transparent;border:none;color:var(--text);cursor:pointer;font-family:var(--mono);font-size:12px;text-align:left;border-bottom:1px solid var(--surface-3);width:100%}
+.kt-menu-row:last-child{border-bottom:none}
+.kt-menu-row:hover:not(:disabled){background:var(--surface-2)}
+.kt-menu-row:disabled{cursor:default;opacity:1}
+.kt-menu-row i.ph{font-size:14px;line-height:1;color:var(--text-faint);width:16px}
+.kt-menu-row.on i.ph{color:var(--triad-existence)}
+.kt-menu-name{flex:1;color:var(--text-bright);font-weight:500}
+.kt-menu-row.on .kt-menu-name{font-weight:700}
+.kt-menu-row:not(.on) .kt-menu-name{color:var(--text-dim);text-decoration:line-through;text-decoration-color:var(--text-faint)}
+.kt-menu-tag{font-size:9.5px;text-transform:uppercase;letter-spacing:1.1px;color:var(--text-faint);padding:0 5px;border:1px solid var(--border);background:var(--surface-2);font-weight:600}
+.kt-menu-empty{padding:12px 11px;font-size:11.5px;color:var(--text-faint);font-style:italic;text-align:center}
+.kt-filter{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;background:#fff;border:1px solid var(--border-strong);min-width:200px}
+.kt-filter:focus-within{border-color:#000}
+.kt-filter i.ph{font-size:13px;color:var(--text-faint)}
+.kt-filter input{flex:1;border:none;outline:none;background:transparent;font-family:var(--mono);font-size:12px;padding:2px 0;box-shadow:none}
+.kt-filter input:focus{box-shadow:none}
+.kt-filter-clear{padding:0 5px;background:transparent;border:none;color:var(--text-faint);font-size:14px;line-height:1;cursor:pointer;font-family:var(--mono)}
+.kt-filter-clear:hover{color:#000}
+.kt-spacer{flex:1}
+.kt-meta{font-size:11px;color:var(--text-dim);font-weight:500;font-variant-numeric:tabular-nums}
+
+/* ── Kanban card field rows + empty state ─────────────────────────────── */
+.card .card-fields{display:flex;flex-direction:column;gap:2px;margin-top:3px;padding-top:5px;border-top:1px solid var(--surface-3)}
+.card .cf-row{display:grid;grid-template-columns:14px auto 1fr;align-items:baseline;gap:6px;font-size:11px;line-height:1.4}
+.card .cf-icon{font-size:11px;line-height:1;color:var(--text-faint);align-self:center}
+.card .cf-key{color:var(--text-dim);font-weight:500;text-transform:lowercase;letter-spacing:.2px;white-space:nowrap;font-size:10.5px}
+.card .cf-val{color:var(--text-bright);font-weight:600;word-break:break-word}
+.card .cf-val.prio-high{color:var(--triad-significance)}
+.card .cf-val.prio-low{color:var(--text-dim)}
+.kcol-empty{padding:14px 8px;text-align:center;color:var(--text-faint);font-size:11px;font-style:italic}
+
+/* ── Kanban "+ add column" ───────────────────────────────────────────── */
+.kcol-add-col{background:transparent;border:1px dashed var(--border-strong);border-left-width:1px;border-left-style:dashed;justify-content:center;align-items:center;min-height:140px}
+.kcol-add-col:hover{border-color:#000}
+.kcol-add-btn{display:inline-flex;flex-direction:column;align-items:center;gap:5px;padding:14px 18px;background:transparent;border:none;color:var(--text-dim);cursor:pointer;font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.4px;text-transform:lowercase}
+.kcol-add-btn:hover{color:var(--text-bright)}
+.kcol-add-btn i.ph{font-size:22px;line-height:1}
+.kcol-add-form{display:flex;flex-direction:column;gap:9px;padding:13px 12px;width:100%;background:#fff;border:1px solid #000}
+.kcol-add-eyebrow{font-size:9.5px;text-transform:uppercase;letter-spacing:1.3px;color:var(--text-dim);font-weight:700}
+.kcol-add-form input{font-family:var(--mono);font-size:12px;padding:5px 8px;border:1px solid var(--border-strong);background:#fff}
+.kcol-add-form input:focus{border-color:#000}
+.kcol-add-actions{display:flex;gap:6px;justify-content:flex-end}
+.kcol-add-cancel{padding:4px 10px;font-size:11px;background:#fff;border:1px solid var(--border-strong);color:var(--text-dim);font-family:var(--mono);font-weight:600;text-transform:lowercase;cursor:pointer}
+.kcol-add-cancel:hover{border-color:#000;color:#000}
+.kcol-add-go{padding:4px 12px;font-size:11px;background:#000;color:#fff;border:1px solid #000;font-family:var(--mono);font-weight:700;text-transform:lowercase;cursor:pointer}
+.kcol-add-go:hover:not(:disabled){background:#222}
+.kcol-add-go:disabled{background:var(--text-faint);border-color:var(--text-faint);cursor:not-allowed}
 .card:hover{border-color:#000}
 .card.dragging{opacity:.35}
 .card .title{font-size:13px;color:var(--text-bright);line-height:1.4;font-weight:500}
@@ -1045,8 +1181,10 @@ table.csv-preview tr:last-child td{border-bottom:none}
 <script src="vendor/react.js"></script>
 <script src="vendor/react-dom.js"></script>
 <script src="vendor/babel.js"></script>
+<script src="https://unpkg.com/@phosphor-icons/web@2.1.1"></script>
 
 <script src="engine.js"></script>
+<script src="formula.js"></script>
 <script type="text/babel" data-presets="react" src="tweaks-panel.jsx"></script>
 <script type="text/babel" data-presets="react" src="matrix-auth.jsx"></script>
 <script type="text/babel" data-presets="react" src="csv-import.jsx"></script>
