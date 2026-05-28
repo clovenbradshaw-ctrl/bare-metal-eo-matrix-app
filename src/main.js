@@ -48,6 +48,7 @@ const subscribers = new Set();
 const roomStores = new Map();           // roomId → EventStore
 const roomEvents = new Map();           // roomId → Array<plainEvent> (committed)
 const roomUnsubs = new Map();           // roomId → cleanup fns
+const roomEventCounts = new Map();      // roomId → last known event count (survives eviction)
 const pendingByLocalId = new Map();     // localId → { roomId, event }
 const sentEventToLocalId = new Map();
 
@@ -343,6 +344,7 @@ async function tearDownLiveState() {
   roomUnsubs.clear();
   roomStores.clear();
   roomEvents.clear();
+  roomEventCounts.clear();
   pendingByLocalId.clear();
   sentEventToLocalId.clear();
   roomManifest = [];
@@ -373,6 +375,16 @@ async function clearLocalData() {
 // the manifest is refreshed from them. When the SDK is empty (cold
 // offline boot, stale token), the manifest fills in so the user can
 // still see the rooms they had before.
+//
+// eventCount falls back to the cached count for rooms we've evicted from
+// memory, so the workspace list keeps labelling a room you've visited even
+// after we've released its full history.
+function roomEventCount(roomId) {
+  const live = roomEvents.get(roomId);
+  if (live) return live.length;
+  return roomEventCounts.get(roomId) || 0;
+}
+
 function listRooms() {
   const live = discoverRooms(ROOM_TYPE);
   if (live.length > 0) {
@@ -380,7 +392,7 @@ function listRooms() {
     return live.map(r => ({
       id: r.roomId,
       name: r.name,
-      eventCount: roomEvents.get(r.roomId)?.length || 0,
+      eventCount: roomEventCount(r.roomId),
       namespace: NAMESPACE,
       title: r.name,
       membership: r.membership,
@@ -391,7 +403,7 @@ function listRooms() {
   return roomManifest.map(r => ({
     id: r.roomId,
     name: r.name,
-    eventCount: roomEvents.get(r.roomId)?.length || 0,
+    eventCount: roomEventCount(r.roomId),
     namespace: NAMESPACE,
     title: r.name,
     membership: r.membership || 'join',
@@ -418,7 +430,38 @@ async function joinRoom(roomId) {
 }
 
 // ── Per-room timeline ──
+
+/**
+ * Release everything we hold for a room: its live subscriptions, the
+ * EventStore (whose in-memory dedup set grows with the event count), and
+ * the committed-event array. The on-disk OPFS log is left intact, so
+ * reopening the room re-hydrates from disk and re-syncs from the cursor.
+ *
+ * The last known event count is preserved so the workspace list can still
+ * label the room without keeping its full history resident.
+ */
+function closeRoom(roomId) {
+  const events = roomEvents.get(roomId);
+  if (events) roomEventCounts.set(roomId, events.length);
+
+  const fns = roomUnsubs.get(roomId);
+  if (fns) fns.forEach(fn => { try { fn(); } catch {} });
+  roomUnsubs.delete(roomId);
+  roomStores.delete(roomId);
+  roomEvents.delete(roomId);
+}
+
 async function openRoom(roomId) {
+  // The UI only ever renders one room at a time, but every room we opened
+  // used to stay fully resident — its event log, the store's per-event
+  // dedup set, and its live listeners — until logout. Browsing across rooms
+  // (or accumulating data in them) therefore grew memory without bound.
+  // Evict every other open room first so resident memory tracks the single
+  // active room rather than the whole session's browsing history.
+  for (const openId of [...roomStores.keys()]) {
+    if (openId !== roomId) closeRoom(openId);
+  }
+
   if (roomStores.has(roomId)) return; // already open
 
   const store = new EventStore(roomId, NAMESPACE);
@@ -725,6 +768,7 @@ window.MatrixLive = {
   createRoom: createWorkspace,
   joinRoom,
   openRoom,
+  closeRoom,
   getEventsForRoom,
   emit,
   inviteUser,
