@@ -616,12 +616,46 @@
     return coerce(value, type);
   }
 
-  async function materializeImportRows(importEntity) {
+  async function materializeImportRows(importEntity, onPhase) {
     if (!importEntity || !importEntity._anchor) return null;
-    const cached = importRowCache.get(importEntity._anchor);
+    const anchor = importEntity._anchor;
+    // Optional progress hook so callers can surface what's happening
+    // (downloading the source blob, parsing it) without re-implementing it.
+    const phase = typeof onPhase === 'function' ? onPhase : () => {};
+    const cached = importRowCache.get(anchor);
     if (cached) return cached;
 
     const ML = window.MatrixLive;
+
+    // Persistent cache first: rows materialised on a previous load are
+    // stored in OPFS (vault-encrypted binary), so we can skip both the
+    // network download and the CSV/JSON re-parse — and they survive a
+    // media-cache wipe entirely. A hit (even zero rows) is authoritative.
+    if (ML?.loadImportRows) {
+      try {
+        const persisted = await ML.loadImportRows(anchor);
+        if (Array.isArray(persisted)) {
+          importRowCache.set(anchor, persisted);
+          return persisted;
+        }
+      } catch (e) {
+        console.warn('[csv-import] persistent row cache read failed:', e);
+      }
+    }
+
+    // Cache in memory and (best-effort, async) persist to OPFS so the
+    // next load skips the download + parse and survives a media-cache
+    // wipe. Persisting is fire-and-forget: a slow disk write must not
+    // delay the rows reaching the table.
+    const cacheRows = (rows) => {
+      importRowCache.set(anchor, rows);
+      if (ML?.saveImportRows) {
+        Promise.resolve(ML.saveImportRows(anchor, rows))
+          .catch(e => console.warn('[csv-import] persistent row cache write failed:', e));
+      }
+      return rows;
+    };
+
     const ref = importEntity.file;
     const fieldPlan = importEntity.field_plan;
     const setName = importEntity.derived_set;
@@ -630,10 +664,14 @@
     // Returning null (not []) keeps the import retryable until it does.
     if (!ML?.readMedia || !ref || !Array.isArray(fieldPlan) || !setName) return null;
 
+    phase('download', { name: importEntity.name || ref.name, size: ref.size, set: setName });
+
     let bytes;
     try { bytes = await ML.readMedia(ref); }
     catch (e) { console.warn('[csv-import] could not read source blob:', e); return null; }
     if (!bytes) return null;
+
+    phase('parse', { set: setName });
 
     let text;
     if (typeof bytes === 'string')         text = bytes;
@@ -653,15 +691,13 @@
       try { parsed = parseCSV(text); }
       catch (e) { console.warn('[csv-import] parse failed:', e); return null; }
       if (!Array.isArray(parsed) || parsed.length === 0) {
-        importRowCache.set(importEntity._anchor, []);
-        return [];
+        return cacheRows([]);
       }
       const hasHeader = importEntity.has_header !== false;
       dataRows = hasHeader ? parsed.slice(1) : parsed;
     }
     if (!Array.isArray(dataRows) || dataRows.length === 0) {
-      importRowCache.set(importEntity._anchor, []);
-      return [];
+      return cacheRows([]);
     }
 
     const rows = dataRows.map((raw, i) => {
@@ -683,8 +719,7 @@
       return out;
     });
 
-    importRowCache.set(importEntity._anchor, rows);
-    return rows;
+    return cacheRows(rows);
   }
 
   // Find import entities whose derived set matches `entityType`.
