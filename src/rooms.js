@@ -352,7 +352,27 @@ export async function invite(roomId, userId) {
 }
 
 /**
+ * Ensure a room's full member list is loaded. With lazy-loaded members
+ * (see SYNC_OPTS in client.js) the SDK only knows a room's "essential"
+ * members until this is called, which keeps idle memory low. Call it before
+ * showing a member list. Resolves once members are present; no-op if already
+ * loaded or offline.
+ *
+ * @param {string} roomId
+ */
+export async function loadRoomMembers(roomId) {
+  const client = getClient();
+  if (!client) return;
+  const room = client.getRoom(roomId);
+  if (!room) return;
+  try { await room.loadMembersIfNeeded(); }
+  catch (e) { console.warn('[rooms] loadMembersIfNeeded failed:', e?.message || e); }
+}
+
+/**
  * Get current room members (joined + invited) with their power levels.
+ * With lazy-loaded members this returns only the members the SDK has so far;
+ * call loadRoomMembers(roomId) first for the complete list.
  *
  * @param {string} roomId
  * @returns {Array<{ userId, displayName, membership, powerLevel }>}

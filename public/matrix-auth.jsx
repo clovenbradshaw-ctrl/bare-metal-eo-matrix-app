@@ -543,6 +543,12 @@ function MembersDialog({ space, mySession, onClose }) {
   const inputRef = useRef(null);
   useEffect(() => { inputRef.current?.focus(); }, []);
 
+  // Members are lazy-loaded to keep idle memory low; pull the full list now
+  // that the dialog is open. useMembers re-renders when it arrives.
+  useEffect(() => {
+    if (space?.id && ML?.loadMembers) ML.loadMembers(space.id);
+  }, [ML, space?.id]);
+
   if (!space) return null;
   const myMxid = mySession?.mxid;
   const canInvite = myPowerLevel >= 50;
