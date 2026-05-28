@@ -9,6 +9,34 @@
 (function () {
 const { useState, useMemo } = React;
 
+// Short relative phrase for any timestamp — "3m ago", "in 2d", "5mo ago", "2y ago".
+function relTime(ts) {
+  if (!ts) return '';
+  const diff = ts - Date.now();
+  const abs = Math.abs(diff);
+  const past = diff < 0;
+  if (abs < 45_000) return past ? 'just now' : 'in a moment';
+  const M = 60_000, H = 3_600_000, D = 86_400_000;
+  let n, u;
+  if (abs < H)              { n = Math.round(abs / M); u = 'm'; }
+  else if (abs < D)         { n = Math.round(abs / H); u = 'h'; }
+  else if (abs < 30 * D)    { n = Math.round(abs / D); u = 'd'; }
+  else if (abs < 365 * D)   { n = Math.round(abs / (30 * D)); u = 'mo'; }
+  else                      { n = Math.round(abs / (365 * D)); u = 'y'; }
+  return past ? `${n}${u} ago` : `in ${n}${u}`;
+}
+function fmtDateWithRel(ts) {
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '—';
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  const abs = d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    year: sameYear ? undefined : 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  });
+  return `${abs} · ${relTime(d.getTime())}`;
+}
+
 function eventTouchesAnchor(event, anchor) {
   const c = event.content || {};
   if (c.anchor === anchor) return true;
@@ -166,8 +194,8 @@ function EntityTimelineView({
               <span><b>_type</b> <code>{entity._type}</code></span>
               {entity._partition && <span><b>_partition</b> <code>{entity._partition}</code></span>}
               <span><b>_hwm</b> <code>{entity._hwm}</code></span>
-              <span><b>created</b> <code>{new Date(entity._created).toLocaleString()}</code></span>
-              {entity._updated && <span><b>updated</b> <code>{new Date(entity._updated).toLocaleString()}</code></span>}
+              <span><b>created</b> <code title={new Date(entity._created).toISOString()}>{fmtDateWithRel(entity._created)}</code></span>
+              {entity._updated && <span><b>updated</b> <code title={new Date(entity._updated).toISOString()}>{fmtDateWithRel(entity._updated)}</code></span>}
               <span><b>by</b> <code>{entity._updatedBy || entity._sender}</code></span>
             </div>
             {fields.length > 0 && (
@@ -202,7 +230,7 @@ function EntityTimelineView({
                   <div className={`tl-card ${s.op?.triad === 'structure' ? 'con' : ''} ${isRec ? 'rec' : ''} ${isViol ? 'eva-fail' : ''}`}>
                     <div className="tl-card-head">
                       <span className={`tl-card-op ${s.triad}`}>{s.key}</span>
-                      <span className="tl-card-ts">#{String(ev._seq).padStart(3,'0')} · {new Date(ev.origin_server_ts).toLocaleString()}</span>
+                      <span className="tl-card-ts" title={new Date(ev.origin_server_ts).toISOString()}>#{String(ev._seq).padStart(3,'0')} · {fmtDateWithRel(ev.origin_server_ts)}</span>
                     </div>
                     <div className="tl-card-body">
                       {s.body}

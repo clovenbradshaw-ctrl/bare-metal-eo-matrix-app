@@ -194,10 +194,10 @@ const FUNCS = {
 };
 
 // Constants exposed alongside functions
-const CONSTS = { TRUE: true, FALSE: false, VOID: null, PI: Math.PI, E: Math.E };
+const CONSTS = { TRUE: true, FALSE: false, NULL: null, PI: Math.PI, E: Math.E };
 
 const FUNC_NAMES = Object.keys(FUNCS);
-const FUNC_RE = new RegExp('\\b(' + FUNC_NAMES.join('|') + '|TRUE|FALSE|VOID|PI|E)\\b', 'gi');
+const FUNC_RE = new RegExp('\\b(' + FUNC_NAMES.join('|') + '|TRUE|FALSE|NULL|PI|E)\\b', 'gi');
 
 // ─────────────────────────────────────────────────────────────────────────
 // Evaluator (per-row)
