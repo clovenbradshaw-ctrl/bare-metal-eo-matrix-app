@@ -37,9 +37,22 @@ import { OutboxFlusher, listAll as outboxListAll, pendingCount,
 import { onNetworkChange, getNetworkState } from './network.js';
 import { uploadFile as mediaUploadFile, getMediaBytes } from './media.js';
 import { loadManifest, saveManifest } from './roomManifest.js';
+import * as memory from './memory.js';
 
 const NAMESPACE = 'io.matrix-events';
 const ROOM_TYPE = 'eo.workspace';
+
+// Hard heap budget for the whole tab. The governor sheds inactive state
+// before this is reached; the LRU room cap below keeps steady-state
+// footprint bounded regardless of how many rooms the user visits.
+const MEMORY_BUDGET_BYTES = 500 * 1024 * 1024;
+
+// How many rooms stay hydrated in memory at once. Each open room holds its
+// committed op-events plus a per-event dedup set, and pins the matrix-js-sdk
+// timeline for that room. Only the active room is ever read by the UI
+// (see useLiveStore), so a tiny LRU is plenty — switching back re-hydrates
+// from OPFS in a single decrypt pass. Lower this if rooms are very large.
+const MAX_OPEN_ROOMS = 3;
 
 setNamespace(NAMESPACE);
 
@@ -48,11 +61,13 @@ const subscribers = new Set();
 const roomStores = new Map();           // roomId → EventStore
 const roomEvents = new Map();           // roomId → Array<plainEvent> (committed)
 const roomUnsubs = new Map();           // roomId → cleanup fns
+const openOrder = [];                   // roomIds, least→most recently touched (LRU)
 const pendingByLocalId = new Map();     // localId → { roomId, event }
 const sentEventToLocalId = new Map();
 
 let outboxFlusher = null;
 let unsubRoomChanges = null;
+let unregisterRoomEvictor = null;
 let netState = 'offline';
 let activeSession = null;               // { mxid, homeserver, device_id, ... }
 let progressLog = [];                   // ring buffer of recent log lines
@@ -211,6 +226,25 @@ function makeOutboxFlusher() {
   });
 }
 
+// Start the heap governor and register the room evictor it runs under
+// pressure. Idempotent — safe to call on every (re)auth.
+function startMemoryGovernor() {
+  memory.start({ budgetBytes: MEMORY_BUDGET_BYTES });
+  if (unregisterRoomEvictor) unregisterRoomEvictor();
+  unregisterRoomEvictor = memory.registerEvictor('inactive-rooms', () => {
+    const active = activeRoomId();
+    let freed = false;
+    for (const rid of [...openOrder]) {
+      if (rid !== active) { closeRoom(rid); freed = true; }
+    }
+    // Hard-trim the progress ring buffer too — cheap and it can hold
+    // chatty sync lines.
+    if (progressLog.length > 12) { progressLog = progressLog.slice(-12); freed = true; }
+    if (freed) notify('events');
+    return freed;
+  }, { priority: 100, level: 'soft' });
+}
+
 async function afterAuth(userId, homeserver) {
   const liveClient = getClient();
   activeSession = {
@@ -224,6 +258,8 @@ async function afterAuth(userId, homeserver) {
   if (outboxFlusher) outboxFlusher.stop();
   outboxFlusher = makeOutboxFlusher();
   outboxFlusher.start();
+
+  startMemoryGovernor();
 
   if (unsubRoomChanges) unsubRoomChanges();
   unsubRoomChanges = onRoomChanges(() => {
@@ -261,6 +297,8 @@ async function afterAuthStale(userId, homeserver) {
   if (outboxFlusher) outboxFlusher.stop();
   outboxFlusher = makeOutboxFlusher();
   outboxFlusher.start();  // kick() is a no-op until getClient() comes back
+
+  startMemoryGovernor();
 
   if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
 
@@ -339,10 +377,13 @@ async function tearDownLiveState() {
   if (outboxFlusher) { outboxFlusher.stop(); outboxFlusher = null; }
   if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
   if (manifestSaveTimer) { clearTimeout(manifestSaveTimer); manifestSaveTimer = null; }
+  if (unregisterRoomEvictor) { unregisterRoomEvictor(); unregisterRoomEvictor = null; }
+  memory.stop();
   for (const [, fns] of roomUnsubs) fns.forEach(fn => { try { fn(); } catch {} });
   roomUnsubs.clear();
   roomStores.clear();
   roomEvents.clear();
+  openOrder.length = 0;
   pendingByLocalId.clear();
   sentEventToLocalId.clear();
   roomManifest = [];
@@ -417,9 +458,77 @@ async function joinRoom(roomId) {
   notify('rooms');
 }
 
+// ── Per-room lifecycle (bounded LRU) ──
+//
+// The UI only ever reads the active room (useLiveStore), but switching
+// rooms used to leave every visited room's events + dedup set + SDK
+// timeline pinned in memory for the rest of the session. We instead keep
+// a small LRU: the most-recently-touched room is "active" and never
+// evicted; rooms beyond MAX_OPEN_ROOMS are closed, freeing their memory.
+
+function touchRoom(roomId) {
+  const i = openOrder.indexOf(roomId);
+  if (i >= 0) openOrder.splice(i, 1);
+  openOrder.push(roomId);
+}
+
+function activeRoomId() {
+  return openOrder.length ? openOrder[openOrder.length - 1] : null;
+}
+
+/**
+ * Drop a room from memory: stop its listeners, release its events +
+ * dedup set, and reset the matrix-js-sdk live timeline so the decrypted
+ * MatrixEvent objects the SDK accumulated are reclaimed. History is
+ * re-derived from OPFS on reopen, so nothing is lost — only re-read.
+ */
+function closeRoom(roomId) {
+  const fns = roomUnsubs.get(roomId);
+  if (fns) { fns.forEach(fn => { try { fn(); } catch {} }); roomUnsubs.delete(roomId); }
+  roomStores.delete(roomId);
+  roomEvents.delete(roomId);
+  const i = openOrder.indexOf(roomId);
+  if (i >= 0) openOrder.splice(i, 1);
+  resetSdkTimeline(roomId);
+}
+
+/**
+ * Release the SDK's in-memory timeline for a room. Best-effort: this app
+ * reads history from OPFS, not the SDK cache, so a fresh empty live
+ * timeline (re-paginated on demand) costs nothing but reclaims what can
+ * be hundreds of MB of decrypted events for a large room.
+ */
+function resetSdkTimeline(roomId) {
+  try {
+    const room = getClient()?.getRoom?.(roomId);
+    if (room && typeof room.resetLiveTimeline === 'function') {
+      room.resetLiveTimeline(null, null);
+    }
+  } catch (e) {
+    console.warn('[bridge] timeline reset failed:', e?.message || e);
+  }
+}
+
+/**
+ * Close least-recently-used rooms until at most `max` remain open. Skips
+ * the active room and any room still mid-hydration (not yet in roomStores),
+ * so a burst of room switches can't evict a room out from under its own
+ * in-flight openRoom().
+ */
+function enforceRoomCap(max = MAX_OPEN_ROOMS) {
+  const active = activeRoomId();
+  for (let i = 0; i < openOrder.length && openOrder.length > max; ) {
+    const victim = openOrder[i];
+    if (victim === active || !roomStores.has(victim)) { i++; continue; }
+    closeRoom(victim); // removes victim from openOrder — keep i fixed
+    logProgress(`Closed inactive room to free memory`);
+  }
+}
+
 // ── Per-room timeline ──
 async function openRoom(roomId) {
-  if (roomStores.has(roomId)) return; // already open
+  touchRoom(roomId);
+  if (roomStores.has(roomId)) { enforceRoomCap(); return; } // already open
 
   const store = new EventStore(roomId, NAMESPACE);
   await store.open();
@@ -448,6 +557,12 @@ async function openRoom(roomId) {
         roomEvents.set(roomId, cur.concat(plain));
         notify('events');
       }
+      // A first-time seed paginates the room's entire history into the SDK
+      // timeline (one event per cell edit → potentially hundreds of MB of
+      // decrypted MatrixEvent objects). Those bytes are now safely in OPFS,
+      // so drop the SDK copy; live updates land in a fresh timeline and are
+      // captured by the listeners attached below.
+      if (newEvents.length > 2000) resetSdkTimeline(roomId);
     } catch (e) {
       logProgress(`Sync ${roomId}: ${e.message}`);
     }
@@ -497,6 +612,7 @@ async function openRoom(roomId) {
     }
   }
   roomUnsubs.set(roomId, fns);
+  enforceRoomCap();
 }
 
 function getEventsForRoom(roomId) {
@@ -737,6 +853,11 @@ window.MatrixLive = {
   // File import / media
   importFile: importFileToRoom,
   readMedia,
+  // Memory governor
+  getMemoryStats: () => memory.getStats(),
+  setMemoryBudget: (bytes) => memory.setBudget(bytes),
+  onMemoryPressure: (fn) => memory.onPressure(fn),
+  checkMemory: () => memory.checkPressure(),
   // Net status
   getNetwork: () => netState,
   getSyncState: () => getClient()?.getSyncState?.() || null,

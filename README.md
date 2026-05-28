@@ -103,6 +103,15 @@ npm install
 npm run dev
 ```
 
+## Memory
+
+The app holds the tab under a 500 MB heap budget: only a small LRU of rooms
+stays in memory (history is re-read from OPFS on demand), the matrix-js-sdk
+timeline is released for closed rooms, and an adaptive governor sheds
+inactive state when the platform reports heap pressure. See
+[`MEMORY.md`](./MEMORY.md) for the model, tuning knobs, and the
+`window.MatrixLive` memory API.
+
 ## Deploy
 
 Push to GitHub. The Action builds and deploys to GitHub Pages. That's it.
