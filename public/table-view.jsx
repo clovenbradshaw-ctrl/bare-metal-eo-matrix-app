@@ -610,23 +610,46 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   const OVERSCAN = 12;
   const virtualize = rows.length > VIRTUAL_THRESHOLD;
   const [rowH, setRowH] = useState(34);
-  const [scrollTop, setScrollTop] = useState(0);
+  // `scrolled` is how far the row region has travelled up past the top of the
+  // viewport; `viewportH` is the visible height of that viewport. Both are
+  // measured against the *real* vertical scroll ancestor — the grid's own
+  // wrapper (.dbtable-scroll) only scrolls horizontally, so vertical scrolling
+  // bubbles to an ancestor (.tv-body). Watching the wrapper left scrollTop
+  // pinned at 0 and clientHeight equal to the full table height, which made
+  // endIdx resolve to every row — so a big import rendered all its rows at
+  // once and could lock up the tab.
+  const [scrolled, setScrolled] = useState(0);
   const [viewportH, setViewportH] = useState(0);
   const firstRowRef = useRef(null);
+  const tbodyRef = useRef(null);
 
   useEffect(() => {
     if (!virtualize) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const sync = () => { setScrollTop(el.scrollTop); setViewportH(el.clientHeight); };
-    sync();
-    const onScroll = () => setScrollTop(el.scrollTop);
-    el.addEventListener('scroll', onScroll, { passive: true });
-    const ro = typeof ResizeObserver !== 'undefined'
-      ? new ResizeObserver(() => setViewportH(el.clientHeight)) : null;
-    ro?.observe(el);
-    return () => { el.removeEventListener('scroll', onScroll); ro?.disconnect(); };
-  }, [virtualize]);
+    // Walk up to the nearest vertically-scrollable ancestor of the grid.
+    let vp = scrollRef.current?.parentElement;
+    while (vp) {
+      const oy = getComputedStyle(vp).overflowY;
+      if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') break;
+      vp = vp.parentElement;
+    }
+    vp = vp || scrollRef.current;
+    if (!vp) return;
+    const measure = () => {
+      const body = tbodyRef.current;
+      if (!body) return;
+      const vpRect = vp.getBoundingClientRect();
+      // The tbody's top stays put as you scroll (the top spacer reserves the
+      // space for rows scrolled off above), so it marks row 0's virtual top.
+      const bodyTop = body.getBoundingClientRect().top;
+      setScrolled(Math.max(0, vpRect.top - bodyTop));
+      setViewportH(vp.clientHeight || vpRect.height || 0);
+    };
+    measure();
+    vp.addEventListener('scroll', measure, { passive: true });
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null;
+    ro?.observe(vp);
+    return () => { vp.removeEventListener('scroll', measure); ro?.disconnect(); };
+  }, [virtualize, rows.length]);
 
   // Calibrate the row-height estimate from the first rendered data row.
   useEffect(() => {
@@ -639,7 +662,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   let startIdx = 0;
   let endIdx = rows.length;
   if (virtualize) {
-    startIdx = Math.max(0, Math.floor(scrollTop / rowH) - OVERSCAN);
+    startIdx = Math.max(0, Math.floor(scrolled / rowH) - OVERSCAN);
     endIdx = Math.min(rows.length, startIdx + Math.ceil(vh / rowH) + OVERSCAN * 2);
   }
   const visibleRows = virtualize ? rows.slice(startIdx, endIdx) : rows;
@@ -855,7 +878,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
               </th>
             </tr>
           </thead>
-          <tbody>
+          <tbody ref={tbodyRef}>
             {virtualize && padTop > 0 && (
               <tr aria-hidden="true" className="virt-spacer"><td colSpan={spacerCols} style={{ height: padTop, padding: 0, border: 0 }} /></tr>
             )}
