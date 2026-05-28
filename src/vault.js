@@ -67,6 +67,19 @@ async function deriveKey(password, salt) {
 // dies when the tab/browser closes.
 const SESSION_STASH_KEY = 'vault:session_stash';
 
+// localStorage key for the persistent ("keep me signed in") vault stash.
+// Survives browser restarts, so the user isn't prompted for their
+// password on every cold boot.
+//
+// SECURITY TRADE-OFF: this writes the raw AES vault key to disk. Anyone
+// with access to this browser profile can then decrypt the user's
+// local-at-rest data without knowing the password. It is strictly
+// opt-in (the login screen's "keep me signed in" toggle) for exactly
+// that reason. The non-persistent path keeps the key in sessionStorage
+// only — never on disk. Deliberately NOT prefixed `vault:` so it stays
+// out of listVaultUsers()'s scan.
+const PERSIST_STASH_KEY = 'vault_persist_stash';
+
 function loadMeta(userId) {
   const raw = localStorage.getItem(metaKey(userId));
   if (!raw) return null;
@@ -96,11 +109,17 @@ class Vault {
   constructor() {
     this._key = null;
     this._userId = null;
+    // Where the unlocked key is stashed for resume: false → sessionStorage
+    // (tab-scoped), true → localStorage ("keep me signed in", survives
+    // browser restart). Set by initialize/unlock and by the adopt path.
+    this._persist = false;
     this._listeners = new Set();
   }
 
   isUnlocked() { return this._key !== null; }
   getUserId() { return this._userId; }
+  /** True when the resume key is persisted to disk ("keep me signed in"). */
+  isPersistent() { return this._persist; }
   hasMeta(userId) { return loadMeta(userId) !== null; }
 
   onChange(fn) {
@@ -121,8 +140,10 @@ class Vault {
    *
    * Called on the first successful Matrix login for a given user on
    * this device. Subsequent logins use unlock() instead.
+   *
+   * `persist` controls where the resume key is stashed — see _stashKey.
    */
-  async initialize(userId, password) {
+  async initialize(userId, password, { persist = false } = {}) {
     const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
     const key = await deriveKey(password, salt);
 
@@ -135,6 +156,7 @@ class Vault {
     saveMeta(userId, salt, verifierIv, verifierCt);
     this._key = key;
     this._userId = userId;
+    this._persist = persist;
     await this._stashKey();
     this._notify();
   }
@@ -142,8 +164,10 @@ class Vault {
   /**
    * Unlock an existing vault. Returns true on success, false on bad
    * password. Works fully offline — no network calls.
+   *
+   * `persist` controls where the resume key is stashed — see _stashKey.
    */
-  async unlock(userId, password) {
+  async unlock(userId, password, { persist = false } = {}) {
     const meta = loadMeta(userId);
     if (!meta) return false;
     const candidate = await deriveKey(password, meta.salt);
@@ -156,6 +180,7 @@ class Vault {
       if (decoder.decode(new Uint8Array(plain)) !== `verify:${userId}`) return false;
       this._key = candidate;
       this._userId = userId;
+      this._persist = persist;
       await this._stashKey();
       this._notify();
       return true;
@@ -173,40 +198,61 @@ class Vault {
     if (!this.isUnlocked() || this._userId !== userId) {
       throw new Error('Vault must be unlocked for the same user to rekey');
     }
-    await this.initialize(userId, newPassword);
+    // Preserve the user's persistence choice across a password change.
+    await this.initialize(userId, newPassword, { persist: this._persist });
   }
 
   /** Lock: clear key from memory, keep data on disk. */
   lock() {
     this._key = null;
     this._userId = null;
+    this._persist = false;
     this._clearStash();
     this._notify();
   }
 
   /**
-   * Stash the current key into sessionStorage so a tab refresh can re-adopt
-   * it without prompting for the password again. Tab close / browser quit
-   * clears sessionStorage, which is exactly the persistence boundary we want.
+   * Stash the current key so a later launch can re-adopt it without
+   * prompting for the password again.
+   *
+   * When `this._persist` is false (default) the key goes to
+   * sessionStorage: it survives an F5 but tab close / browser quit
+   * clears it. When true ("keep me signed in") it goes to localStorage
+   * so it survives a browser restart — at the cost of writing the key
+   * to disk (see PERSIST_STASH_KEY). Only one store holds the stash at
+   * a time; the other is cleared so a stale copy can't linger.
    */
   async _stashKey() {
     if (!this._key || !this._userId) return;
+    let payload;
     try {
       const raw = await crypto.subtle.exportKey('raw', this._key);
-      const bytes = new Uint8Array(raw);
-      sessionStorage.setItem(SESSION_STASH_KEY, JSON.stringify({
+      payload = JSON.stringify({
         userId: this._userId,
-        key: b64(bytes),
-      }));
+        key: b64(new Uint8Array(raw)),
+      });
     } catch (e) {
-      // Non-extractable key, sessionStorage disabled, or quota — refresh
-      // persistence just won't work in that case.
+      // Non-extractable key — resume persistence just won't work.
+      console.warn('[vault] stash failed:', e?.message || e);
+      return;
+    }
+    try {
+      if (this._persist) {
+        localStorage.setItem(PERSIST_STASH_KEY, payload);
+        sessionStorage.removeItem(SESSION_STASH_KEY);
+      } else {
+        sessionStorage.setItem(SESSION_STASH_KEY, payload);
+        localStorage.removeItem(PERSIST_STASH_KEY);
+      }
+    } catch (e) {
+      // Storage disabled or over quota — resume just won't work.
       console.warn('[vault] stash failed:', e?.message || e);
     }
   }
 
   _clearStash() {
     try { sessionStorage.removeItem(SESSION_STASH_KEY); } catch {}
+    try { localStorage.removeItem(PERSIST_STASH_KEY); } catch {}
   }
 
   /**
@@ -217,9 +263,17 @@ class Vault {
    * we expose it as "unlocked", so a tampered stash can't trick us.
    */
   async tryAdoptStashedKey(expectedUserId) {
-    let raw;
-    try { raw = sessionStorage.getItem(SESSION_STASH_KEY); }
-    catch { return false; }
+    // Prefer the persistent ("keep me signed in") stash so a browser
+    // restart resumes; otherwise fall back to the tab-scoped one.
+    let raw = null;
+    let persistent = false;
+    try { raw = localStorage.getItem(PERSIST_STASH_KEY); } catch {}
+    if (raw) {
+      persistent = true;
+    } else {
+      try { raw = sessionStorage.getItem(SESSION_STASH_KEY); }
+      catch { return false; }
+    }
     if (!raw) return false;
 
     let parsed;
@@ -244,6 +298,7 @@ class Vault {
       }
       this._key = key;
       this._userId = parsed.userId;
+      this._persist = persistent;
       this._notify();
       return true;
     } catch {
@@ -269,6 +324,7 @@ class Vault {
     if (this._userId === userId) {
       this._key = null;
       this._userId = null;
+      this._persist = false;
       this._clearStash();
       this._notify();
     }

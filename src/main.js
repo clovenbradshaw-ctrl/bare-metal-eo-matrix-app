@@ -160,7 +160,10 @@ netState = getNetworkState();
 onOutboxChange(() => notify('outbox'));
 
 // ── Auth ──
-async function loginWithMatrix({ homeserver, username, password }) {
+async function loginWithMatrix({ homeserver, username, password, keepSignedIn = false }) {
+  // When set, the vault key is stashed in localStorage so the session
+  // survives a browser restart instead of being forgotten on tab close.
+  const persist = !!keepSignedIn;
   // Accept either "alice" + "matrix.org" or full "@alice:matrix.org"
   let hs = homeserver;
   let user = username;
@@ -180,7 +183,7 @@ async function loginWithMatrix({ homeserver, username, password }) {
   let vaultUnlockedForUser = false;
   if (hasLocalAccount(user)) {
     try {
-      const { online, needsLogin } = await mxUnlock(user, password);
+      const { online, needsLogin } = await mxUnlock(user, password, { persist });
       vaultUnlockedForUser = vault.isUnlocked() && vault.getUserId() === user;
       if (!needsLogin) {
         logProgress(online ? 'Unlocked (online)' : 'Unlocked (offline)');
@@ -193,7 +196,7 @@ async function loginWithMatrix({ homeserver, username, password }) {
   }
 
   try {
-    const { userId } = await mxLogin(hs, user, password);
+    const { userId } = await mxLogin(hs, user, password, { persist });
     return await afterAuth(userId, hs);
   } catch (e) {
     // Couldn't reach the homeserver (or it refused). If the vault is
@@ -433,7 +436,8 @@ async function reconnect(password) {
   const hs = activeSession.homeserver || '';
   if (!hs) throw new Error('No saved homeserver — sign out and back in');
   logProgress('Reconnecting…');
-  const { userId: refreshedId } = await mxLogin(hs, userId, password);
+  // Keep whatever persistence the user chose at sign-in.
+  const { userId: refreshedId } = await mxLogin(hs, userId, password, { persist: vault.isPersistent() });
   return await afterAuth(refreshedId, hs);
 }
 

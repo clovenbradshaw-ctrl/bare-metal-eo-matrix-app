@@ -132,6 +132,10 @@ function LoginScreen({ onSignIn }) {
   const [homeserver, setHomeserver] = useState(lastHs || 'matrix.org');
   const [username, setUsername]     = useState(lastLocal);
   const [password, setPassword]     = useState('');
+  // Persist the unlock key across browser restarts so the user isn't
+  // prompted again on every cold boot. Defaults on for convenience; see
+  // the security note in vault.js (PERSIST_STASH_KEY).
+  const [keepSignedIn, setKeepSignedIn] = useState(true);
   const [busy, setBusy]             = useState(false);
   const [err, setErr]               = useState(null);
   const [mode, setMode]             = useState('signin'); // 'signin' | 'register'
@@ -160,6 +164,7 @@ function LoginScreen({ onSignIn }) {
         homeserver: hs,
         username: `@${u}:${hs}`,
         password,
+        keepSignedIn,
       });
       onSignIn(session);
     } catch (e) {
@@ -245,6 +250,18 @@ function LoginScreen({ onSignIn }) {
                 </div>
                 <span className="login-hint">where your account lives · default: matrix.org</span>
               </label>
+            )}
+
+            <label className="login-remember" title="stores the encryption key on this device so a browser restart resumes without a password prompt">
+              <input
+                type="checkbox"
+                checked={keepSignedIn}
+                onChange={e => setKeepSignedIn(e.target.checked)}
+              />
+              <span>keep me signed in on this device</span>
+            </label>
+            {!keepSignedIn && (
+              <span className="login-hint">you'll re-enter your password after closing the browser.</span>
             )}
 
             {hasAccount && (
