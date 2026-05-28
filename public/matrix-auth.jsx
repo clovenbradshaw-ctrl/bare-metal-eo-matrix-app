@@ -461,7 +461,7 @@ function IdentityChip({ session, onSignOut }) {
 // the homeserver only stores ciphertext.
 // ─────────────────────────────────────────────────────────────────────────
 
-function ImportButton({ roomId, disabled, onCsvFile }) {
+function ImportButton({ roomId, disabled, isLive, onCsvFile }) {
   const inputRef = useRef(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -474,15 +474,21 @@ function ImportButton({ roomId, disabled, onCsvFile }) {
     const isCsv = /\.csv$/i.test(file.name) || file.type === 'text/csv';
     if (isCsv && typeof onCsvFile === 'function') {
       onCsvFile(file);
+      if (inputRef.current) inputRef.current.value = '';
       return;
     }
-    if (!ML?.importFile) return;
+    if (!isLive || !ML?.importFile) {
+      // Demo mode can't store opaque binary blobs — only the CSV path makes
+      // sense without a homeserver to upload to.
+      setErr('CSV only in demo · sign in for any file');
+      setTimeout(() => setErr(null), 3500);
+      if (inputRef.current) inputRef.current.value = '';
+      return;
+    }
     setErr(null);
     setBusy(true);
     try {
-      // materialize:false → no per-row INS explosion; the source blob
-      // stays in media and any row materialization is lazy at view time.
-      await ML.importFile(roomId, file, { materialize: false });
+      await ML.importFile(roomId, file);
     } catch (e) {
       console.warn('[import] failed:', e);
       setErr(e?.message || 'import failed');
@@ -496,12 +502,16 @@ function ImportButton({ roomId, disabled, onCsvFile }) {
   return (
     <>
       <button
-        className="topbar-members"
+        className="topbar-import"
         onClick={() => inputRef.current?.click()}
         disabled={disabled || busy}
-        title={disabled ? 'sign in to a homeserver to import files'
-                        : 'import a CSV / JSON / binary file into this space'}
-      >{busy ? 'uploading…' : err ? `failed: ${err}` : 'import'}</button>
+        title={isLive
+          ? 'import a CSV / JSON / binary file into this space'
+          : 'import a CSV file into this space · sign in for other file types'}
+      >
+        <i className="ph ph-upload-simple" aria-hidden="true"></i>
+        <span>{busy ? 'uploading…' : err || 'import'}</span>
+      </button>
       <input
         type="file"
         ref={inputRef}

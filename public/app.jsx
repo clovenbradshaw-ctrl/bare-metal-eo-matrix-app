@@ -470,6 +470,10 @@ function App() {
 
   const [customSlices, setCustomSlices] = useState({});
   const [csvImport, setCsvImport] = useState(null); // {id, file, roomId} | null
+  // Time-travel scrubber: collapsed by default; opens via the topbar toggle.
+  // We also force-open it whenever the cursor is *not* live, so the user
+  // can always see/return from a scrubbed state.
+  const [scrubberOpen, setScrubberOpen] = useState(false);
   // Demo mode has no homeserver to push room renames to, so we keep the
   // user's chosen names in-memory and merge them into the rooms list.
   const [demoTitleOverrides, setDemoTitleOverrides] = useDemoTitleOverrides();
@@ -565,6 +569,35 @@ function App() {
     setTimeout(() => setEphemerals(arr => arr.filter(e => e.id !== id)), 4500);
   }
 
+  // Capture meaningful UI activity (button clicks, tab switches, slice picks)
+  // as ephemeral `sig` signals so the live-activity strip reflects what the
+  // user is doing — not just what they've committed to the log.
+  function onActivityCapture(e) {
+    const t = e.target;
+    if (!t || !t.closest) return;
+    const btn = t.closest('button, [role="button"], a, .sb-table-link, .sb-slice, .tv-tab, .gv-zoom button');
+    if (!btn) return;
+    if (btn.disabled) return;
+    // skip clicks inside an input/textarea (they're typing, not navigating)
+    if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT') return;
+    // collect a short label
+    const raw = (btn.getAttribute('aria-label')
+      || btn.getAttribute('title')
+      || btn.textContent
+      || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return;
+    const label = raw.length > 40 ? raw.slice(0, 38) + '…' : raw;
+    // surface where the click landed (sidebar / topbar / view) so the eph
+    // chip can show context.
+    const zone = btn.closest('.sidebar') ? 'sidebar'
+               : btn.closest('.topbar') ? 'topbar'
+               : btn.closest('.tv-tabs') ? 'tabs'
+               : btn.closest('.scrubber') ? 'scrubber'
+               : btn.closest('.gv-zoom') ? 'zoom'
+               : 'view';
+    onEphemeral(ME.OP.SIG, { target: label, note: zone });
+  }
+
   async function onCreateRoom(name) {
     if (isLive) {
       const roomId = await liveStore.createRoom(name);
@@ -600,7 +633,7 @@ function App() {
     setCursor(Infinity);
   }
 
-  const scrubberEl = (
+  const scrubberEl = (scrubberOpen || !live) ? (
     <Scrubber
       cursor={effectiveCursor}
       total={total}
@@ -609,7 +642,7 @@ function App() {
       onLive={() => setCursor(Infinity)}
       live={live}
     />
-  );
+  ) : null;
 
   // No room selected → show the launchpad. This is the post-login default,
   // and the place users return to when they click "← spaces" inside a space.
@@ -629,7 +662,7 @@ function App() {
   }
 
   return (
-    <div className="shell">
+    <div className="shell" onClickCapture={onActivityCapture}>
       <div className="topbar">
         <window.IdentityChip
           session={session}
@@ -650,28 +683,53 @@ function App() {
           isLive={isLive}
           onManageMembers={isLive ? (id) => setMembersDialogRoomId(id) : null}
         />
+        {currentRoomId && (
+          <window.ImportButton
+            roomId={currentRoomId}
+            disabled={isLive ? !!session?.stale : false}
+            isLive={isLive}
+            onCsvFile={(file) => setCsvImport({ id: Date.now(), file, roomId: currentRoomId })}
+          />
+        )}
         {isLive && currentRoomId && (() => {
           const r = rooms.find(x => x.id === currentRoomId);
           if (!r || r.membership !== 'join') return null;
           const stale = !!session?.stale;
           return (
-            <>
-              <button
-                className="topbar-members"
-                onClick={() => setMembersDialogRoomId(currentRoomId)}
-                title={stale ? 'reconnect to the homeserver to manage members' : 'manage members of this space'}
-                disabled={stale}
-              >members</button>
-              <window.ImportButton
-                roomId={currentRoomId}
-                disabled={stale}
-                onCsvFile={(file) => setCsvImport({ id: Date.now(), file, roomId: currentRoomId })}
-              />
-            </>
+            <button
+              className="topbar-members"
+              onClick={() => setMembersDialogRoomId(currentRoomId)}
+              title={stale ? 'reconnect to the homeserver to manage members' : 'manage members of this space'}
+              disabled={stale}
+            >members</button>
           );
         })()}
         <span className="spacer" />
+        <button
+          className={`topbar-timetravel ${scrubberOpen ? 'on' : ''} ${!live ? 'scrubbed' : ''}`}
+          onClick={() => setScrubberOpen(o => !o)}
+          title={live ? 'reveal time-travel scrubber' : `scrubbed to event ${effectiveCursor}/${total} — click to ${scrubberOpen ? 'hide' : 'show'} the scrubber`}
+        >
+          <span className="tt-glyph">⟲</span>
+          <span className="tt-label">{live ? 'time-travel' : `t-${total - effectiveCursor}`}</span>
+        </button>
       </div>
+
+      {ephemerals.length > 0 && (
+        <div className="eph-rail" aria-label="live activity">
+          {ephemerals.slice(-4).map(e => {
+            const op = ME.OP[e.opKey.toUpperCase()];
+            if (!op) return null;
+            return (
+              <div key={e.id} className={`eph-flash ${op.triad}`} title={e.content.note ? `${op.key} · ${e.content.note}` : op.key}>
+                <span className="eph-gly">{op.glyph}</span>
+                <span className="eph-target">{e.content.target || op.key}</span>
+                {e.content.note && <span className="eph-meta">·{e.content.note}</span>}
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       <div className="shell-body">
         <window.Sidebar

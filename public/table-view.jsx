@@ -25,57 +25,277 @@ function inferType(values) {
   return 'json';
 }
 
-function fmtCell(value, type) {
+function fmtCell(value, type, opts) {
   if (value === undefined || value === null || value === '') return { cls: 'null', text: 'NULL' };
   if (type === 'number') return { cls: 'num', text: String(value) };
+  if (type === 'boolean') return { cls: 'str', text: value ? '✓' : '✗' };
+  if (type === 'date') {
+    const f = formatDateCell(value, opts || {});
+    return { cls: `date ${f.tone}`, text: f.text, title: f.title };
+  }
+  if (type === 'duration') {
+    return { cls: 'num', text: formatDuration(value) };
+  }
+  if (type === 'multiselect' && Array.isArray(value)) {
+    return { cls: 'str', text: value.join(', ') };
+  }
   if (type === 'json' && typeof value === 'object') return { cls: 'json', text: JSON.stringify(value) };
   return { cls: 'str', text: String(value) };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Formula evaluator — Airtable-flavored. {field} references resolve against
-// the row record; helpers like RECORD_ID() expose computed properties. The
-// Function constructor evaluates in the room's browser, which is the same
-// trust boundary as any other DEF — formulas live in _schema.fields.* and
-// are authored by room members.
+// Date utilities — smart parse + friendly display + tone (past/today/future).
 // ─────────────────────────────────────────────────────────────────────────
-function evalFormula(formula, record) {
-  if (!formula || typeof formula !== 'string') return '';
-  const code = formula.replace(/\{([^}]+)\}/g, (_, name) => `record[${JSON.stringify(name.trim())}]`);
-  try {
-    const fn = new Function(
-      'record', 'RECORD_ID', 'CONCATENATE', 'UPPER', 'LOWER', 'LEN', 'IF', 'TRIM', 'LEFT', 'RIGHT',
-      `"use strict"; return (${code});`
-    );
-    const s = (v) => v == null ? '' : String(v);
-    return fn(
-      record,
-      () => record._anchor,
-      (...args) => args.map(s).join(''),
-      (v) => s(v).toUpperCase(),
-      (v) => s(v).toLowerCase(),
-      (v) => s(v).length,
-      (cond, a, b) => cond ? a : b,
-      (v) => s(v).trim(),
-      (v, n) => s(v).slice(0, n),
-      (v, n) => s(v).slice(-n),
-    );
-  } catch (e) {
-    return '#ERROR';
+
+const DAY_MS = 86400000;
+const WEEKDAYS = ['sun','mon','tue','wed','thu','fri','sat'];
+const MONTHS = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+
+function smartParseDate(input, opts = {}) {
+  if (input === undefined || input === null) return null;
+  if (input instanceof Date) return input.toISOString();
+  const raw = String(input).trim();
+  if (!raw) return null;
+
+  // ISO/RFC3339 first — fast path
+  const isoTry = new Date(raw);
+  if (!isNaN(isoTry.getTime()) && /^\d{4}-\d{2}-\d{2}/.test(raw)) {
+    return opts.includeTime ? isoTry.toISOString() : raw.slice(0, 10);
   }
+
+  const now = new Date();
+  const today = startOfDay(now);
+  const low = raw.toLowerCase();
+
+  // Aliases
+  if (low === 'today' || low === 'now') return opts.includeTime ? now.toISOString() : isoDate(today);
+  if (low === 'tomorrow' || low === 'tmrw') return isoDate(addDays(today, 1));
+  if (low === 'yesterday') return isoDate(addDays(today, -1));
+
+  // "in N days/weeks/months" / "N days ago"
+  const inMatch = low.match(/^(?:in\s+)?(-?\d+)\s*(d|day|days|w|wk|week|weeks|h|hr|hour|hours|m|min|minute|minutes|mo|mon|month|months|y|yr|year|years)(?:\s+ago)?$/);
+  if (inMatch) {
+    let n = parseInt(inMatch[1], 10);
+    if (low.endsWith(' ago')) n = -n;
+    const unit = inMatch[2];
+    let d = new Date(now);
+    if (/^(d|day|days)$/.test(unit))    d = addDays(d, n);
+    else if (/^(w|wk|week|weeks)$/.test(unit)) d = addDays(d, n * 7);
+    else if (/^(h|hr|hour|hours)$/.test(unit)) d.setHours(d.getHours() + n);
+    else if (/^(m|min|minute|minutes)$/.test(unit)) d.setMinutes(d.getMinutes() + n);
+    else if (/^(mo|mon|month|months)$/.test(unit)) d.setMonth(d.getMonth() + n);
+    else if (/^(y|yr|year|years)$/.test(unit)) d.setFullYear(d.getFullYear() + n);
+    return opts.includeTime ? d.toISOString() : isoDate(d);
+  }
+
+  // "next mon" / "this fri" / "last tue"
+  const dowMatch = low.match(/^(next|this|last)\s+(\w+)$/);
+  if (dowMatch) {
+    const dir = dowMatch[1];
+    const dowName = dowMatch[2].slice(0, 3);
+    const dowIdx = WEEKDAYS.indexOf(dowName);
+    if (dowIdx >= 0) {
+      let d = new Date(today);
+      const cur = d.getDay();
+      let delta = dowIdx - cur;
+      if (dir === 'next' && delta <= 0) delta += 7;
+      if (dir === 'last' && delta >= 0) delta -= 7;
+      d = addDays(d, delta);
+      return isoDate(d);
+    }
+  }
+
+  // bare weekday like "monday"
+  const bareDow = WEEKDAYS.indexOf(low.slice(0, 3));
+  if (bareDow >= 0) {
+    let delta = bareDow - today.getDay();
+    if (delta < 0) delta += 7;
+    return isoDate(addDays(today, delta));
+  }
+
+  // "Aug 5" / "Aug 5 2026" / "5 Aug"
+  const monMatch = low.match(/^([a-z]{3,})\s+(\d{1,2})(?:[,\s]+(\d{4}))?$/) || low.match(/^(\d{1,2})\s+([a-z]{3,})(?:[,\s]+(\d{4}))?$/);
+  if (monMatch) {
+    let monStr, day, year;
+    if (isNaN(parseInt(monMatch[1], 10))) {
+      monStr = monMatch[1].slice(0, 3); day = parseInt(monMatch[2], 10); year = monMatch[3] ? parseInt(monMatch[3], 10) : now.getFullYear();
+    } else {
+      day = parseInt(monMatch[1], 10); monStr = monMatch[2].slice(0, 3); year = monMatch[3] ? parseInt(monMatch[3], 10) : now.getFullYear();
+    }
+    const month = MONTHS.indexOf(monStr);
+    if (month >= 0) {
+      const d = new Date(year, month, day);
+      if (!isNaN(d.getTime())) return isoDate(d);
+    }
+  }
+
+  // Slash dates: 5/12 or 5/12/2026 — month-first by default
+  const slashMatch = raw.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+  if (slashMatch) {
+    const month = parseInt(slashMatch[1], 10) - 1;
+    const day = parseInt(slashMatch[2], 10);
+    let year = slashMatch[3] ? parseInt(slashMatch[3], 10) : now.getFullYear();
+    if (year < 100) year += 2000;
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime())) return isoDate(d);
+  }
+
+  // last-ditch Date.parse
+  const fallback = Date.parse(raw);
+  if (!isNaN(fallback)) {
+    const d = new Date(fallback);
+    return opts.includeTime ? d.toISOString() : isoDate(d);
+  }
+  return null;
 }
 
-function FormulaCell({ formula, record }) {
-  const value = evalFormula(formula, record);
-  const { cls, text } = fmtCell(value, 'text');
+function startOfDay(d) { const x = new Date(d); x.setHours(0,0,0,0); return x; }
+function addDays(d, n)  { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+function isoDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// Friendly display: "Today" / "Yesterday" / "in 3d" / "May 28" with absolute on hover.
+function formatDateCell(value, opts = {}) {
+  if (value === undefined || value === null || value === '') return { text: '', title: '', tone: '' };
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return { text: '#date', title: String(value), tone: 'date-invalid' };
+
+  const now = new Date();
+  const startToday = startOfDay(now);
+  const dDay = startOfDay(d);
+  const diffDays = Math.round((dDay.getTime() - startToday.getTime()) / DAY_MS);
+
+  const fmt = opts.dateFormat || 'friendly';
+  const includeTime = opts.includeTime;
+  const sameYear = d.getFullYear() === now.getFullYear();
+  const absLabel = d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    year: sameYear ? undefined : 'numeric',
+    hour: includeTime ? '2-digit' : undefined,
+    minute: includeTime ? '2-digit' : undefined,
+  });
+  const isoLabel = d.toISOString();
+
+  let text;
+  if (fmt === 'iso') text = isoLabel;
+  else if (fmt === 'relative') text = relativeLabel(diffDays);
+  else { // friendly
+    if (diffDays === 0) text = includeTime ? `today, ${d.toLocaleTimeString(undefined, {hour:'2-digit',minute:'2-digit'})}` : 'today';
+    else if (diffDays === -1) text = 'yesterday';
+    else if (diffDays === 1)  text = 'tomorrow';
+    else if (diffDays >= -7 && diffDays < 0) text = `${-diffDays}d ago`;
+    else if (diffDays > 1 && diffDays <= 7) text = `in ${diffDays}d`;
+    else text = absLabel;
+  }
+
+  // tone — for conditional formatting
+  let tone = '';
+  if (diffDays < 0) tone = 'date-past';
+  else if (diffDays === 0) tone = 'date-today';
+  else if (diffDays <= 7) tone = 'date-soon';
+  else tone = 'date-future';
+
+  return { text, title: `${absLabel}  ·  ${isoLabel}`, tone };
+}
+function relativeLabel(diffDays) {
+  if (diffDays === 0) return 'today';
+  if (diffDays === -1) return 'yesterday';
+  if (diffDays === 1)  return 'tomorrow';
+  if (diffDays < 0) return `${-diffDays}d ago`;
+  return `in ${diffDays}d`;
+}
+
+// Duration field — stored as seconds. Display as "2h 30m" / "1d 4h" / "45m".
+function formatDuration(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (s === 0) return '0';
+  const d = Math.floor(s / 86400); const r1 = s % 86400;
+  const h = Math.floor(r1 / 3600); const r2 = r1 % 3600;
+  const m = Math.floor(r2 / 60);   const sec = r2 % 60;
+  const parts = [];
+  if (d) parts.push(d + 'd');
+  if (h) parts.push(h + 'h');
+  if (m) parts.push(m + 'm');
+  if (!d && !h && sec) parts.push(sec + 's');
+  return parts.length ? parts.join(' ') : '0';
+}
+function parseDuration(input) {
+  const raw = String(input).trim();
+  if (!raw) return 0;
+  // Plain number → minutes
+  if (/^-?\d+(\.\d+)?$/.test(raw)) return parseFloat(raw) * 60;
+  let total = 0;
+  raw.replace(/(\d+(?:\.\d+)?)\s*(d|h|m|s|day|hour|min|sec)/gi, (_, n, unit) => {
+    const x = parseFloat(n);
+    const u = unit[0].toLowerCase();
+    if (u === 'd') total += x * 86400;
+    else if (u === 'h') total += x * 3600;
+    else if (u === 'm') total += x * 60;
+    else if (u === 's') total += x;
+    return '';
+  });
+  return total;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Formula + rollup evaluation is delegated to window.Formula (formula.js).
+// Computed values are derived at render time from the current fold state —
+// nothing here writes to the log. The expression / rollup config lives in
+// _schema.fields.<set>.{formula | rollup} and is authored by room members.
+// ─────────────────────────────────────────────────────────────────────────
+
+function FormulaCell({ formula, record, state }) {
+  const r = (window.Formula && window.Formula.evaluate)
+    ? window.Formula.evaluate(formula, { record, state })
+    : { ok: false, value: null, error: 'formula.js not loaded' };
+  if (!r.ok) {
+    return (
+      <td className="cell formula has-error" title={`formula error · ${r.error}\n= ${formula || ''}`}>
+        <span className="em">#ERR</span>
+      </td>
+    );
+  }
+  const { cls, text } = fmtCell(r.value, typeof r.value === 'number' ? 'number' : 'text');
   return (
-    <td className={`cell formula ${cls}`} title={formula ? `= ${formula}` : 'formula · double-click the header in schema view to set'}>
+    <td className={`cell formula ${cls}`} title={formula ? `= ${formula}` : 'formula · set the expression in the schema view'}>
       {text}
     </td>
   );
 }
 
-function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsumed, onNavigate, readOnly }) {
+// Rollup cell — aggregates field values from linked records.
+//   cfg = { via: '<relation>', field?: '<name>', fn: 'sum'|'count'|'avg'|... }
+function RollupCell({ rollup, record, state }) {
+  if (!window.Formula?.evaluateRollup) {
+    return <td className="cell rollup-cell"><span className="em">rollup unavailable</span></td>;
+  }
+  const r = window.Formula.evaluateRollup(rollup || {}, { record, state });
+  const fn = (rollup?.fn || 'count').toLowerCase();
+  const titleParts = [`rollup · ${fn}(`];
+  if (rollup?.field) titleParts.push(rollup.field);
+  titleParts.push(`) via "${rollup?.via || '?'}"`);
+  if (!r.ok) {
+    return (
+      <td className="cell rollup-cell has-error" title={titleParts.join('') + `\n— ${r.error}`}>
+        <span className="em">#ERR</span>
+      </td>
+    );
+  }
+  const isCount = fn === 'count';
+  const cls = (typeof r.value === 'number' || isCount) ? 'num' : 'str';
+  const text = r.value === null || r.value === undefined || r.value === '' ? '—' : String(r.value);
+  return (
+    <td className={`cell rollup-cell ${cls}`} title={titleParts.join('')}>
+      <span className="roll-list">{text}</span>
+    </td>
+  );
+}
+
+function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsumed, onNavigate }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const inputRef = useRef(null);
@@ -85,7 +305,7 @@ function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsume
   }
 
   useEffect(() => {
-    if (shouldFocus && !editing && !readOnly) {
+    if (shouldFocus && !editing) {
       setDraft(draftFromValue(value));
       setEditing(true);
       if (onFocusConsumed) onFocusConsumed();
@@ -138,9 +358,6 @@ function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsume
   }
   const { cls, text } = fmtCell(value, type);
   const heatCls = heat ? heatClass(heat) : '';
-  if (readOnly) {
-    return <td className={`cell ${cls} ${heatCls} readonly`} title="materialized from the imported source · read-only">{text}</td>;
-  }
   return <td className={`cell ${cls} ${heatCls}`} onClick={startEdit} title={heat ? `${heat} write${heat===1?'':'s'} · click to edit` : 'click to edit · emits DEF'}>{text}</td>;
 }
 
@@ -191,7 +408,7 @@ function buildTable(entityType, state) {
   let cols;
   if (Array.isArray(schemaFields)) {
     const declared = new Set(schemaFields.map(f => f.name));
-    cols = schemaFields.map(f => ({ name: f.name, type: f.type, options: f.options, formula: f.formula, schematized: true }));
+    cols = schemaFields.map(f => ({ name: f.name, type: f.type, options: f.options, formula: f.formula, rollup: f.rollup, schematized: true }));
     // any data-only columns get appended
     const extras = new Set();
     for (const r of rows) {
@@ -261,38 +478,67 @@ function linksFromAnchor(anchor, otherType, state) {
 // ─────────────────────────────────────────────────────────────────────────
 
 function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showDDL, setSelection }) {
-  const built = useMemo(() => buildTable(entityType, state), [entityType, state]);
-
-  // Lazy-materialize rows from any import entity that produced this set.
-  // New imports emit a single INS (no per-row events); rows live in the
-  // source CSV blob and get parsed on demand here, then merged with any
-  // legacy per-row entities folded normally.
-  const imports = useMemo(
-    () => window.CsvImport?.importsForSet?.(state, entityType) || [],
-    [state, entityType]
-  );
-  const importsKey = imports.map(i => i._anchor).join('|');
-  const [materializedRows, setMaterializedRows] = useState([]);
-  useEffect(() => {
-    if (imports.length === 0) { setMaterializedRows([]); return; }
-    let cancelled = false;
-    Promise.all(imports.map(i => window.CsvImport.materializeImportRows(i)))
-      .then(arrays => { if (!cancelled) setMaterializedRows(arrays.flat()); })
-      .catch(e => { if (!cancelled) console.warn('[table-view] import materialization failed:', e); });
-    return () => { cancelled = true; };
-  }, [importsKey]);
-
-  const rows = useMemo(
-    () => materializedRows.length ? [...built.rows, ...materializedRows] : built.rows,
-    [built.rows, materializedRows]
-  );
-  const { cols, partitioned, partitionFromSchema } = built;
+  const { cols, rows, partitioned, partitionFromSchema } = useMemo(() => buildTable(entityType, state), [entityType, state]);
   const linkedTypes = useMemo(() => linkedTypesFor(entityType, state), [entityType, state]);
   const declaredInSchema = !!state.schema?.fields?.[entityType] || (state.schema?.tables || []).includes(entityType);
   const [heatOn, setHeatOn] = useState(false);
   const [showFormula, setShowFormula] = useState(false);
   // Header-rename mode for one column at a time. {oldName, draft}.
   const [renamingField, setRenamingField] = useState(null);
+  // Right-click column-type picker. {name, x, y} | null
+  const [colMenu, setColMenu] = useState(null);
+  const scrollRef = useRef(null);
+
+  // Close the col-type menu on Escape or outside click.
+  useEffect(() => {
+    if (!colMenu) return;
+    function onKey(e) { if (e.key === 'Escape') setColMenu(null); }
+    function onClick(e) { if (!e.target.closest('.col-type-menu')) setColMenu(null); }
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onClick);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onClick);
+    };
+  }, [colMenu]);
+
+  function changeFieldType(fieldName, newType) {
+    const existing = state.schema?.fields?.[entityType] || [];
+    const next = existing.map(f => {
+      if (f.name !== fieldName) return f;
+      const u = { ...f, type: newType };
+      if (newType !== 'select' && newType !== 'multiselect') delete u.options;
+      else if (!u.options) u.options = [];
+      if (newType !== 'formula') delete u.formula;
+      else if (typeof u.formula !== 'string') u.formula = '';
+      if (newType !== 'rollup') delete u.rollup;
+      else if (!u.rollup || typeof u.rollup !== 'object') u.rollup = { via: '', field: '', fn: 'count' };
+      return u;
+    });
+    onEmit(TV_OP.DEF, { anchor: null, path: `_schema.fields.${entityType}`, value: next });
+  }
+
+  // Set a single param (formula expression / rollup config / select options) on a field.
+  function patchField(fieldName, patch) {
+    const existing = state.schema?.fields?.[entityType] || [];
+    const next = existing.map(f => f.name === fieldName ? { ...f, ...patch } : f);
+    onEmit(TV_OP.DEF, { anchor: null, path: `_schema.fields.${entityType}`, value: next });
+    // keep colMenu in sync so the editor inside it stays responsive
+    setColMenu(m => m && m.name === fieldName ? { ...m, ...patch } : m);
+  }
+
+  // Rename a field (deferred under the hood — values stored under the old key would
+  // orphan, so we only allow rename when the field is empty across rows).
+  function renameField(oldName, newName) {
+    const trimmed = (newName || '').trim();
+    if (!trimmed || trimmed === oldName) return false;
+    const existing = state.schema?.fields?.[entityType] || [];
+    if (existing.some(f => f.name === trimmed && f.name !== oldName)) return false;
+    const updated = existing.map(f => f.name === oldName ? { ...f, name: trimmed } : f);
+    onEmit(TV_OP.DEF, { anchor: null, path: `_schema.fields.${entityType}`, value: updated });
+    setColMenu(m => m && m.name === oldName ? { ...m, name: trimmed } : m);
+    return true;
+  }
 
   // Cell-focus coordination for the airtable-style flow: a cell whose
   // {anchor, field} matches pendingFocus opens in edit mode on the next render.
@@ -310,7 +556,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     if (autoFocusedTablesRef.current.has(entityType)) return;
     if (rows.length !== 1 || cols.length === 0) return;
     const r = rows[0];
-    const editable = cols.filter(c => c.type !== 'formula');
+    const editable = cols.filter(c => c.type !== 'formula' && c.type !== 'rollup');
     if (editable.length === 0) return;
     const allEmpty = editable.every(c => {
       const v = r[c.name];
@@ -321,7 +567,8 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     setPendingFocus({ anchor: r._anchor, field: editable[0].name });
   }, [entityType, rows, cols]);
 
-  function addNewField() {
+  function addNewField(typeOverride) {
+    const type = typeOverride || 'text';
     const existing = state.schema?.fields?.[entityType] || [];
     const used = new Set(existing.map(f => f.name));
     let n = existing.length;
@@ -330,12 +577,27 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
       n += 1;
       placeholder = `Field ${n}`;
     } while (used.has(placeholder));
+    const newField = { name: placeholder, type };
+    if (type === 'select' || type === 'multiselect') newField.options = [];
+    if (type === 'formula') newField.formula = '';
+    if (type === 'rollup')  newField.rollup  = { via: '', field: '', fn: 'count' };
     onEmit(TV_OP.DEF, {
       anchor: null,
       path: `_schema.fields.${entityType}`,
-      value: [...existing, { name: placeholder, type: 'text' }],
+      value: [...existing, newField],
     });
     setRenamingField({ oldName: placeholder, draft: placeholder });
+    // Scroll the grid to its rightmost edge so the new column is visible.
+    requestAnimationFrame(() => {
+      const s = scrollRef.current;
+      if (s) s.scrollLeft = s.scrollWidth;
+    });
+  }
+
+  // Open the col-type menu in "creating" mode below the "+ add column" header.
+  function openAddColumnMenu(e) {
+    const r = e.currentTarget.getBoundingClientRect();
+    setColMenu({ creating: true, x: r.left - 220, y: r.bottom });
   }
 
   function commitRename() {
@@ -389,7 +651,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
 
   function nextEditableCol(startIdx, step) {
     for (let i = startIdx; i >= 0 && i < cols.length; i += step) {
-      if (cols[i].type !== 'formula') return i;
+      if (cols[i].type !== 'formula' && cols[i].type !== 'rollup') return i;
     }
     return -1;
   }
@@ -435,9 +697,12 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
 
   const allCols = [
     ...(showFormula ? [{ name: '_anchor', type: 'pk', isPk: true, schematized: true }] : []),
-    ...cols,
+    // derived columns (partition + linked) sit on the LEFT, so user-defined
+    // schema fields cluster on the right and new "+ add field" columns always
+    // appear at the rightmost edge of the grid.
     ...(partitioned ? [{ name: '_partition', type: 'partition', schematized: partitionFromSchema }] : []),
     ...linkedTypes.map(t => ({ name: t, type: 'linked', schematized: true })),
+    ...cols,
   ];
 
   // DDL string for the table header — only schema-declared fields counted as part of schema
@@ -473,13 +738,6 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
         </div>
         <div className="meta">
           {rows.length} row{rows.length!==1?'s':''}
-          <span className="pill">{cols.length} col{cols.length!==1?'s':''}</span>
-          {linkedTypes.length > 0 && <span className="pill">{linkedTypes.length} linked</span>}
-          <button
-            className={`heat-toggle ${showFormula ? 'on' : ''}`}
-            onClick={() => setShowFormula(o => !o)}
-            title="reveal _anchor — the content-addressed primary key, computed from INS payload"
-          >ƒ formula fields</button>
           <button
             className={`heat-toggle ${heatOn ? 'on' : ''}`}
             onClick={() => setHeatOn(o => !o)}
@@ -487,30 +745,42 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
           >heat map</button>
         </div>
       </div>
-      <div className="dbtable-scroll">
+      <div className="dbtable-scroll" ref={scrollRef}>
         <table className={`dbgrid ${heatOn ? 'heat-on' : ''}`}>
           <thead>
             <tr>
               {allCols.map(c => {
                 const cs = colStats[c.name];
                 const isFormula = c.type === 'formula';
+                const isRollup  = c.type === 'rollup';
                 const renameable = !c.isPk && c.type !== 'linked' && c.type !== 'partition';
                 // Only allow dblclick-rename on fields with no row data — renaming a
                 // populated field would orphan its values under the old key. Formula
-                // fields don't store row data, so they're always rename-safe.
-                const empty = isFormula || rows.every(r => r[c.name] === undefined || r[c.name] === null || r[c.name] === '');
+                // and rollup fields don't store row data, so they're always rename-safe.
+                const empty = isFormula || isRollup || rows.every(r => r[c.name] === undefined || r[c.name] === null || r[c.name] === '');
                 const dblRenameable = renameable && empty;
                 const isRenaming = renameable && renamingField?.oldName === c.name;
-                const showGlyph = c.isPk || isFormula;
+                const showGlyph = c.isPk || isFormula || isRollup;
+                const canEdit = !c.isPk && c.type !== 'linked' && c.type !== 'partition' && c.schematized !== false;
                 const headerTitle = c.isPk
                   ? '_anchor · formula field, derived from INS payload'
                   : isFormula
-                    ? (c.formula ? `formula: ${c.formula}` : 'formula field · set the expression in schema view')
-                    : (c.schematized === false ? 'in data but not in _schema' : (dblRenameable ? 'double-click to rename' : ''));
+                    ? (c.formula ? `formula: ${c.formula}` : 'formula field · click to set the expression')
+                    : isRollup
+                      ? (c.rollup?.via ? `rollup: ${c.rollup.fn || 'count'}(${c.rollup.field || ''}) via ${c.rollup.via}` : 'rollup field · click to set via / field / fn')
+                      : (c.schematized === false ? 'in data but not in _schema' : canEdit ? 'click to edit field · rename, change type, set params' : '');
+                const openMenu = (canEdit && !isRenaming) ? (e) => {
+                  // never hijack clicks inside the inline rename input
+                  if (e.target.tagName === 'INPUT') return;
+                  e.preventDefault();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  setColMenu({ name: c.name, currentType: c.type, options: c.options, formula: c.formula, rollup: c.rollup, x: r.left, y: r.bottom });
+                } : undefined;
                 return (
-                  <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''} ${showGlyph ? 'formula' : ''} ${isRenaming ? 'renaming' : ''}`}
+                  <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''} ${showGlyph ? 'formula' : ''} ${canEdit ? 'editable' : ''}`}
                       title={headerTitle}
-                      onDoubleClick={dblRenameable ? () => setRenamingField({ oldName: c.name, draft: c.name }) : undefined}>
+                      onClick={openMenu}
+                      onContextMenu={openMenu}>
                     {showGlyph && <span className="formula-glyph" title="formula field">ƒ </span>}
                     {isRenaming ? (
                       <input
@@ -526,17 +796,15 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                         }}
                       />
                     ) : c.name}
-                    {c.type !== 'pk' && c.type !== 'linked' && c.type !== 'partition' && <span className="ty">{sqlType(c.type)}</span>}
-                    {c.type === 'linked' && <span className="ty">LINK</span>}
-                    {c.type === 'partition' && <span className="ty">TEXT</span>}
+                    {!c.isPk && <span className="ty" title={sqlType(c.type)}><i className={`ph ph-${iconForType(c.type)}`} aria-hidden="true"></i></span>}
                     {heatOn && cs && cs.avg > 0 && (
                       <span className="rev" title={`${cs.total} writes total · max ${cs.max} on one row`}> · {cs.avg.toFixed(1)} avg</span>
                     )}
                   </th>
                 );
               })}
-              <th className="add-col" title="add a text field · double-click any header to rename">
-                <button className="add-col-btn" onClick={addNewField} title="add a text field · double-click the header to rename">+</button>
+              <th className="add-col" title="add a column · pick a field type">
+                <button className="add-col-btn" onClick={openAddColumnMenu} title="add a column · pick a field type">+</button>
               </th>
             </tr>
           </thead>
@@ -556,9 +824,26 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     title="view this entity's timeline"
                   >{r._anchor}</td>
                 )}
+                {partitioned && (
+                  <EditableCell
+                    value={state.partitions[r._anchor]}
+                    type="text"
+                    heat={0}
+                    onCommit={(v) => commitPartition(r._anchor, v)}
+                  />
+                )}
+                {linkedTypes.map(t => (
+                  <LinkedCell
+                    key={t}
+                    links={linksFromAnchor(r._anchor, t, state)}
+                    onJump={onJump}
+                  />
+                ))}
                 {cols.map((c, cIdx) => (
                   c.type === 'formula' ? (
-                    <FormulaCell key={c.name} formula={c.formula} record={r} />
+                    <FormulaCell key={c.name} formula={c.formula} record={r} state={state} />
+                  ) : c.type === 'rollup' ? (
+                    <RollupCell key={c.name} rollup={c.rollup} record={r} state={state} />
                   ) : (
                     <EditableCell
                       key={c.name}
@@ -569,25 +854,8 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                       shouldFocus={pendingFocus?.anchor === r._anchor && pendingFocus?.field === c.name}
                       onFocusConsumed={() => setPendingFocus(null)}
                       onNavigate={(dir) => navigate(rIdx, cIdx, dir)}
-                      readOnly={!!r._materialized}
                     />
                   )
-                ))}
-                {partitioned && (
-                  <EditableCell
-                    value={state.partitions[r._anchor]}
-                    type="text"
-                    heat={0}
-                    onCommit={(v) => commitPartition(r._anchor, v)}
-                    readOnly={!!r._materialized}
-                  />
-                )}
-                {linkedTypes.map(t => (
-                  <LinkedCell
-                    key={t}
-                    links={linksFromAnchor(r._anchor, t, state)}
-                    onJump={onJump}
-                  />
                 ))}
                 <td className="cell add-col-spacer" title="open this row's timeline" onClick={() => setSelection && setSelection({
                   kind: 'slice',
@@ -603,7 +871,9 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             {heatOn && rows.length > 0 && (
               <tr className="heat-summary">
                 {showFormula && <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}>avg writes</td>}
-                {!showFormula && cols.length > 0 && <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}></td>}
+                {partitioned && <td className="cell"></td>}
+                {linkedTypes.map(t => <td key={t} className="cell hs-link"></td>)}
+                {!showFormula && cols.length > 0 && !partitioned && linkedTypes.length === 0 && <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}></td>}
                 {cols.map((c, i) => {
                   const cs = colStats[c.name] || { avg: 0, max: 0 };
                   const pct = Math.min(cs.max / 10 * 100, 100);
@@ -616,8 +886,6 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     </td>
                   );
                 })}
-                {partitioned && <td className="cell"></td>}
-                {linkedTypes.map(t => <td key={t} className="cell"></td>)}
                 <td className="cell"></td>
               </tr>
             )}
@@ -640,12 +908,342 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
           </tbody>
         </table>
       </div>
+      {colMenu && (
+        <div className="col-type-menu" style={{ left: colMenu.x, top: colMenu.y }} role="menu" onClick={(e) => e.stopPropagation()}>
+          <div className="col-type-menu-head">
+            <span className="ctm-eyebrow">{colMenu.creating ? 'new column · pick a type' : 'edit column'}</span>
+            {!colMenu.creating && (
+              <input
+                autoFocus
+                className="ctm-name-input"
+                defaultValue={colMenu.name}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    if (renameField(colMenu.name, e.target.value)) setColMenu(null);
+                  } else if (e.key === 'Escape') {
+                    setColMenu(null);
+                  }
+                }}
+                onBlur={(e) => {
+                  if (e.target.value.trim() && e.target.value.trim() !== colMenu.name) {
+                    renameField(colMenu.name, e.target.value);
+                  }
+                }}
+                placeholder="field name"
+              />
+            )}
+          </div>
+
+          {/* Type picker */}
+          <div className="ctm-section-label">type</div>
+          {FIELD_TYPES.map(ft => (
+            <button
+              key={ft.value}
+              className={`col-type-menu-row ${ft.value === colMenu.currentType ? 'on' : ''}`}
+              onClick={() => {
+                if (colMenu.creating) {
+                  addNewField(ft.value);
+                  setColMenu(null);
+                } else if (ft.value !== colMenu.currentType) {
+                  changeFieldType(colMenu.name, ft.value);
+                  // keep menu open so user can immediately set params
+                  setColMenu(m => m && ({ ...m, currentType: ft.value }));
+                }
+              }}
+              title={ft.hint}
+            >
+              <i className={`ctm-icon ph ph-${ft.icon}`} aria-hidden="true"></i>
+              <span className="ctm-label">{ft.label}</span>
+              <span className="ctm-hint">{ft.hint}</span>
+            </button>
+          ))}
+
+          {/* Params editor — only when not in creating mode and type has params */}
+          {!colMenu.creating && (colMenu.currentType === 'formula' || colMenu.currentType === 'rollup' || colMenu.currentType === 'select' || colMenu.currentType === 'multiselect') && (
+            <ColMenuParams
+              menu={colMenu}
+              state={state}
+              entityType={entityType}
+              linkedTypes={linkedTypes}
+              onPatch={(patch) => patchField(colMenu.name, patch)}
+            />
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
 function sqlType(t) {
   return { text: 'TEXT', number: 'INTEGER', boolean: 'BOOLEAN', json: 'JSONB', select: 'TEXT', multiselect: 'TEXT[]', longtext: 'TEXT', date: 'TIMESTAMP', url: 'TEXT', email: 'TEXT', partition: 'TEXT', linked: 'LINK', formula: 'FORMULA' }[t] || 'TEXT';
+}
+
+// Short docs for the most commonly used functions (used by the autocomplete
+// popover when a suggestion is hovered/active). Falls back to empty hint.
+const FORMULA_HINTS = {
+  SUM: 'SUM(num, …) → total', AVG: 'AVG(num, …)', AVERAGE: 'AVERAGE(num, …)',
+  MIN: 'MIN(num, …)', MAX: 'MAX(num, …)', COUNT: 'COUNT(num, …)', COUNTA: 'COUNTA(any, …)',
+  ROUND: 'ROUND(n, digits=0)', ROUNDUP: 'ROUNDUP(n, digits=0)', ROUNDDOWN: 'ROUNDDOWN(n, digits=0)',
+  ABS: 'ABS(n)', FLOOR: 'FLOOR(n)', CEIL: 'CEIL(n)', CEILING: 'CEILING(n)', INT: 'INT(n)',
+  POW: 'POW(base, exp)', POWER: 'POWER(base, exp)', SQRT: 'SQRT(n)', MOD: 'MOD(a, b)', EXP: 'EXP(n)', LOG: 'LOG(n, base=10)',
+  IF: 'IF(cond, then, else)', AND: 'AND(a, …) → all truthy',
+  OR: 'OR(a, …) → any truthy', NOT: 'NOT(x)', BLANK: 'BLANK(v)',
+  IFERROR: 'IFERROR(value, fallback)', SWITCH: 'SWITCH(expr, key, val, …, default?)',
+  CONCAT: 'CONCAT(a, …)', CONCATENATE: 'CONCATENATE(a, …)',
+  LEN: 'LEN(str)', LOWER: 'LOWER(str)', UPPER: 'UPPER(str)', TRIM: 'TRIM(str)',
+  LEFT: 'LEFT(str, n)', RIGHT: 'RIGHT(str, n)', MID: 'MID(str, start, count)',
+  FIND: 'FIND(needle, hay, start=0) → 1-indexed', SEARCH: 'SEARCH(needle, hay) → case-insensitive',
+  SUBSTITUTE: 'SUBSTITUTE(str, find, rep, [index])', REPLACE: 'REPLACE(str, find, rep)',
+  REPT: 'REPT(str, n)', T: 'T(value) → str or blank',
+  ENCODE_URL_COMPONENT: 'ENCODE_URL_COMPONENT(str)',
+  REGEX_MATCH: 'REGEX_MATCH(str, pattern) → bool', REGEX_EXTRACT: 'REGEX_EXTRACT(str, pattern)',
+  REGEX_REPLACE: 'REGEX_REPLACE(str, pattern, rep)',
+  TODAY: 'TODAY() → YYYY-MM-DD', NOW: 'NOW() → ISO timestamp',
+  YEAR: 'YEAR(date)', MONTH: 'MONTH(date)', DAY: 'DAY(date)',
+  HOUR: 'HOUR(date)', MINUTE: 'MINUTE(date)', SECOND: 'SECOND(date)', WEEKDAY: 'WEEKDAY(date) → 0..6',
+  DATEADD: 'DATEADD(date, n, "days"|"hours"|…)',
+  DATETIME_DIFF: 'DATETIME_DIFF(a, b, unit="days")',
+  DATETIME_FORMAT: 'DATETIME_FORMAT(date, "YYYY-MM-DD HH:mm")',
+  RECORD_ID: 'RECORD_ID() → this row\'s _anchor',
+  CREATED_TIME: 'CREATED_TIME() → row created ts',
+  LAST_MODIFIED_TIME: 'LAST_MODIFIED_TIME() → last update ts',
+};
+
+function FormulaEditor({ value, entityType, state, onCommit }) {
+  const taRef = React.useRef(null);
+  const [draft, setDraft] = React.useState(value || '');
+  // Open suggestions popover. {kind: 'fn'|'field', items: string[], idx: number}
+  const [sugg, setSugg] = React.useState(null);
+
+  React.useEffect(() => { setDraft(value || ''); }, [value]);
+
+  const FUNCS = window.Formula?.FUNCTIONS || [];
+  const HELPERS = ['RECORD_ID', 'CREATED_TIME', 'LAST_MODIFIED_TIME', 'TRUE', 'FALSE', 'NULL', 'PI', 'E'];
+  const ALL_IDENTS = [...FUNCS, ...HELPERS];
+  const fields = (state.schema?.fields?.[entityType] || []).map(f => f.name);
+
+  // Recompute suggestions every time the textarea content changes or caret moves.
+  function recomputeSuggestions() {
+    const ta = taRef.current;
+    if (!ta) return;
+    const text = ta.value;
+    const pos = ta.selectionStart;
+    const before = text.slice(0, pos);
+
+    // 1. Inside an unclosed {…} → field name
+    const openBrace = before.lastIndexOf('{');
+    const closeBrace = before.lastIndexOf('}');
+    if (openBrace > closeBrace) {
+      const frag = before.slice(openBrace + 1).toLowerCase();
+      const items = fields.filter(f => f.toLowerCase().includes(frag));
+      if (items.length) { setSugg({ kind: 'field', items, idx: 0, start: openBrace + 1 }); return; }
+      setSugg(null);
+      return;
+    }
+    // 2. Trailing word that looks like an identifier → function/helper
+    const m = before.match(/[A-Za-z_][A-Za-z0-9_]*$/);
+    if (m && m[0].length >= 1) {
+      const frag = m[0].toUpperCase();
+      // Prefix match first, then substring fallback
+      const prefix = ALL_IDENTS.filter(n => n.startsWith(frag));
+      const subs   = ALL_IDENTS.filter(n => !n.startsWith(frag) && n.includes(frag));
+      const items = [...prefix, ...subs].slice(0, 10);
+      if (items.length) { setSugg({ kind: 'fn', items, idx: 0, start: pos - m[0].length, end: pos }); return; }
+    }
+    setSugg(null);
+  }
+
+  function applySuggestion(s, item) {
+    const ta = taRef.current;
+    if (!ta) return;
+    const text = ta.value;
+    let newText, caret;
+    if (s.kind === 'field') {
+      // Replace from s.start (after '{') to current caret with the chosen name, close with `}`
+      const pos = ta.selectionStart;
+      const before = text.slice(0, s.start);
+      const after = text.slice(pos);
+      // Auto-add closing brace if there isn't one already
+      const trailing = after.startsWith('}') ? '' : '}';
+      newText = before + item + trailing + after;
+      caret = (before + item + (trailing ? '}' : '')).length;
+    } else {
+      // Function — replace identifier, then add "(" and place caret inside
+      const before = text.slice(0, s.start);
+      const after = text.slice(s.end);
+      newText = before + item + '(' + after;
+      caret = (before + item + '(').length;
+    }
+    setDraft(newText);
+    setSugg(null);
+    requestAnimationFrame(() => {
+      ta.value = newText;
+      ta.focus();
+      ta.setSelectionRange(caret, caret);
+    });
+  }
+
+  function onKeyDown(e) {
+    if (sugg) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setSugg(s => ({ ...s, idx: (s.idx + 1) % s.items.length })); return; }
+      if (e.key === 'ArrowUp')   { e.preventDefault(); setSugg(s => ({ ...s, idx: (s.idx - 1 + s.items.length) % s.items.length })); return; }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        applySuggestion(sugg, sugg.items[sugg.idx]);
+        return;
+      }
+      if (e.key === 'Escape') { e.preventDefault(); setSugg(null); return; }
+    }
+    if ((e.key === 'Enter' && (e.metaKey || e.ctrlKey)) || (e.key === 'Enter' && !sugg && e.shiftKey === false)) {
+      if (e.metaKey || e.ctrlKey) { e.preventDefault(); commit(); }
+    }
+  }
+
+  function commit() {
+    if (draft !== (value || '')) onCommit(draft);
+  }
+
+  return (
+    <div className="ctm-params">
+      <div className="ctm-section-label">formula</div>
+      <div className="ctm-formula-wrap">
+        <textarea
+          ref={taRef}
+          className="ctm-formula"
+          value={draft}
+          placeholder="UPPER({Name})  ·  {price} * {qty}  ·  IF({done}, 'shipped', 'wip')"
+          rows={3}
+          spellCheck={false}
+          onChange={(e) => { setDraft(e.target.value); recomputeSuggestions(); }}
+          onClick={recomputeSuggestions}
+          onKeyUp={(e) => {
+            // Reposition popover after arrow nav inside textarea
+            if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) recomputeSuggestions();
+          }}
+          onKeyDown={onKeyDown}
+          onBlur={commit}
+        />
+        {sugg && sugg.items.length > 0 && (
+          <div className="ctm-suggest" role="listbox">
+            {sugg.items.map((it, i) => (
+              <button
+                key={it}
+                className={`ctm-suggest-row ${i === sugg.idx ? 'active' : ''}`}
+                onMouseDown={(e) => { e.preventDefault(); applySuggestion(sugg, it); }}
+              >
+                <i className={`ph ph-${sugg.kind === 'field' ? 'brackets-curly' : 'function'}`} aria-hidden="true"></i>
+                <span className="cs-name">{it}</span>
+                {sugg.kind === 'fn' && <span className="cs-hint">{FORMULA_HINTS[it] || ''}</span>}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="ctm-hint-line">
+        type <code>{'{'}</code> for fields · letters for functions · ↑↓ to nav · ⏎/⇥ to accept · ⌘/Ctrl+⏎ to save
+      </div>
+    </div>
+  );
+}
+
+// Inline params editor that lives inside the column popover.
+// Formula → autocompleting editor  ·  Rollup → 3 selects  ·  Select/Multiselect → chips + add
+function ColMenuParams({ menu, state, entityType, linkedTypes, onPatch }) {
+  const t = menu.currentType;
+  if (t === 'formula') {
+    return (
+      <FormulaEditor
+        value={menu.formula || ''}
+        entityType={entityType}
+        state={state}
+        onCommit={(v) => onPatch({ formula: v })}
+      />
+    );
+  }
+
+  if (t === 'rollup') {
+    const cfg = menu.rollup || { via: '', field: '', fn: 'count' };
+    const relations = linkedTypes.length
+      ? (state.schema?.links || [])
+          .filter(l => l.from === entityType || l.to === entityType)
+          .map(l => l.rel)
+          .filter((r, i, a) => a.indexOf(r) === i)
+      : [];
+    // candidate fields = fields on the LINKED entity types
+    const linkedTypeNames = new Set();
+    for (const l of (state.schema?.links || [])) {
+      if (l.from === entityType) linkedTypeNames.add(l.to);
+      if (l.to === entityType)   linkedTypeNames.add(l.from);
+    }
+    const linkedFields = new Set();
+    for (const tn of linkedTypeNames) {
+      for (const f of (state.schema?.fields?.[tn] || [])) {
+        if (f.type !== 'linked' && f.type !== 'partition') linkedFields.add(f.name);
+      }
+    }
+    const FNS = window.Formula?.ROLLUP_FNS || ['count', 'sum', 'avg', 'min', 'max', 'list'];
+    return (
+      <div className="ctm-params">
+        <div className="ctm-section-label">rollup</div>
+        <div className="ctm-rollup-grid">
+          <label>via</label>
+          <select value={cfg.via || ''} onChange={(e) => onPatch({ rollup: { ...cfg, via: e.target.value } })}>
+            <option value="">(pick a relation)</option>
+            {relations.map(r => <option key={r} value={r}>{r}</option>)}
+          </select>
+          <label>fn</label>
+          <select value={cfg.fn || 'count'} onChange={(e) => onPatch({ rollup: { ...cfg, fn: e.target.value } })}>
+            {FNS.map(f => <option key={f} value={f}>{f}</option>)}
+          </select>
+          {(cfg.fn !== 'count' && cfg.fn !== 'list') && (
+            <>
+              <label>field</label>
+              <select value={cfg.field || ''} onChange={(e) => onPatch({ rollup: { ...cfg, field: e.target.value } })}>
+                <option value="">(pick a field)</option>
+                {[...linkedFields].sort().map(fn => <option key={fn} value={fn}>{fn}</option>)}
+              </select>
+            </>
+          )}
+        </div>
+        {relations.length === 0 && (
+          <div className="ctm-hint-line">no link relations on this set yet — add one in the schema view first.</div>
+        )}
+      </div>
+    );
+  }
+
+  if (t === 'select' || t === 'multiselect') {
+    const opts = menu.options || [];
+    const removeOption = (o) => onPatch({ options: opts.filter(x => x !== o) });
+    return (
+      <div className="ctm-params">
+        <div className="ctm-section-label">options</div>
+        <div className="ctm-chips">
+          {opts.map(o => (
+            <span key={o} className="ctm-chip">
+              {o}
+              <button className="ctm-chip-x" onClick={() => removeOption(o)} title="remove">×</button>
+            </span>
+          ))}
+          {opts.length === 0 && <span className="ctm-empty">no options yet</span>}
+        </div>
+        <input
+          className="ctm-option-input"
+          placeholder="type to add an option · enter to commit"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              const v = e.target.value.trim();
+              if (!v) return;
+              if (opts.includes(v)) return;
+              onPatch({ options: [...opts, v] });
+              e.target.value = '';
+            }
+          }}
+        />
+      </div>
+    );
+  }
+  return null;
 }
 
 function fmtAbsDate(ts) {
@@ -662,19 +1260,32 @@ function fmtRelTime(ts) {
 }
 
 // Standard field types — the type picker offers these.
+// `icon` is a Phosphor icon name (loaded via the @phosphor-icons/web script
+// in index.html); renders as <i class="ph ph-{icon}" />.
 const FIELD_TYPES = [
-  { value: 'text',        label: 'text',         hint: 'single-line string' },
-  { value: 'longtext',    label: 'long text',    hint: 'multi-line string'  },
-  { value: 'number',      label: 'number',       hint: 'integer or decimal' },
-  { value: 'boolean',     label: 'checkbox',     hint: 'true / false'        },
-  { value: 'select',      label: 'single-select',hint: 'one of a fixed enum'},
-  { value: 'multiselect', label: 'multi-select', hint: 'subset of an enum (REC: overwrite → append)' },
-  { value: 'date',        label: 'date',         hint: 'timestamp'           },
-  { value: 'url',         label: 'url',          hint: 'validated http(s)'   },
-  { value: 'email',       label: 'email',        hint: 'validated address'   },
-  { value: 'json',        label: 'json',         hint: 'arbitrary structured'},
-  { value: 'formula',     label: 'formula',      hint: 'read-only · e.g. RECORD_ID() or UPPER({Name})' },
+  { value: 'text',        label: 'text',         icon: 'text-aa',         hint: 'single-line string' },
+  { value: 'longtext',    label: 'long text',    icon: 'text-align-left', hint: 'multi-line string'  },
+  { value: 'number',      label: 'number',       icon: 'hash',            hint: 'integer or decimal' },
+  { value: 'boolean',     label: 'checkbox',     icon: 'check-square',    hint: 'true / false'        },
+  { value: 'select',      label: 'single-select',icon: 'circle',          hint: 'one of a fixed enum'},
+  { value: 'multiselect', label: 'multi-select', icon: 'list-checks',     hint: 'subset of an enum (REC: overwrite → append)' },
+  { value: 'date',        label: 'date',         icon: 'calendar-blank',  hint: 'timestamp'           },
+  { value: 'url',         label: 'url',          icon: 'link',            hint: 'validated http(s)'   },
+  { value: 'email',       label: 'email',        icon: 'envelope',        hint: 'validated address'   },
+  { value: 'json',        label: 'json',         icon: 'brackets-curly',  hint: 'arbitrary structured'},
+  { value: 'formula',     label: 'formula',      icon: 'function',        hint: 'read-only · e.g. RECORD_ID() or UPPER({Name})' },
+  { value: 'rollup',      label: 'rollup',       icon: 'sigma',           hint: 'aggregate values across linked records (sum / count / avg / …)' },
 ];
+
+// Phosphor icon for any column type (including derived: pk / linked / partition).
+function iconForType(t) {
+  const ft = FIELD_TYPES.find(f => f.value === t);
+  if (ft) return ft.icon;
+  if (t === 'pk') return 'key';
+  if (t === 'linked') return 'arrows-left-right';
+  if (t === 'partition') return 'kanban';
+  return 'text-aa';
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Per-table schema slice — renders the columns/links/partitions of one table
@@ -703,8 +1314,18 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
     if (c.linked) return 'link';
     if (c.partition) return 'partition';
     if (c.type === 'formula') return 'compute';
+    if (c.type === 'rollup')  return 'compute';
     if (c.type === 'multiselect') return 'append';
     return 'overwrite';
+  }
+
+  // Compact human-readable summary for a rollup config, used in the params cell.
+  function rollupSummary(cfg) {
+    if (!cfg || typeof cfg !== 'object') return '';
+    const fn = (cfg.fn || 'count').toLowerCase();
+    const via = cfg.via || '?';
+    if (fn === 'count' || fn === 'list') return `${fn}() via ${via}`;
+    return `${fn}(${cfg.field || '?'}) via ${via}`;
   }
 
   const rows = [
@@ -719,7 +1340,11 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
       schematized: c.schematized,
       options: c.options,
       formula: c.formula,
-      params: c.options ? c.options.join(', ') : (c.type === 'formula' ? (c.formula || '') : (c.type === 'json' ? 'arbitrary JSON' : '')),
+      rollup: c.rollup,
+      params: c.options ? c.options.join(', ')
+              : (c.type === 'formula' ? (c.formula || '')
+              : (c.type === 'rollup'  ? rollupSummary(c.rollup)
+              : (c.type === 'json'    ? 'arbitrary JSON' : ''))),
       editable: c.schematized,
     })),
     ...(partitioned ? [{
@@ -730,15 +1355,6 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
       params: partitions.length ? partitions.join(', ') : 'observed in data',
       editable: partitionFromSchema || !state.schema?.partitions?.[entityType],
     }] : []),
-    ...linkedTypes.map(t => ({
-      path: t, kind: 'link', rawType: 'linked', linkTo: t,
-      type: `LINK<${t}>`,
-      operator: 'link',
-      schematized: !!state.schema?.links,
-      params: links.filter(l => (l.from === entityType && l.to === t) || (l.to === entityType && l.from === t))
-        .map(l => l.rel).join(', ') || '(observed)',
-      editable: !!state.schema?.links,
-    })),
   ];
 
   function fieldsArray() { return state.schema?.fields?.[entityType] || []; }
@@ -797,6 +1413,11 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
 
   function setFieldFormula(fieldName, formula) {
     const next = fieldsArray().map(f => f.name === fieldName ? { ...f, formula } : f);
+    emitFields(next);
+  }
+
+  function setFieldRollup(fieldName, rollup) {
+    const next = fieldsArray().map(f => f.name === fieldName ? { ...f, rollup } : f);
     emitFields(next);
   }
 
@@ -908,16 +1529,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
         <section className="page-section">
           <div className="page-section-head">
             <h2 className="page-section-label">definition</h2>
-            <span className="page-section-sub">
-              {cols.length} field{cols.length !== 1 ? 's' : ''}
-              {linkedTypes.length > 0 && ` · ${linkedTypes.length} linked`}
-              {partitioned && ' · partitioned'}
-            </span>
-            <button
-              className={`heat-toggle schema-formula-toggle ${showFormula ? 'on' : ''}`}
-              onClick={() => setShowFormula(o => !o)}
-              title="reveal _anchor — the content-addressed primary key, computed from INS payload"
-            >ƒ formula fields</button>
+            {partitioned && <span className="page-section-sub">partitioned</span>}
           </div>
           <div className="dbtable schema-dbtable">
           <div className="dbtable-scroll">
@@ -1114,7 +1726,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
                 )}
 
                 {/* Add link row */}
-                {otherTables.length > 0 && (
+                {false && otherTables.length > 0 && (
                   <tr className="add-row schema-add-row">
                     <td className="cell">
                       <select
@@ -1193,7 +1805,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
 
 function canEditParams(r) {
   if (r.kind === 'field' && r.editable) {
-    return r.rawType === 'select' || r.rawType === 'multiselect' || r.rawType === 'formula';
+    return r.rawType === 'select' || r.rawType === 'multiselect' || r.rawType === 'formula' || r.rawType === 'rollup';
   }
   if (r.kind === 'partition' && r.editable) return true;
   return false;
@@ -1210,6 +1822,10 @@ function paramsLabel(r) {
     if (r.rawType === 'formula') {
       if (!r.formula) return <span style={{color:'var(--text-faint)',fontStyle:'italic'}}>(no formula — double-click · e.g. RECORD_ID())</span>;
       return <code style={{color:'var(--text-bright)'}}>{r.formula}</code>;
+    }
+    if (r.rawType === 'rollup') {
+      if (!r.rollup || !r.rollup.via) return <span style={{color:'var(--text-faint)',fontStyle:'italic'}}>(no rollup — double-click · e.g. sum(estimate_h) via blocks)</span>;
+      return <code style={{color:'var(--text-bright)'}}>{r.params}</code>;
     }
     return r.params || <span style={{color:'var(--text-faint)'}}>—</span>;
   }
