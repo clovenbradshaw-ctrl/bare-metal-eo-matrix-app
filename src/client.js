@@ -41,6 +41,8 @@ let _watchSyncUnsub = null;
 const QUIET_PATTERNS = [
   'does not have an m.room.create event',
   'No membership changes detected',
+  'Adding default global',            // push-rule setup noise on every login
+  'GroupCallEventHandler',            // call subsystem we disable anyway
 ];
 function makeQuietLogger() {
   const noop = () => {};
@@ -78,12 +80,15 @@ const SYNC_OPTS = {
   disablePresence: true,
 };
 
-// matrix-js-sdk spins up a MatrixRTCSession (Element-Call membership tracker)
-// for *every room in the account* and re-scans them on every sync — pure
-// overhead for a data app that has no calls. Tear it down right after
-// startClient. Safe: nothing in this app touches client.matrixRTC.
+// matrix-js-sdk spins up TWO call subsystems for *every room in the account*
+// and re-scans them on every sync — the newer MatrixRTCSession manager and the
+// older GroupCallEventHandler. Both are pure overhead for a data app with no
+// calls (the "[MatrixRTCSession … No membership changes detected]" /
+// "GroupCallEventHandler start()" spam). Tear both down right after
+// startClient. Safe: nothing in this app touches calls.
 function disableMatrixRTC(c) {
   try { c.matrixRTC?.stop?.(); } catch (e) { progress(`RTC disable skipped: ${e.message}`); }
+  try { c.groupCallEventHandler?.stop?.(); } catch (e) { progress(`GroupCall disable skipped: ${e.message}`); }
 }
 
 let progress = (msg) => console.log('[matrix]', msg);
@@ -588,6 +593,7 @@ export async function restoreSession(userId) {
   let sessionExpired = false;
   try {
     await client.startClient(SYNC_OPTS);
+    disableMatrixRTC(client);
     if (_watchSyncUnsub) _watchSyncUnsub();
     _watchSyncUnsub = watchSync(client);
     // Best-effort wait for sync — short timeout so offline boots fast.
