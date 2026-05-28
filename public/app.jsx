@@ -407,21 +407,125 @@ function useLiveStore(enabled, currentRoomId) {
   }, [enabled, ML, currentRoomId, tick]);
 
   if (!enabled || !ML) {
-    return { byRoom: {}, rooms: [], emit: null, createRoom: null };
+    return { byRoom: {}, committedByRoom: {}, rooms: [], emit: null, createRoom: null };
   }
 
   const rooms = ML.listRooms();
   const byRoom = {};
+  const committedByRoom = {};
   for (const r of rooms) {
-    byRoom[r.id] = currentRoomId === r.id ? ML.getEventsForRoom(r.id) : [];
+    // Only the active room is folded by the UI, so only it needs its events
+    // materialized. We surface the committed (append-only) prefix and the
+    // merged list separately so the fold can cache the committed prefix and
+    // re-derive only the small, volatile pending tail each render.
+    if (currentRoomId === r.id) {
+      committedByRoom[r.id] = ML.getCommittedForRoom?.(r.id) ?? ML.getEventsForRoom(r.id);
+      byRoom[r.id] = ML.getEventsForRoom(r.id);
+    } else {
+      committedByRoom[r.id] = [];
+      byRoom[r.id] = [];
+    }
   }
   return {
     byRoom,
+    committedByRoom,
     rooms,
     emit: (roomId, op, content) => ML.emit(roomId, op, content),
     createRoom: (name) => ML.createRoom(name),
     inviteUser: (roomId, userId) => ML.inviteUser(roomId, userId),
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Incremental fold
+//
+// Folding the whole event log on every edit is O(events) per keystroke —
+// fine for a demo, painful for a real room with one event per cell edit.
+// The committed log is strictly append-only, so we cache its fold and, on
+// the next render, extend the cached accumulator with only the new tail
+// (O(new events)). Pending (optimistic, not-yet-acked) events are small and
+// volatile, so they're folded fresh on top of a copy that leaves the cache
+// intact. Time-travel to a position behind the cache folds that prefix from
+// scratch without disturbing the warm live cache.
+// ─────────────────────────────────────────────────────────────────────────
+
+const EMPTY_EVENTS = [];
+
+// Shallow-copy a fold state's top-level containers. Inner entity objects are
+// shared — safe because nothing downstream mutates state, only the fold does,
+// and the fold only ever mutates through copies created here.
+function shallowCopyState(s) {
+  return {
+    entities: { ...s.entities },
+    partitions: { ...s.partitions },
+    connections: s.connections.slice(),
+    frames: s.frames.slice(),
+    schema: s.schema,
+    cursor: s.cursor,
+    _violations: s._violations.slice(),
+  };
+}
+
+// Anchors a pending event may mutate. Cloning just these entities before
+// folding pending keeps the cached committed state untouched.
+function pendingAnchors(ev) {
+  const c = ev && ev.content;
+  if (!c) return [];
+  const out = [];
+  if (c.anchor) out.push(c.anchor);
+  if (c.source_anchor) out.push(c.source_anchor);
+  if (c.target_anchor) out.push(c.target_anchor);
+  if (Array.isArray(c.input_anchors)) out.push(...c.input_anchors);
+  return out;
+}
+
+// Fold `pending` on top of the cached committed state `cs` without mutating
+// it: copy the containers, deep-copy only the entities pending will touch
+// (new entities pending creates are unshared already), then dispatch.
+function foldPendingOnto(ME, cs, pending) {
+  if (!pending || pending.length === 0) return cs;
+  const state = shallowCopyState(cs);
+  const touched = new Set();
+  for (const ev of pending) for (const a of pendingAnchors(ev)) touched.add(a);
+  for (const a of touched) {
+    if (state.entities[a]) state.entities[a] = structuredClone(state.entities[a]);
+  }
+  return pending.reduce(ME.dispatch, state);
+}
+
+// Return the fold of `committed[0..cc]`, reusing/extending `cache` when the
+// cached prefix is still valid (committed is append-only, checked by the
+// event_id at the cache boundary). Mutates `cache` only when extending the
+// live head; scrub-behind queries fold a fresh prefix and leave it alone.
+function foldCommitted(ME, cache, committed, cc, roomId) {
+  const ccLastId = cc > 0 ? committed[cc - 1].event_id : null;
+  const cacheUsable =
+    cache.state &&
+    cache.roomId === roomId &&
+    cache.count <= committed.length &&
+    (cache.count === 0 || committed[cache.count - 1]?.event_id === cache.lastId);
+
+  if (cacheUsable && cc >= cache.count) {
+    if (cc > cache.count) {
+      cache.state = committed.slice(cache.count, cc).reduce(ME.dispatch, cache.state);
+      cache.count = cc;
+      cache.lastId = ccLastId;
+    }
+    return cache.state;
+  }
+
+  if (cacheUsable && cc < cache.count) {
+    // Scrubbed behind the live head — fold this prefix fresh, keep cache warm.
+    return ME.fold(committed.slice(0, cc));
+  }
+
+  // Cold (room switch / first fold): rebuild and seed the cache at the head.
+  const fresh = ME.fold(committed.slice(0, cc));
+  cache.roomId = roomId;
+  cache.count = cc;
+  cache.lastId = ccLastId;
+  cache.state = fresh;
+  return fresh;
 }
 
 function App() {
@@ -494,7 +598,39 @@ function App() {
 
   useEffect(() => { if (live) setCursor(Infinity); }, [total]); // eslint-disable-line
 
-  const state = useMemo(() => ME.fold(allEvents.slice(0, effectiveCursor)), [allEvents, effectiveCursor]);
+  // Committed (append-only) prefix vs the small pending tail. allEvents is
+  // committed ++ pending, so the first `committedCount` events are committed.
+  // Demo mode has no pending — committed === allEvents.
+  const committed = (isLive ? (dataSource.committedByRoom?.[currentRoomId]) : allEvents) || EMPTY_EVENTS;
+  const committedCount = committed.length;
+  const cc = Math.min(effectiveCursor, committedCount);
+  const pendingPart = effectiveCursor > committedCount
+    ? allEvents.slice(committedCount, effectiveCursor)
+    : EMPTY_EVENTS;
+
+  // Incremental fold cache for the active room's committed log (see helpers
+  // above). Survives re-renders; rekeyed on room switch by foldCommitted.
+  const foldCacheRef = useRef({ roomId: null, count: 0, lastId: null, state: null });
+
+  // A cheap signature of everything the fold depends on. Only when it changes
+  // do we produce a new state object — so identity stays stable when nothing
+  // changed (keeping downstream memos warm), and folding extends the cache by
+  // just the new events otherwise.
+  const lastCommittedId = cc > 0 ? committed[cc - 1].event_id : '';
+  const pendingSig = pendingPart.length
+    ? pendingPart.map(e => e.event_id).join(',')
+    : '';
+  const foldSig = `${currentRoomId || ''}|${cc}|${lastCommittedId}|${pendingSig}`;
+
+  const state = useMemo(() => {
+    const committedState = foldCommitted(ME, foldCacheRef.current, committed, cc, currentRoomId);
+    if (pendingPart.length === 0) {
+      // No pending: hand back a fresh top-level object (new identity for React)
+      // that shares the cached inner state — never mutated downstream.
+      return shallowCopyState(committedState);
+    }
+    return foldPendingOnto(ME, committedState, pendingPart);
+  }, [foldSig]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Large CSV imports don't emit one event per row — a 10k-row sheet would
   // blow past Matrix's per-event size limit. The importer instead stores
