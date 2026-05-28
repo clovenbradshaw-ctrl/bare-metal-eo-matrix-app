@@ -573,6 +573,15 @@
    *
    * Source blobs are immutable, so we cache parsed results in-memory for
    * the page lifetime keyed by import anchor.
+   *
+   * Return contract: an array (possibly empty) means the source was read
+   * and parsed successfully — that result is cached. `null` means we could
+   * NOT materialize yet: the import entity's `file` ref hasn't folded in
+   * (it arrives as a separate DEF after the INS that carries the field
+   * plan), the media mirror is still syncing after a refresh, or the bytes
+   * couldn't be parsed. Callers should treat `null` as "retry later" and
+   * must not cache it — otherwise a transient miss right after a reload
+   * would hide the imported rows forever.
    */
   const importRowCache = new Map();
 
@@ -608,7 +617,7 @@
   }
 
   async function materializeImportRows(importEntity) {
-    if (!importEntity || !importEntity._anchor) return [];
+    if (!importEntity || !importEntity._anchor) return null;
     const cached = importRowCache.get(importEntity._anchor);
     if (cached) return cached;
 
@@ -616,35 +625,44 @@
     const ref = importEntity.file;
     const fieldPlan = importEntity.field_plan;
     const setName = importEntity.derived_set;
-    if (!ML?.readMedia || !ref || !Array.isArray(fieldPlan) || !setName) return [];
+    // `file` is DEF'd onto the entity after the INS that carries the field
+    // plan, so right after a refresh the ref may not have folded in yet.
+    // Returning null (not []) keeps the import retryable until it does.
+    if (!ML?.readMedia || !ref || !Array.isArray(fieldPlan) || !setName) return null;
 
     let bytes;
     try { bytes = await ML.readMedia(ref); }
-    catch (e) { console.warn('[csv-import] could not read source blob:', e); return []; }
-    if (!bytes) return [];
+    catch (e) { console.warn('[csv-import] could not read source blob:', e); return null; }
+    if (!bytes) return null;
 
     let text;
     if (typeof bytes === 'string')         text = bytes;
     else if (bytes instanceof Blob)        text = await bytes.text();
     else if (bytes instanceof Uint8Array)  text = new TextDecoder().decode(bytes);
     else if (bytes instanceof ArrayBuffer) text = new TextDecoder().decode(new Uint8Array(bytes));
-    else                                   return [];
+    else                                   return null;
 
     const isJson = importEntity.shape === 'json';
 
     let dataRows;
     if (isJson) {
       try { dataRows = parseJsonRows(text); }
-      catch (e) { console.warn('[csv-import] json parse failed:', e); return []; }
+      catch (e) { console.warn('[csv-import] json parse failed:', e); return null; }
     } else {
       let parsed;
       try { parsed = parseCSV(text); }
-      catch (e) { console.warn('[csv-import] parse failed:', e); return []; }
-      if (!Array.isArray(parsed) || parsed.length === 0) return [];
+      catch (e) { console.warn('[csv-import] parse failed:', e); return null; }
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        importRowCache.set(importEntity._anchor, []);
+        return [];
+      }
       const hasHeader = importEntity.has_header !== false;
       dataRows = hasHeader ? parsed.slice(1) : parsed;
     }
-    if (!Array.isArray(dataRows) || dataRows.length === 0) return [];
+    if (!Array.isArray(dataRows) || dataRows.length === 0) {
+      importRowCache.set(importEntity._anchor, []);
+      return [];
+    }
 
     const rows = dataRows.map((raw, i) => {
       const out = {
