@@ -615,14 +615,32 @@ async function openRoom(roomId) {
   enforceRoomCap();
 }
 
-function getEventsForRoom(roomId) {
-  const committed = roomEvents.get(roomId) || [];
+// Committed (server-acked) events only. This list is strictly append-only
+// per room — events are concatenated as they arrive and deduped, never
+// reordered or removed — which is exactly what lets the UI fold it
+// incrementally and cache the result. The array reference changes on
+// append, but the event_id at any given index never does.
+function getCommittedForRoom(roomId) {
+  return roomEvents.get(roomId) || [];
+}
+
+// Pending (optimistic, not-yet-acked) events for a room, ts-sorted. Small
+// and volatile: entries appear on emit and disappear on echo/reconcile, so
+// the UI folds these fresh on top of the cached committed state rather than
+// into the cache.
+function getPendingForRoom(roomId) {
   const pending = [];
   for (const { roomId: rid, event } of pendingByLocalId.values()) {
     if (rid === roomId) pending.push(event);
   }
-  if (pending.length === 0) return committed;
   pending.sort((a, b) => (a.origin_server_ts || 0) - (b.origin_server_ts || 0));
+  return pending;
+}
+
+function getEventsForRoom(roomId) {
+  const committed = getCommittedForRoom(roomId);
+  const pending = getPendingForRoom(roomId);
+  if (pending.length === 0) return committed;
   return committed.concat(pending);
 }
 
@@ -842,6 +860,8 @@ window.MatrixLive = {
   joinRoom,
   openRoom,
   getEventsForRoom,
+  getCommittedForRoom,
+  getPendingForRoom,
   emit,
   inviteUser,
   kickUser,

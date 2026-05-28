@@ -88,6 +88,19 @@ const off = registerEvictor('my-cache', () => myCache.clear() || true,
   persisted fold checkpoint (the `EventStore` already has the checkpoint
   primitives) — a larger change tracked as future work.
 
+## Folding is incremental (speed, not memory)
+
+The active room's state is derived by folding its event log. Re-folding the
+whole log on every edit is `O(events)` per keystroke, so the UI
+(`public/app.jsx`) caches the fold of the **append-only committed prefix**
+and extends the cached accumulator with only the new tail on each render
+(`O(new events)`). The small, volatile **pending** (optimistic) tail is
+folded fresh on top of a copy that leaves the cache intact, and
+time-travelling behind the live head folds that prefix from scratch without
+disturbing the warm cache. This is a CPU/latency win — the events still
+reside in memory, so the single-huge-room note above still stands; the
+persisted fold checkpoint is what would address that.
+
 ## Tuning
 
 Edit the constants in `src/main.js` (`MAX_OPEN_ROOMS`, `MEMORY_BUDGET_BYTES`)
