@@ -1268,6 +1268,25 @@ table.csv-preview tr:last-child td{border-bottom:none}
 .csv-import{padding:8px 18px;background:#000;border:1px solid #000;color:#fff;font-family:var(--mono);font-size:12px;cursor:pointer;font-weight:700;text-transform:lowercase;letter-spacing:.3px}
 .csv-import:hover:not(:disabled){background:#222}
 .csv-import:disabled{background:var(--text-faint);border-color:var(--text-faint);cursor:not-allowed}
+
+/* ── toast notifications ─────────────────────────────────────────── */
+.toast-host{position:fixed;right:16px;bottom:16px;z-index:9999;display:flex;flex-direction:column;gap:8px;max-width:360px;pointer-events:none}
+.toast{pointer-events:auto;display:flex;align-items:flex-start;gap:10px;padding:11px 12px;background:#fff;border:1px solid var(--border-strong);box-shadow:0 4px 16px rgba(0,0,0,.12);font-family:var(--mono);animation:toast-rise .14s ease}
+.toast-success{border-left:3px solid #1a7f37}
+.toast-error{border-left:3px solid var(--signal,#c0392b)}
+.toast-progress{border-left:3px solid var(--text-dim)}
+.toast-info{border-left:3px solid var(--text-bright)}
+@keyframes toast-rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.toast-glyph{flex:0 0 auto;font-size:13px;line-height:1.4;color:var(--text-dim);font-weight:700}
+.toast-success .toast-glyph{color:#1a7f37}
+.toast-error .toast-glyph{color:var(--signal,#c0392b)}
+.toast-glyph.spin{animation:toast-spin 1s linear infinite}
+@keyframes toast-spin{to{transform:rotate(360deg)}}
+.toast-body{flex:1 1 auto;min-width:0}
+.toast-title{font-size:12px;font-weight:700;color:var(--text-bright);text-transform:lowercase;letter-spacing:.2px}
+.toast-msg{font-size:11px;color:var(--text-dim);margin-top:2px;line-height:1.4;word-break:break-word}
+.toast-x{flex:0 0 auto;background:transparent;border:none;color:var(--text-faint);font-size:15px;line-height:1;cursor:pointer;padding:0 2px;font-family:inherit}
+.toast-x:hover{color:var(--text-bright)}
 </style>
 </head>
 <body>
@@ -1296,6 +1315,7 @@ table.csv-preview tr:last-child td{border-bottom:none}
 <script type="text/babel" data-presets="react" src="table-view.jsx"></script>
 <script type="text/babel" data-presets="react" src="graph-view.jsx"></script>
 <script type="text/babel" data-presets="react" src="app-view.jsx"></script>
+<script type="text/babel" data-presets="react" src="toast.jsx"></script>
 <script type="text/babel" data-presets="react" src="app.jsx"></script>
 </body>
 </html>

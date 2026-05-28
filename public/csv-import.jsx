@@ -616,9 +616,12 @@
     return coerce(value, type);
   }
 
-  async function materializeImportRows(importEntity) {
+  async function materializeImportRows(importEntity, onPhase) {
     if (!importEntity || !importEntity._anchor) return null;
     const anchor = importEntity._anchor;
+    // Optional progress hook so callers can surface what's happening
+    // (downloading the source blob, parsing it) without re-implementing it.
+    const phase = typeof onPhase === 'function' ? onPhase : () => {};
     const cached = importRowCache.get(anchor);
     if (cached) return cached;
 
@@ -661,10 +664,14 @@
     // Returning null (not []) keeps the import retryable until it does.
     if (!ML?.readMedia || !ref || !Array.isArray(fieldPlan) || !setName) return null;
 
+    phase('download', { name: importEntity.name || ref.name, size: ref.size, set: setName });
+
     let bytes;
     try { bytes = await ML.readMedia(ref); }
     catch (e) { console.warn('[csv-import] could not read source blob:', e); return null; }
     if (!bytes) return null;
+
+    phase('parse', { set: setName });
 
     let text;
     if (typeof bytes === 'string')         text = bytes;

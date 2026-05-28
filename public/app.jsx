@@ -4,6 +4,14 @@
 const { useState, useMemo, useEffect, useRef } = React;
 const ME = window.MatrixEngine;
 
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // In-memory event store · persisted for the demo session so spaces and
 // edits survive a reload (the real Matrix path persists on its own via
@@ -658,13 +666,42 @@ function App() {
         const a = imp._anchor;
         if (importRowsRef.current[a] || inFlightRef.current.has(a)) continue;
         inFlightRef.current.add(a);
+
+        // Notification id is stable per import so progress → done/fail
+        // updates the same toast rather than stacking new ones. `announced`
+        // tracks whether this attempt actually hit the network (vs. an
+        // instant OPFS-cache hit, which we don't bother announcing).
+        const toastId = `import:${a}`;
+        const label = imp.derived_set || 'table';
+        let announced = false;
+        const onPhase = (p, info) => {
+          if (p === 'download') {
+            announced = true;
+            const size = info?.size ? ` · ${fmtBytes(info.size)}` : '';
+            window.Toast?.push({
+              id: toastId, kind: 'progress',
+              title: `loading ${label}`,
+              message: `downloading ${info?.name || 'source file'}${size}…`,
+            });
+          } else if (p === 'parse' && announced) {
+            window.Toast?.update(toastId, { message: `parsing ${label}…` });
+          }
+        };
+
         try {
-          const rows = await CI.materializeImportRows(imp);
+          const rows = await CI.materializeImportRows(imp, onPhase);
           if (cancelled) return;
           if (Array.isArray(rows)) {
             // Successfully parsed (possibly to zero rows). Cache and render.
             importRowsRef.current[a] = rows;
             setImportRowsVersion(v => v + 1);
+            if (announced) {
+              window.Toast?.update(toastId, {
+                kind: 'success',
+                title: `${label} ready`,
+                message: `${rows.length.toLocaleString()} row${rows.length === 1 ? '' : 's'} loaded · cached locally`,
+              });
+            }
           } else {
             // Couldn't materialize yet — the import entity's `file` ref
             // hasn't folded in (it DEFs in after the INS), or the media
@@ -680,6 +717,18 @@ function App() {
                 () => setImportRowsVersion(v => v + 1),
                 Math.min(2000, 250 * n),
               ));
+            } else {
+              // Exhausted retries. If we ever started a download the source
+              // is unreachable (removed from the homeserver, offline, or the
+              // media endpoint rejected us); surface a sticky error so the
+              // rows aren't silently missing.
+              window.Toast?.update(toastId, {
+                kind: 'error', sticky: true,
+                title: `couldn't load ${label}`,
+                message: announced
+                  ? 'the source file could not be downloaded from the homeserver — it may have been removed, or you may be offline.'
+                  : 'waiting on this import to finish syncing — reload if it doesn\'t appear shortly.',
+              });
             }
           }
         } catch (e) {
@@ -875,6 +924,7 @@ function App() {
 
   return (
     <div className="shell" onClickCapture={onActivityCapture}>
+      {window.ToastHost && <window.ToastHost />}
       <div className="topbar">
         <window.IdentityChip
           session={session}
