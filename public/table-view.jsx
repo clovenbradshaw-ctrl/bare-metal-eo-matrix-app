@@ -395,6 +395,199 @@ function LinkedCell({ links, onJump }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Record detail side panel — pops out when a row is expanded.
+// Shows every field for one record (editable), plus its links and a jump
+// into the entity's full event timeline. Lives in the same DEF/SEG emit
+// path as the grid, so edits are identical writes to inline cell edits.
+// ─────────────────────────────────────────────────────────────────────────
+
+function DetailField({ value, type, onCommit }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const ref = useRef(null);
+
+  function draftFromValue(v) {
+    return v === undefined || v === null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+  }
+
+  useEffect(() => {
+    if (editing && ref.current) { ref.current.focus(); ref.current.select(); }
+  }, [editing]);
+
+  function startEdit() { setDraft(draftFromValue(value)); setEditing(true); }
+  function commit() {
+    setEditing(false);
+    let parsed = draft;
+    if (type === 'number') { const n = parseFloat(draft); if (!isNaN(n)) parsed = n; }
+    else if (type === 'json') { try { parsed = JSON.parse(draft); } catch {} }
+    if (parsed !== value) onCommit(parsed);
+  }
+
+  if (editing) {
+    if (type === 'longtext' || type === 'json') {
+      return (
+        <textarea
+          ref={ref}
+          className="rd-input rd-textarea"
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={e => {
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commit(); }
+            else if (e.key === 'Escape') setEditing(false);
+          }}
+        />
+      );
+    }
+    return (
+      <input
+        ref={ref}
+        className="rd-input"
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={e => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(); }
+          else if (e.key === 'Escape') setEditing(false);
+        }}
+      />
+    );
+  }
+  const { cls, text } = fmtCell(value, type);
+  const empty = value === undefined || value === null || value === '';
+  return (
+    <div
+      className={`rd-value ${cls} ${empty ? 'is-empty' : ''}`}
+      onClick={startEdit}
+      title="click to edit · emits DEF"
+    >{empty ? <span className="rd-empty">empty</span> : text}</div>
+  );
+}
+
+function RecordDetailPanel({
+  record, records, entityType, room, cols, partitioned, linkedTypes, state,
+  onClose, onCommitCell, onCommitPartition, onJump, onSelectRecord, onViewTimeline,
+}) {
+  // Escape closes the panel. Re-registered per record so it stays live.
+  useEffect(() => {
+    function onKey(e) { if (e.key === 'Escape') onClose(); }
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const idx = records.findIndex(r => r._anchor === record._anchor);
+  const prev = idx > 0 ? records[idx - 1] : null;
+  const next = idx >= 0 && idx < records.length - 1 ? records[idx + 1] : null;
+
+  // First text-ish field doubles as the record's display title.
+  const titleCol = cols.find(c => c.type !== 'formula' && c.type !== 'rollup');
+  const titleVal = titleCol ? record[titleCol.name] : undefined;
+  const title = (titleVal === undefined || titleVal === null || titleVal === '')
+    ? record._anchor : String(titleVal);
+
+  return (
+    <div className="record-detail-backdrop" onClick={onClose}>
+      <aside className="record-detail-panel" role="dialog" aria-label="record details" onClick={e => e.stopPropagation()}>
+        <header className="rd-head">
+          <div className="rd-head-top">
+            <span className="rd-eyebrow">{room?.title || 'workspace'} · {entityType}</span>
+            <div className="rd-head-nav">
+              <button className="rd-nav-btn" disabled={!prev} title="previous record" onClick={() => prev && onSelectRecord(prev._anchor)}>‹</button>
+              <span className="rd-nav-count">{idx >= 0 ? idx + 1 : '–'} / {records.length}</span>
+              <button className="rd-nav-btn" disabled={!next} title="next record" onClick={() => next && onSelectRecord(next._anchor)}>›</button>
+              <button className="rd-close" title="close · esc" onClick={onClose}>×</button>
+            </div>
+          </div>
+          <h2 className="rd-title" title={title}>{title}</h2>
+          <code className="rd-anchor" title="permanent anchor id">{record._anchor}</code>
+        </header>
+
+        <div className="rd-body">
+          {partitioned && (
+            <div className="rd-field">
+              <label className="rd-label">_partition <span className="rd-type">SEG</span></label>
+              <DetailField
+                value={state.partitions[record._anchor]}
+                type="text"
+                onCommit={(v) => onCommitPartition(record._anchor, v)}
+              />
+            </div>
+          )}
+
+          {linkedTypes.map(t => {
+            const links = linksFromAnchor(record._anchor, t, state);
+            return (
+              <div className="rd-field" key={`link-${t}`}>
+                <label className="rd-label">{t} <span className="rd-type">link</span></label>
+                {links.length === 0 ? (
+                  <div className="rd-value is-empty"><span className="rd-empty">no links</span></div>
+                ) : (
+                  <div className="link-pills rd-links">
+                    {links.map((l, i) => (
+                      <button key={i} className="link-pill" onClick={() => onJump(l.anchor, l.type)} title={`-[${l.rel}]→ ${l.anchor}`}>
+                        <span className="lp-rel">{l.dir === 'out' ? '→' : '←'}</span>
+                        <span className="lp-name">{l.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {cols.map(c => {
+            if (c.type === 'formula') {
+              const r = (window.Formula && window.Formula.evaluate)
+                ? window.Formula.evaluate(c.formula, { record, state })
+                : { ok: false, error: 'formula.js not loaded' };
+              const text = r.ok ? fmtCell(r.value, typeof r.value === 'number' ? 'number' : 'text').text : '#ERR';
+              return (
+                <div className="rd-field" key={c.name}>
+                  <label className="rd-label"><span className="rd-fglyph">ƒ</span> {c.name} <span className="rd-type">formula</span></label>
+                  <div className="rd-value rd-derived" title={c.formula ? `= ${c.formula}` : 'formula'}>{text}</div>
+                </div>
+              );
+            }
+            if (c.type === 'rollup') {
+              const r = window.Formula?.evaluateRollup
+                ? window.Formula.evaluateRollup(c.rollup || {}, { record, state })
+                : { ok: false };
+              const text = r.ok ? (r.value === null || r.value === undefined || r.value === '' ? '—' : String(r.value)) : '#ERR';
+              return (
+                <div className="rd-field" key={c.name}>
+                  <label className="rd-label"><span className="rd-fglyph">ƒ</span> {c.name} <span className="rd-type">rollup</span></label>
+                  <div className="rd-value rd-derived">{text}</div>
+                </div>
+              );
+            }
+            return (
+              <div className="rd-field" key={c.name}>
+                <label className="rd-label">{c.name} <span className="rd-type">{c.type}</span></label>
+                <DetailField
+                  value={record[c.name]}
+                  type={c.type}
+                  onCommit={(v) => onCommitCell(record._anchor, c.name, v)}
+                />
+              </div>
+            );
+          })}
+
+          {cols.length === 0 && (
+            <div className="rd-empty-state">no fields yet · add a field from the grid header</div>
+          )}
+        </div>
+
+        <footer className="rd-foot">
+          <button className="rd-timeline-btn" onClick={() => onViewTimeline(record._anchor)} title="replay every event that produced this record">
+            ⏚ view full timeline
+          </button>
+        </footer>
+      </aside>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Build a table model from the state for one entity type
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -487,6 +680,8 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   const [renamingField, setRenamingField] = useState(null);
   // Right-click column-type picker. {name, x, y} | null
   const [colMenu, setColMenu] = useState(null);
+  // Anchor of the record whose detail side panel is open, or null.
+  const [detailAnchor, setDetailAnchor] = useState(null);
   const scrollRef = useRef(null);
 
   // Close the col-type menu on Escape or outside click.
@@ -932,13 +1127,8 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     />
                   )
                 ))}
-                <td className="cell add-col-spacer" title="open this row's timeline" onClick={() => setSelection && setSelection({
-                  kind: 'slice',
-                  sliceId: `${entityType}.timeline.${r._anchor}`,
-                  sliceKind: 'timeline',
-                  tableId: entityType,
-                  entityAnchor: r._anchor,
-                })}>⏚</td>
+                <td className="cell add-col-spacer row-expand" title="expand record · view & edit all fields"
+                    onClick={() => setDetailAnchor(r._anchor)}>⤢</td>
               </tr>
               );
             })}
@@ -1049,6 +1239,37 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
           )}
         </div>
       )}
+      {detailAnchor && (() => {
+        const rec = rows.find(r => r._anchor === detailAnchor);
+        if (!rec) return null;
+        return (
+          <RecordDetailPanel
+            record={rec}
+            records={rows}
+            entityType={entityType}
+            room={room}
+            cols={cols}
+            partitioned={partitioned}
+            linkedTypes={linkedTypes}
+            state={state}
+            onClose={() => setDetailAnchor(null)}
+            onCommitCell={commitCell}
+            onCommitPartition={commitPartition}
+            onJump={onJump}
+            onSelectRecord={setDetailAnchor}
+            onViewTimeline={(anchor) => {
+              setDetailAnchor(null);
+              setSelection && setSelection({
+                kind: 'slice',
+                sliceId: `${entityType}.timeline.${anchor}`,
+                sliceKind: 'timeline',
+                tableId: entityType,
+                entityAnchor: anchor,
+              });
+            }}
+          />
+        );
+      })()}
     </div>
   );
 }
