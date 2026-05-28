@@ -351,6 +351,19 @@ async function ensureSecureBackup(password, userId) {
 
     progress(ssssOnServer ? 'Linking secure backup…' : 'Initializing secure backup…');
 
+    // Force a /keys/query for our own user so the public cross-signing
+    // identity is in the local store before we bootstrap. On the post-wipe
+    // re-login path the crypto store is fresh: bootstrapCrossSigning pulls
+    // the *private* keys out of SSSS, but importing them fails ("No public
+    // identity found … a /keys/query needs to be done") unless the matching
+    // *public* identity has already been downloaded. The initial sync alone
+    // doesn't guarantee that query has run, so we trigger it explicitly.
+    try {
+      await crypto.getUserDeviceInfo([userId], true);
+    } catch (e) {
+      progress(`Downloading identity keys: ${e.message}`);
+    }
+
     // Bootstrap cross-signing. If keys already exist on the server, this
     // pulls them out of SSSS into the local store (via getSecretStorageKey).
     // If they don't, it creates and uploads them; UIA below replays the
