@@ -667,6 +667,251 @@ function linksFromAnchor(anchor, otherType, state) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// View controls — sort / filter / hide columns. These are projection-local:
+// they reshape what THIS grid shows without writing anything to the log.
+// (Schema and data edits emit events; rearranging your own view does not.)
+// ─────────────────────────────────────────────────────────────────────────
+
+// Collapse the field-type zoo down to the handful of comparison behaviours the
+// sort/filter engine actually cares about.
+function filterKind(type) {
+  if (type === 'number' || type === 'duration') return 'number';
+  if (type === 'date') return 'date';
+  if (type === 'boolean') return 'boolean';
+  if (type === 'select') return 'select';
+  if (type === 'multiselect') return 'multiselect';
+  return 'text'; // text, longtext, url, email, json, formula, rollup, …
+}
+
+const FILTER_OPS = {
+  text:        ['contains', 'ncontains', 'eq', 'neq', 'empty', 'notempty'],
+  number:      ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'empty', 'notempty'],
+  date:        ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'empty', 'notempty'],
+  boolean:     ['true', 'false', 'empty', 'notempty'],
+  select:      ['eq', 'neq', 'empty', 'notempty'],
+  multiselect: ['contains', 'ncontains', 'empty', 'notempty'],
+};
+const OP_LABELS = {
+  contains: 'contains', ncontains: "doesn't contain",
+  eq: 'is', neq: 'is not', gt: '>', gte: '≥', lt: '<', lte: '≤',
+  empty: 'is empty', notempty: 'is not empty',
+  true: 'is checked', false: 'is unchecked',
+};
+// Operators that compare against nothing — no value box.
+const VALUELESS_OPS = new Set(['empty', 'notempty', 'true', 'false']);
+
+function isBlank(v) {
+  return v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0);
+}
+
+// Coerce a cell value into a comparable number for ordered operators / numeric
+// sorts; returns null when the side isn't comparable in that kind.
+function asComparable(v, kind) {
+  if (kind === 'number') {
+    const n = typeof v === 'number' ? v : parseFloat(v);
+    return isNaN(n) ? null : n;
+  }
+  if (kind === 'date') {
+    const t = v instanceof Date ? v.getTime() : Date.parse(v);
+    return isNaN(t) ? null : t;
+  }
+  return null;
+}
+
+function matchFilter(value, f, type) {
+  const kind = filterKind(type);
+  const op = f.op;
+  if (op === 'empty')    return isBlank(value);
+  if (op === 'notempty') return !isBlank(value);
+  if (op === 'true')     return !!value && value !== 'false';
+  if (op === 'false')    return !value || value === 'false';
+
+  const target = (f.value == null ? '' : String(f.value)).trim();
+  // A half-typed filter (operator chosen, no value yet) must not hide every row.
+  if (target === '') return true;
+
+  if (op === 'gt' || op === 'gte' || op === 'lt' || op === 'lte') {
+    const a = asComparable(value, kind);
+    const b = kind === 'date' ? Date.parse(target) : parseFloat(target);
+    if (a === null || isNaN(b)) return false;
+    if (op === 'gt')  return a >  b;
+    if (op === 'gte') return a >= b;
+    if (op === 'lt')  return a <  b;
+    return a <= b;
+  }
+
+  if (kind === 'number' && (op === 'eq' || op === 'neq')) {
+    const a = asComparable(value, 'number');
+    const b = parseFloat(target);
+    const eq = a !== null && !isNaN(b) && a === b;
+    return op === 'eq' ? eq : !eq;
+  }
+
+  // string-ish comparisons (case-insensitive); arrays (multiselect) flatten
+  const hay = Array.isArray(value) ? value.join(', ') : (value == null ? '' : String(value));
+  const h = hay.toLowerCase();
+  const t = target.toLowerCase();
+  if (op === 'contains')  return h.includes(t);
+  if (op === 'ncontains') return !h.includes(t);
+  if (op === 'eq')        return h === t;
+  if (op === 'neq')       return h !== t;
+  return true;
+}
+
+function compareValues(a, b, type) {
+  const kind = filterKind(type);
+  const aBlank = isBlank(a), bBlank = isBlank(b);
+  if (aBlank && bBlank) return 0;
+  if (aBlank) return 1;   // blanks sort last
+  if (bBlank) return -1;
+  if (kind === 'number' || kind === 'date') {
+    const na = asComparable(a, kind), nb = asComparable(b, kind);
+    if (na === null && nb === null) return 0;
+    if (na === null) return 1;
+    if (nb === null) return -1;
+    return na - nb;
+  }
+  const sa = Array.isArray(a) ? a.join(', ') : String(a);
+  const sb = Array.isArray(b) ? b.join(', ') : String(b);
+  return sa.localeCompare(sb, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+// Resolve the displayed value of a cell — including computed formula/rollup
+// fields — so sort & filter operate on what the user actually sees.
+function cellValue(record, col, state) {
+  if (!col) return undefined;
+  if (col.type === 'formula') {
+    const r = window.Formula?.evaluate ? window.Formula.evaluate(col.formula, { record, state }) : null;
+    return r && r.ok ? r.value : undefined;
+  }
+  if (col.type === 'rollup') {
+    const r = window.Formula?.evaluateRollup ? window.Formula.evaluateRollup(col.rollup || {}, { record, state }) : null;
+    return r && r.ok ? r.value : undefined;
+  }
+  return record[col.name];
+}
+
+// ── Toolbar dropdown panels ────────────────────────────────────────────────
+
+function FilterPanel({ cols, filters, setFilters }) {
+  const fields = cols.filter(c => c.name);
+  function addFilter() {
+    const first = fields[0];
+    if (!first) return;
+    const ops = FILTER_OPS[filterKind(first.type)];
+    setFilters(fs => [...fs, { id: `${Date.now()}-${Math.random()}`, field: first.name, op: ops[0], value: '' }]);
+  }
+  function update(id, patch) { setFilters(fs => fs.map(f => f.id === id ? { ...f, ...patch } : f)); }
+  function remove(id) { setFilters(fs => fs.filter(f => f.id !== id)); }
+  return (
+    <div className="tv-pop tv-pop-filter" role="dialog" onClick={e => e.stopPropagation()}>
+      <div className="tv-pop-head">filter rows <span className="tv-pop-sub">view-local · emits nothing</span></div>
+      {filters.length === 0 && <div className="tv-pop-empty">no filters · all rows shown</div>}
+      {filters.map((f, i) => {
+        const col = fields.find(c => c.name === f.field) || fields[0];
+        const kind = filterKind(col?.type || 'text');
+        const ops = FILTER_OPS[kind];
+        return (
+          <div className="tv-ctrl-row" key={f.id}>
+            <span className="tv-conj">{i === 0 ? 'where' : 'and'}</span>
+            <select className="tv-sel" value={f.field} onChange={e => {
+              const nc = fields.find(c => c.name === e.target.value);
+              const nops = FILTER_OPS[filterKind(nc?.type || 'text')];
+              update(f.id, { field: e.target.value, op: nops.includes(f.op) ? f.op : nops[0] });
+            }}>
+              {fields.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
+            </select>
+            <select className="tv-sel" value={f.op} onChange={e => update(f.id, { op: e.target.value })}>
+              {ops.map(o => <option key={o} value={o}>{OP_LABELS[o]}</option>)}
+            </select>
+            {!VALUELESS_OPS.has(f.op) && (
+              kind === 'select' && col?.options?.length
+                ? <select className="tv-sel tv-val" value={f.value} onChange={e => update(f.id, { value: e.target.value })}>
+                    <option value="">…</option>
+                    {col.options.map(o => <option key={o} value={o}>{o}</option>)}
+                  </select>
+                : <input
+                    className="tv-val-input"
+                    value={f.value}
+                    placeholder="value"
+                    type={kind === 'number' ? 'number' : kind === 'date' ? 'date' : 'text'}
+                    onChange={e => update(f.id, { value: e.target.value })}
+                  />
+            )}
+            <button className="tv-row-x" title="remove filter" onClick={() => remove(f.id)}>×</button>
+          </div>
+        );
+      })}
+      <button className="tv-add" onClick={addFilter} disabled={fields.length === 0}>+ add filter</button>
+    </div>
+  );
+}
+
+function SortPanel({ cols, sorts, setSorts }) {
+  const fields = cols.filter(c => c.name);
+  const used = new Set(sorts.map(s => s.field));
+  function addSort() {
+    const first = fields.find(c => !used.has(c.name)) || fields[0];
+    if (!first) return;
+    setSorts(ss => [...ss, { field: first.name, dir: 'asc' }]);
+  }
+  function update(i, patch) { setSorts(ss => ss.map((s, j) => j === i ? { ...s, ...patch } : s)); }
+  function remove(i) { setSorts(ss => ss.filter((_, j) => j !== i)); }
+  return (
+    <div className="tv-pop tv-pop-sort" role="dialog" onClick={e => e.stopPropagation()}>
+      <div className="tv-pop-head">sort rows <span className="tv-pop-sub">view-local · emits nothing</span></div>
+      {sorts.length === 0 && <div className="tv-pop-empty">no sorts · log order</div>}
+      {sorts.map((s, i) => (
+        <div className="tv-ctrl-row" key={i}>
+          <span className="tv-conj">{i === 0 ? 'by' : 'then'}</span>
+          <select className="tv-sel" value={s.field} onChange={e => update(i, { field: e.target.value })}>
+            {fields.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
+          </select>
+          <div className="tv-dir">
+            <button className={s.dir === 'asc' ? 'on' : ''} onClick={() => update(i, { dir: 'asc' })} title="ascending">↑</button>
+            <button className={s.dir === 'desc' ? 'on' : ''} onClick={() => update(i, { dir: 'desc' })} title="descending">↓</button>
+          </div>
+          <button className="tv-row-x" title="remove sort" onClick={() => remove(i)}>×</button>
+        </div>
+      ))}
+      <button className="tv-add" onClick={addSort} disabled={fields.length === 0}>+ add sort</button>
+    </div>
+  );
+}
+
+function HidePanel({ items, hidden, setHidden }) {
+  function toggle(key) {
+    setHidden(prev => {
+      const n = new Set(prev);
+      if (n.has(key)) n.delete(key); else n.add(key);
+      return n;
+    });
+  }
+  return (
+    <div className="tv-pop tv-pop-hide" role="dialog" onClick={e => e.stopPropagation()}>
+      <div className="tv-pop-head">
+        hide columns <span className="tv-pop-sub">view-local · emits nothing</span>
+      </div>
+      <div className="tv-hide-actions">
+        <button onClick={() => setHidden(new Set(items.map(it => it.key)))} disabled={items.length === 0}>hide all</button>
+        <button onClick={() => setHidden(new Set())}>show all</button>
+      </div>
+      {items.length === 0 && <div className="tv-pop-empty">no columns</div>}
+      {items.map(it => {
+        const isHidden = hidden.has(it.key);
+        return (
+          <button key={it.key} className={`tv-hide-row ${isHidden ? 'is-hidden' : ''}`} onClick={() => toggle(it.key)} title={isHidden ? 'click to show' : 'click to hide'}>
+            <i className={`ph ph-${isHidden ? 'eye-slash' : 'eye'}`} aria-hidden="true"></i>
+            <span className="tv-hide-name">{it.label}</span>
+            <span className="tv-hide-kind">{it.kind}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // One table
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -682,7 +927,25 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   const [colMenu, setColMenu] = useState(null);
   // Anchor of the record whose detail side panel is open, or null.
   const [detailAnchor, setDetailAnchor] = useState(null);
+  // View-local controls — none of these emit events; they only reshape the grid.
+  const [sorts, setSorts] = useState([]);       // [{ field, dir: 'asc'|'desc' }]
+  const [filters, setFilters] = useState([]);   // [{ id, field, op, value }]
+  const [hidden, setHidden] = useState(() => new Set()); // column keys: 'f:Name' | 'l:Type' | 'p:_partition'
+  const [toolPanel, setToolPanel] = useState(null); // 'filter' | 'sort' | 'hide' | null
   const scrollRef = useRef(null);
+
+  // Close any open toolbar dropdown on Escape or an outside click.
+  useEffect(() => {
+    if (!toolPanel) return;
+    function onKey(e) { if (e.key === 'Escape') setToolPanel(null); }
+    function onClick(e) { if (!e.target.closest('.tv-toolbar')) setToolPanel(null); }
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onClick);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onClick);
+    };
+  }, [toolPanel]);
 
   // Close the col-type menu on Escape or outside click.
   useEffect(() => {
@@ -743,6 +1006,10 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
 
   useEffect(() => {
     setPendingFocus(null);
+    setSorts([]);
+    setFilters([]);
+    setHidden(new Set());
+    setToolPanel(null);
   }, [entityType]);
 
   // When landing on a freshly-created table (one row, all fields empty),
@@ -795,6 +1062,41 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     setColMenu({ creating: true, x: r.left - 220, y: r.bottom });
   }
 
+  // ── View controls: hide → filter → sort ───────────────────────────────
+  // Columns the user can toggle off (field cols + derived link/partition cols).
+  const hideItems = [
+    ...(partitioned ? [{ key: 'p:_partition', label: '_partition', kind: 'partition' }] : []),
+    ...linkedTypes.map(t => ({ key: 'l:' + t, label: t, kind: 'link' })),
+    ...cols.map(c => ({ key: 'f:' + c.name, label: c.name, kind: c.type })),
+  ];
+  const hiddenCount = hideItems.filter(it => hidden.has(it.key)).length;
+  const showPartitionCol = partitioned && !hidden.has('p:_partition');
+  const visibleLinkedTypes = linkedTypes.filter(t => !hidden.has('l:' + t));
+  const visibleCols = cols.filter(c => !hidden.has('f:' + c.name));
+
+  // Filtered + sorted rows actually rendered. Filters/sorts read computed cell
+  // values (formula/rollup included) so the view matches what's on screen.
+  const displayRows = useMemo(() => {
+    let out = rows;
+    if (filters.length) {
+      out = out.filter(r => filters.every(f => {
+        const col = cols.find(c => c.name === f.field);
+        return matchFilter(cellValue(r, col, state), f, col?.type || 'text');
+      }));
+    }
+    if (sorts.length) {
+      out = [...out].sort((a, b) => {
+        for (const s of sorts) {
+          const col = cols.find(c => c.name === s.field);
+          const cmp = compareValues(cellValue(a, col, state), cellValue(b, col, state), col?.type || 'text');
+          if (cmp !== 0) return s.dir === 'desc' ? -cmp : cmp;
+        }
+        return 0;
+      });
+    }
+    return out;
+  }, [rows, filters, sorts, cols, state]);
+
   // ── Row virtualization ───────────────────────────────────────────────
   // A non-virtualized grid happily renders a few hundred rows, but a CSV
   // import can materialize tens of thousands — building that many <tr>s at
@@ -803,7 +1105,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   // rows above and below. Small tables take the simple path unchanged.
   const VIRTUAL_THRESHOLD = 200;
   const OVERSCAN = 12;
-  const virtualize = rows.length > VIRTUAL_THRESHOLD;
+  const virtualize = displayRows.length > VIRTUAL_THRESHOLD;
   const [rowH, setRowH] = useState(34);
   // `scrolled` is how far the row region has travelled up past the top of the
   // viewport; `viewportH` is the visible height of that viewport. Both are
@@ -844,7 +1146,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null;
     ro?.observe(vp);
     return () => { vp.removeEventListener('scroll', measure); ro?.disconnect(); };
-  }, [virtualize, rows.length]);
+  }, [virtualize, displayRows.length]);
 
   // Calibrate the row-height estimate from the first rendered data row.
   useEffect(() => {
@@ -855,15 +1157,15 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
 
   const vh = viewportH || 600;
   let startIdx = 0;
-  let endIdx = rows.length;
+  let endIdx = displayRows.length;
   if (virtualize) {
     startIdx = Math.max(0, Math.floor(scrolled / rowH) - OVERSCAN);
-    endIdx = Math.min(rows.length, startIdx + Math.ceil(vh / rowH) + OVERSCAN * 2);
+    endIdx = Math.min(displayRows.length, startIdx + Math.ceil(vh / rowH) + OVERSCAN * 2);
   }
-  const visibleRows = virtualize ? rows.slice(startIdx, endIdx) : rows;
+  const visibleRows = virtualize ? displayRows.slice(startIdx, endIdx) : displayRows;
   const padTop = virtualize ? startIdx * rowH : 0;
-  const padBottom = virtualize ? (rows.length - endIdx) * rowH : 0;
-  const spacerCols = (showFormula ? 1 : 0) + (partitioned ? 1 : 0) + linkedTypes.length + cols.length + 1;
+  const padBottom = virtualize ? (displayRows.length - endIdx) * rowH : 0;
+  const spacerCols = (showFormula ? 1 : 0) + (showPartitionCol ? 1 : 0) + visibleLinkedTypes.length + visibleCols.length + 1;
 
   function commitRename() {
     if (!renamingField) return;
@@ -914,9 +1216,11 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     return anchor;
   }
 
+  // Cell navigation walks the *visible, displayed* grid — hidden columns are
+  // skipped and row order follows the active sort/filter.
   function nextEditableCol(startIdx, step) {
-    for (let i = startIdx; i >= 0 && i < cols.length; i += step) {
-      if (cols[i].type !== 'formula' && cols[i].type !== 'rollup') return i;
+    for (let i = startIdx; i >= 0 && i < visibleCols.length; i += step) {
+      if (visibleCols[i].type !== 'formula' && visibleCols[i].type !== 'rollup') return i;
     }
     return -1;
   }
@@ -925,39 +1229,39 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     if (dir === 'tab') {
       const next = nextEditableCol(colIdx + 1, 1);
       if (next !== -1) {
-        setPendingFocus({ anchor: rows[rowIdx]._anchor, field: cols[next].name });
-      } else if (rowIdx === rows.length - 1) {
+        setPendingFocus({ anchor: displayRows[rowIdx]._anchor, field: visibleCols[next].name });
+      } else if (rowIdx === displayRows.length - 1) {
         const first = nextEditableCol(0, 1);
         const newAnchor = addRow();
-        if (first !== -1) setPendingFocus({ anchor: newAnchor, field: cols[first].name });
+        if (first !== -1) setPendingFocus({ anchor: newAnchor, field: visibleCols[first].name });
       } else {
         const first = nextEditableCol(0, 1);
-        if (first !== -1) setPendingFocus({ anchor: rows[rowIdx + 1]._anchor, field: cols[first].name });
+        if (first !== -1) setPendingFocus({ anchor: displayRows[rowIdx + 1]._anchor, field: visibleCols[first].name });
       }
     } else if (dir === 'shift-tab') {
       const prev = nextEditableCol(colIdx - 1, -1);
       if (prev !== -1) {
-        setPendingFocus({ anchor: rows[rowIdx]._anchor, field: cols[prev].name });
+        setPendingFocus({ anchor: displayRows[rowIdx]._anchor, field: visibleCols[prev].name });
       } else if (rowIdx > 0) {
-        const last = nextEditableCol(cols.length - 1, -1);
-        if (last !== -1) setPendingFocus({ anchor: rows[rowIdx - 1]._anchor, field: cols[last].name });
+        const last = nextEditableCol(visibleCols.length - 1, -1);
+        if (last !== -1) setPendingFocus({ anchor: displayRows[rowIdx - 1]._anchor, field: visibleCols[last].name });
       }
     } else if (dir === 'enter') {
-      if (rowIdx === rows.length - 1) {
+      if (rowIdx === displayRows.length - 1) {
         const first = nextEditableCol(0, 1);
         const newAnchor = addRow();
-        if (first !== -1) setPendingFocus({ anchor: newAnchor, field: cols[first].name });
+        if (first !== -1) setPendingFocus({ anchor: newAnchor, field: visibleCols[first].name });
       } else {
-        setPendingFocus({ anchor: rows[rowIdx + 1]._anchor, field: cols[colIdx].name });
+        setPendingFocus({ anchor: displayRows[rowIdx + 1]._anchor, field: visibleCols[colIdx].name });
       }
     }
   }
 
   function addRowAndFocus() {
-    if (cols.length === 0) return;
+    if (visibleCols.length === 0) return;
     const first = nextEditableCol(0, 1);
     const newAnchor = addRow();
-    if (first !== -1) setPendingFocus({ anchor: newAnchor, field: cols[first].name });
+    if (first !== -1) setPendingFocus({ anchor: newAnchor, field: visibleCols[first].name });
   }
 
   const allCols = [
@@ -965,9 +1269,9 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     // derived columns (partition + linked) sit on the LEFT, so user-defined
     // schema fields cluster on the right and new "+ add field" columns always
     // appear at the rightmost edge of the grid.
-    ...(partitioned ? [{ name: '_partition', type: 'partition', schematized: partitionFromSchema }] : []),
-    ...linkedTypes.map(t => ({ name: t, type: 'linked', schematized: true })),
-    ...cols,
+    ...(showPartitionCol ? [{ name: '_partition', type: 'partition', schematized: partitionFromSchema }] : []),
+    ...visibleLinkedTypes.map(t => ({ name: t, type: 'linked', schematized: true })),
+    ...visibleCols,
   ];
 
   // DDL string for the table header — only schema-declared fields counted as part of schema
@@ -1002,13 +1306,38 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
           {!declaredInSchema && <span style={{color:'var(--signal)',marginLeft:8,fontWeight:400}}>? unschematized</span>}
         </div>
         <div className="meta">
-          {rows.length} row{rows.length!==1?'s':''}
+          {filters.length && displayRows.length !== rows.length
+            ? <span title={`${rows.length} total · ${filters.length} filter${filters.length!==1?'s':''} active`}>{displayRows.length} of {rows.length} rows</span>
+            : <span>{rows.length} row{rows.length!==1?'s':''}</span>}
           <button
             className={`heat-toggle ${heatOn ? 'on' : ''}`}
             onClick={() => setHeatOn(o => !o)}
             title="color cells by number of DEF writes per path"
           >heat map</button>
         </div>
+      </div>
+      <div className="tv-toolbar">
+        <button
+          className={`tv-tool-btn ${filters.length ? 'active' : ''} ${toolPanel === 'filter' ? 'open' : ''}`}
+          onClick={() => setToolPanel(p => p === 'filter' ? null : 'filter')}
+          title="filter rows · view-local, emits nothing"
+        ><i className="ph ph-funnel" aria-hidden="true"></i> filter{filters.length ? ` · ${filters.length}` : ''}</button>
+        <button
+          className={`tv-tool-btn ${sorts.length ? 'active' : ''} ${toolPanel === 'sort' ? 'open' : ''}`}
+          onClick={() => setToolPanel(p => p === 'sort' ? null : 'sort')}
+          title="sort rows · view-local, emits nothing"
+        ><i className="ph ph-arrows-down-up" aria-hidden="true"></i> sort{sorts.length ? ` · ${sorts.length}` : ''}</button>
+        <button
+          className={`tv-tool-btn ${hiddenCount ? 'active' : ''} ${toolPanel === 'hide' ? 'open' : ''}`}
+          onClick={() => setToolPanel(p => p === 'hide' ? null : 'hide')}
+          title="hide columns · view-local, emits nothing"
+        ><i className={`ph ph-${hiddenCount ? 'eye-slash' : 'eye'}`} aria-hidden="true"></i> {hiddenCount ? `${hiddenCount} hidden` : 'hide fields'}</button>
+        {(filters.length || sorts.length || hiddenCount) ? (
+          <button className="tv-tool-reset" onClick={() => { setFilters([]); setSorts([]); setHidden(new Set()); setToolPanel(null); }} title="clear all view controls">reset view</button>
+        ) : null}
+        {toolPanel === 'filter' && <FilterPanel cols={cols} filters={filters} setFilters={setFilters} />}
+        {toolPanel === 'sort' && <SortPanel cols={cols} sorts={sorts} setSorts={setSorts} />}
+        {toolPanel === 'hide' && <HidePanel items={hideItems} hidden={hidden} setHidden={setHidden} />}
       </div>
       <div className="dbtable-scroll" ref={scrollRef}>
         <table className={`dbgrid ${heatOn ? 'heat-on' : ''}`}>
@@ -1094,7 +1423,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     title="view this entity's timeline"
                   >{r._anchor}</td>
                 )}
-                {partitioned && (
+                {showPartitionCol && (
                   <EditableCell
                     value={state.partitions[r._anchor]}
                     type="text"
@@ -1102,14 +1431,14 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     onCommit={(v) => commitPartition(r._anchor, v)}
                   />
                 )}
-                {linkedTypes.map(t => (
+                {visibleLinkedTypes.map(t => (
                   <LinkedCell
                     key={t}
                     links={linksFromAnchor(r._anchor, t, state)}
                     onJump={onJump}
                   />
                 ))}
-                {cols.map((c, cIdx) => (
+                {visibleCols.map((c, cIdx) => (
                   c.type === 'formula' ? (
                     <FormulaCell key={c.name} formula={c.formula} record={r} state={state} />
                   ) : c.type === 'rollup' ? (
@@ -1136,14 +1465,23 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
               <tr aria-hidden="true" className="virt-spacer"><td colSpan={spacerCols} style={{ height: padBottom, padding: 0, border: 0 }} /></tr>
             )}
 
+            {displayRows.length === 0 && rows.length > 0 && (
+              <tr className="tv-no-match">
+                <td className="cell" colSpan={allCols.length + 1} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
+                  no rows match the active filter{filters.length !== 1 ? 's' : ''} ·{' '}
+                  <button className="tv-inline-link" onClick={() => setFilters([])}>clear filter{filters.length !== 1 ? 's' : ''}</button>
+                </td>
+              </tr>
+            )}
+
             {/* Heat-map summary row */}
             {heatOn && rows.length > 0 && (
               <tr className="heat-summary">
                 {showFormula && <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}>avg writes</td>}
-                {partitioned && <td className="cell"></td>}
-                {linkedTypes.map(t => <td key={t} className="cell hs-link"></td>)}
-                {!showFormula && cols.length > 0 && !partitioned && linkedTypes.length === 0 && <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}></td>}
-                {cols.map((c, i) => {
+                {showPartitionCol && <td className="cell"></td>}
+                {visibleLinkedTypes.map(t => <td key={t} className="cell hs-link"></td>)}
+                {!showFormula && visibleCols.length > 0 && !showPartitionCol && visibleLinkedTypes.length === 0 && <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}></td>}
+                {visibleCols.map((c, i) => {
                   const cs = colStats[c.name] || { avg: 0, max: 0 };
                   const pct = Math.min(cs.max / 10 * 100, 100);
                   const color = cs.avg < 1.5 ? '#85b7eb' : cs.avg < 3 ? '#fac775' : cs.avg < 6 ? '#f09595' : '#e24b4a';
@@ -1158,10 +1496,10 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                 <td className="cell"></td>
               </tr>
             )}
-            {cols.length > 0 && (
+            {cols.length > 0 && visibleCols.length > 0 && (
               <tr className="add-row" onClick={addRowAndFocus} title="click to add a row · or hit Enter from the last cell">
                 {showFormula && <td className="cell anchor add-row-gutter"><span className="add-row-plus">+</span></td>}
-                <td className="cell add-row-cell" colSpan={cols.length + (partitioned ? 1 : 0) + linkedTypes.length + 1}>
+                <td className="cell add-row-cell" colSpan={visibleCols.length + (showPartitionCol ? 1 : 0) + visibleLinkedTypes.length + 1}>
                   {!showFormula && <span className="add-row-plus">+</span>}
                   <span className="add-row-hint">{rows.length === 0 ? `add the first ${entityType} row` : 'add row'}</span>
                 </td>

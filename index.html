@@ -415,6 +415,55 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 
 .dbtable-scroll{overflow-x:auto;max-width:100%}
 
+/* ── View controls toolbar (sort / filter / hide) ────────────────────────
+   Projection-local: reshapes the grid without emitting any events. */
+.tv-toolbar{position:relative;display:flex;align-items:center;gap:6px;padding:6px 12px;border-bottom:1px solid var(--border);background:var(--surface-2);flex-wrap:wrap}
+.tv-tool-btn{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;font-family:var(--mono);font-size:11px;border:1px solid var(--border-strong);background:#fff;color:var(--text);cursor:pointer;letter-spacing:.3px;text-transform:lowercase;font-weight:600}
+.tv-tool-btn i{font-size:13px;line-height:1;color:var(--text-dim)}
+.tv-tool-btn:hover{border-color:#000}
+.tv-tool-btn.active{border-color:#000;color:var(--text-bright)}
+.tv-tool-btn.active i{color:var(--triad-structure)}
+.tv-tool-btn.open{background:#000;color:#fff;border-color:#000}
+.tv-tool-btn.open i{color:#fff}
+.tv-tool-reset{margin-left:auto;padding:3px 9px;font-family:var(--mono);font-size:10.5px;border:1px solid transparent;background:transparent;color:var(--text-dim);cursor:pointer;letter-spacing:.3px;text-transform:lowercase;font-weight:600}
+.tv-tool-reset:hover{color:var(--red);border-color:var(--border-strong)}
+.tv-inline-link{background:none;border:none;color:var(--triad-structure);cursor:pointer;font-family:var(--mono);font-size:inherit;text-decoration:underline;padding:0}
+
+/* Dropdown popovers */
+.tv-pop{position:absolute;z-index:200;top:calc(100% - 2px);left:12px;background:#fff;border:1px solid #000;box-shadow:0 18px 40px -10px rgba(0,0,0,.35),0 2px 6px rgba(0,0,0,.18);font-family:var(--mono);min-width:340px;max-width:480px;display:flex;flex-direction:column;animation:proj-rise .14s ease-out}
+.tv-pop-sort{left:80px}
+.tv-pop-hide{left:148px;min-width:240px}
+.tv-pop-head{padding:8px 11px;border-bottom:1px solid var(--border);background:linear-gradient(180deg,#fff,var(--surface-2));font-size:11px;font-weight:700;color:var(--text-bright);display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.tv-pop-sub{font-size:9px;text-transform:uppercase;letter-spacing:1.1px;color:var(--text-faint);font-weight:700}
+.tv-pop-empty{padding:10px 11px;font-size:11px;color:var(--text-faint);font-style:italic}
+.tv-ctrl-row{display:flex;align-items:center;gap:6px;padding:6px 11px;border-bottom:1px solid var(--surface-3)}
+.tv-conj{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);font-weight:700;min-width:38px}
+.tv-sel{font-family:var(--mono);font-size:11.5px;padding:3px 6px;border:1px solid var(--border-strong);background:#fff;color:var(--text);outline:none;max-width:140px}
+.tv-sel:focus{border-color:#000}
+.tv-val,.tv-val-input{flex:1;min-width:60px}
+.tv-val-input{font-family:var(--mono);font-size:11.5px;padding:3px 6px;border:1px solid var(--border-strong);background:#fff;color:var(--text);outline:none}
+.tv-val-input:focus{border-color:#000}
+.tv-dir{display:inline-flex;border:1px solid var(--border-strong)}
+.tv-dir button{font-family:var(--mono);font-size:12px;padding:2px 8px;background:#fff;border:none;cursor:pointer;color:var(--text-dim);line-height:1.4}
+.tv-dir button+button{border-left:1px solid var(--border-strong)}
+.tv-dir button.on{background:#000;color:#fff}
+.tv-row-x{margin-left:auto;background:transparent;border:none;color:var(--text-faint);cursor:pointer;font-size:15px;line-height:1;padding:0 2px;font-family:var(--mono)}
+.tv-row-x:hover{color:var(--red)}
+.tv-add{margin:7px 11px 9px;align-self:flex-start;font-family:var(--mono);font-size:11px;padding:3px 10px;border:1px dashed var(--border-strong);background:#fff;color:var(--text-dim);cursor:pointer;text-transform:lowercase;letter-spacing:.3px;font-weight:600}
+.tv-add:hover:not(:disabled){border-style:solid;border-color:#000;color:#000}
+.tv-add:disabled{opacity:.4;cursor:not-allowed}
+.tv-hide-actions{display:flex;gap:6px;padding:7px 11px;border-bottom:1px solid var(--border);background:var(--surface-2)}
+.tv-hide-actions button{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:1px;font-weight:700;padding:2px 8px;border:1px solid var(--border-strong);background:#fff;color:var(--text-dim);cursor:pointer}
+.tv-hide-actions button:hover:not(:disabled){border-color:#000;color:#000}
+.tv-hide-actions button:disabled{opacity:.4;cursor:not-allowed}
+.tv-hide-row{display:flex;align-items:center;gap:8px;width:100%;padding:6px 11px;background:transparent;border:none;border-bottom:1px solid var(--surface-3);cursor:pointer;font-family:var(--mono);font-size:12px;color:var(--text-bright);text-align:left}
+.tv-hide-row:hover{background:var(--surface-2)}
+.tv-hide-row i{font-size:14px;color:var(--triad-structure)}
+.tv-hide-row.is-hidden{color:var(--text-faint)}
+.tv-hide-row.is-hidden i{color:var(--text-faint)}
+.tv-hide-name{font-weight:600}
+.tv-hide-kind{margin-left:auto;font-size:9.5px;text-transform:uppercase;letter-spacing:1px;color:var(--text-faint);font-weight:700}
+
 /* Row-expand affordance — opens the record detail side panel */
 .dbgrid td.row-expand{font-size:14px;line-height:1}
 .dbgrid td.row-expand:hover{color:var(--text-bright);font-weight:700}
