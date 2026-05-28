@@ -129,7 +129,7 @@
 
   function CsvImportModalInner({ csvImport, state, onEmit, onClose }) {
     const { file, roomId } = csvImport;
-    const [phase, setPhase]   = useState('parsing');   // parsing | ready | importing | done | error
+    const [phase, setPhase]   = useState('parsing');   // parsing | ready | uploading | done | error
     const [error, setError]   = useState(null);
     const [rawRows, setRawRows] = useState([]);        // string[][]
     const [hasHeader, setHasHeader] = useState(true);
@@ -148,7 +148,6 @@
     // Mapping: per CSV column, { target: '<fieldName>' | '__skip__' | '__new__', newName?, type? }
     const [mapping, setMapping] = useState([]);
 
-    const [importProgress, setImportProgress] = useState(0);
     const [importTotal, setImportTotal]       = useState(0);
 
     /* parse on mount */
@@ -225,26 +224,13 @@
       const ME = window.MatrixEngine;
       const ML = window.MatrixLive;
       if (!ME) { setError('engine not loaded'); setPhase('error'); return; }
+      if (!ML?.importFile || !roomId) {
+        setError('cannot import — not connected to a homeserver');
+        setPhase('error');
+        return;
+      }
 
       try {
-        // 1. Ship the source CSV to the media store + emit the `import` entity
-        //    FIRST so the log narrative reads:
-        //      INS import → DEF _schema.* → INS rows×N
-        if (ML?.importFile && roomId) {
-          setPhase('uploading');
-          try {
-            await ML.importFile(roomId, file);
-          } catch (e) {
-            // Non-fatal: we can still import the rows even if the blob
-            // upload fails. Surface a soft warning in dev console.
-            console.warn('[csv-import] source blob upload failed:', e);
-          }
-        }
-
-        setPhase('importing');
-        setImportProgress(0);
-        setImportTotal(dataRows.length);
-
         // Resolve the final field list for the destination set.
         const existingFieldsArr = (state?.schema?.fields?.[setName]) || [];
         const existingByName    = new Map(existingFieldsArr.map(f => [f.name, f]));
@@ -275,7 +261,7 @@
           return { name: fieldName, type: fieldType, csvIdx: i };
         });
 
-        // 2. declare table if new
+        // 1. declare table if new
         if (dest === 'new') {
           onEmit(ME.OP.DEF, {
             anchor: null,
@@ -283,39 +269,33 @@
             value: existingSets.includes(setName) ? existingSets : [...existingSets, setName],
           });
         }
-        // 3. declare/extend fields if changed
+        // 2. declare/extend fields if changed
         const fieldsChanged = JSON.stringify(finalFields) !== JSON.stringify(existingFieldsArr);
         if (fieldsChanged) {
           onEmit(ME.OP.DEF, { anchor: null, path: `_schema.fields.${setName}`, value: finalFields });
         }
 
-        // 4. one INS per row, full payload, in batches with a microtask yield
-        //    so the UI can paint the progress bar.
-        const me = ML?.getCurrentMxid?.() || '@you:demo';
-        const BATCH = 100;
-        const totalRows = dataRows.length;
-        let i = 0;
-        const baseTs = Date.now();
-        while (i < totalRows) {
-          const end = Math.min(i + BATCH, totalRows);
-          for (let r = i; r < end; r++) {
-            const row = dataRows[r];
-            const payload = {};
-            for (const t of columnTargets) {
-              if (!t) continue;
-              const raw = row[t.csvIdx];
-              const v = coerce(raw, t.type);
-              if (v !== undefined) payload[t.name] = v;
-            }
-            const ts = baseTs + r;
-            const anchor = ME.makeAnchor(setName, payload, me, ts);
-            onEmit(ME.OP.INS, { anchor, entity_type: setName, payload });
-          }
-          i = end;
-          setImportProgress(i);
-          // yield to the event loop so progress paints
-          await new Promise(res => setTimeout(res, 0));
-        }
+        // 3. Upload the source CSV + emit ONE INS for the import entity.
+        //    The import payload carries the field plan + header flag so
+        //    table-view can reconstruct rows lazily from the source blob.
+        //    No per-row INS events — 10k rows now becomes ~5 log entries
+        //    instead of ~70k.
+        setPhase('uploading');
+        setImportTotal(dataRows.length);
+
+        const fieldPlan = columnTargets
+          .filter(Boolean)
+          .map(t => ({ name: t.name, type: t.type, csvIdx: t.csvIdx }));
+
+        await ML.importFile(roomId, file, {
+          materialize: false,
+          payload: {
+            derived_set: setName,
+            rows_imported: dataRows.length,
+            has_header: hasHeader,
+            field_plan: fieldPlan,
+          },
+        });
 
         setPhase('done');
         setTimeout(() => onClose?.(), 700);
@@ -329,7 +309,7 @@
     /* ── escape closes the modal (when not mid-import) */
     useEffect(() => {
       function onKey(e) {
-        if (e.key === 'Escape' && phase !== 'importing' && phase !== 'uploading') onClose?.();
+        if (e.key === 'Escape' && phase !== 'uploading') onClose?.();
       }
       window.addEventListener('keydown', onKey);
       return () => window.removeEventListener('keydown', onKey);
@@ -337,7 +317,7 @@
 
     /* render */
     return (
-      <div className="csv-modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && phase !== 'importing' && phase !== 'uploading') onClose?.(); }}>
+      <div className="csv-modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && phase !== 'uploading') onClose?.(); }}>
         <div className="csv-modal">
           {/* head */}
           <div className="csv-head">
@@ -354,7 +334,7 @@
                 )}
               </div>
             </div>
-            <button className="csv-close" onClick={() => phase !== 'importing' && phase !== 'uploading' && onClose?.()} title="close" disabled={phase === 'importing' || phase === 'uploading'}>×</button>
+            <button className="csv-close" onClick={() => phase !== 'uploading' && onClose?.()} title="close" disabled={phase === 'uploading'}>×</button>
           </div>
 
           {/* body */}
@@ -376,15 +356,7 @@
               <div className="csv-state-block csv-state-done">
                 <div className="csv-state-glyph">✓</div>
                 <div><b>imported {importTotal.toLocaleString()} row{importTotal === 1 ? '' : 's'}</b> into <b>{setName}</b></div>
-                <div className="csv-state-sub">emitted {importTotal.toLocaleString()} INS event{importTotal === 1 ? '' : 's'} + schema declarations</div>
-              </div>
-            )}
-            {phase === 'importing' && (
-              <div className="csv-state-block">
-                <div className="csv-state-glyph">●</div>
-                <div><b>importing rows…</b> {importProgress.toLocaleString()} / {importTotal.toLocaleString()}</div>
-                <div className="csv-progress"><div className="csv-progress-fill" style={{ width: `${(importProgress / Math.max(1, importTotal)) * 100}%` }} /></div>
-                <div className="csv-state-sub">one INS per row · {importTotal.toLocaleString()} events · don't close the tab</div>
+                <div className="csv-state-sub">1 INS event + schema declarations · rows materialize on demand from the source blob</div>
               </div>
             )}
             {phase === 'uploading' && (
@@ -559,22 +531,21 @@
                   <span className="csv-foot-mxc">⎘ source csv will be uploaded to the media store</span>
                   {dataRows.length > 0 && (
                     <span className="csv-foot-evt">
-                      · will emit <b>{(dataRows.length + (dest === 'new' ? 2 : 1)).toLocaleString()}</b> events
-                      <span className="csv-foot-evt-detail"> ({dataRows.length.toLocaleString()} INS + schema)</span>
+                      · will emit <b>{(1 + (dest === 'new' ? 2 : 1)).toLocaleString()}</b> events
+                      <span className="csv-foot-evt-detail"> (1 import + schema · rows materialize from the blob)</span>
                     </span>
                   )}
                 </>
               )}
             </div>
             <div className="csv-foot-actions">
-              <button className="csv-cancel" onClick={onClose} disabled={phase === 'importing' || phase === 'uploading'}>cancel</button>
+              <button className="csv-cancel" onClick={onClose} disabled={phase === 'uploading'}>cancel</button>
               <button
                 className="csv-import"
                 onClick={doImport}
                 disabled={!canImport}
               >
                 {phase === 'uploading' ? 'uploading…'
-                 : phase === 'importing' ? 'importing…'
                  : phase === 'done'      ? 'done'
                  : phase === 'error'     ? 'retry'
                  : `import ${dataRows.length.toLocaleString()} row${dataRows.length === 1 ? '' : 's'}`}
@@ -586,6 +557,83 @@
     );
   }
 
+  /* ── Lazy row materialization ────────────────────────────────────────
+   *
+   * The new csv-import flow emits 1 INS for the import entity + schema
+   * DEFs — but NO per-row events. The rows live in the source CSV which
+   * is preserved in the homeserver's media store. This function fetches
+   * those bytes, parses + coerces them with the field plan stored on the
+   * import entity, and returns synthetic row entities (stable
+   * `${importAnchor}#r${idx}` anchors) the table view can render.
+   *
+   * Source blobs are immutable, so we cache parsed results in-memory for
+   * the page lifetime keyed by import anchor.
+   */
+  const importRowCache = new Map();
+
+  async function materializeImportRows(importEntity) {
+    if (!importEntity || !importEntity._anchor) return [];
+    const cached = importRowCache.get(importEntity._anchor);
+    if (cached) return cached;
+
+    const ML = window.MatrixLive;
+    const ref = importEntity.file;
+    const fieldPlan = importEntity.field_plan;
+    const setName = importEntity.derived_set;
+    if (!ML?.readMedia || !ref || !Array.isArray(fieldPlan) || !setName) return [];
+
+    let bytes;
+    try { bytes = await ML.readMedia(ref); }
+    catch (e) { console.warn('[csv-import] could not read source blob:', e); return []; }
+    if (!bytes) return [];
+
+    let text;
+    if (typeof bytes === 'string')         text = bytes;
+    else if (bytes instanceof Blob)        text = await bytes.text();
+    else if (bytes instanceof Uint8Array)  text = new TextDecoder().decode(bytes);
+    else if (bytes instanceof ArrayBuffer) text = new TextDecoder().decode(new Uint8Array(bytes));
+    else                                   return [];
+
+    let parsed;
+    try { parsed = parseCSV(text); }
+    catch (e) { console.warn('[csv-import] parse failed:', e); return []; }
+    if (!Array.isArray(parsed) || parsed.length === 0) return [];
+
+    const hasHeader = importEntity.has_header !== false;
+    const dataRows  = hasHeader ? parsed.slice(1) : parsed;
+
+    const rows = dataRows.map((raw, i) => {
+      const out = {
+        _anchor: `${importEntity._anchor}#r${i}`,
+        _type: setName,
+        _created: importEntity._created,
+        _sender: importEntity._sender,
+        _eventId: importEntity._eventId,
+        _hwm: 2,
+        _materialized: importEntity._anchor,
+      };
+      for (const f of fieldPlan) {
+        const v = coerce(raw[f.csvIdx], f.type);
+        if (v !== undefined && v !== null && v !== '') out[f.name] = v;
+      }
+      return out;
+    });
+
+    importRowCache.set(importEntity._anchor, rows);
+    return rows;
+  }
+
+  // Find import entities whose derived set matches `entityType`.
+  function importsForSet(state, entityType) {
+    if (!state?.entities || !entityType) return [];
+    return Object.values(state.entities).filter(
+      e => e?._type === 'import' && e.derived_set === entityType && Array.isArray(e.field_plan)
+    );
+  }
+
   window.CsvImportModal = CsvImportModal;
-  window.CsvImport = { parseCSV, inferType, coerce, FIELD_TYPES };
+  window.CsvImport = {
+    parseCSV, inferType, coerce, FIELD_TYPES,
+    materializeImportRows, importsForSet,
+  };
 })();

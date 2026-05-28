@@ -75,7 +75,7 @@ function FormulaCell({ formula, record }) {
   );
 }
 
-function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsumed, onNavigate }) {
+function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsumed, onNavigate, readOnly }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const inputRef = useRef(null);
@@ -85,7 +85,7 @@ function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsume
   }
 
   useEffect(() => {
-    if (shouldFocus && !editing) {
+    if (shouldFocus && !editing && !readOnly) {
       setDraft(draftFromValue(value));
       setEditing(true);
       if (onFocusConsumed) onFocusConsumed();
@@ -138,6 +138,9 @@ function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsume
   }
   const { cls, text } = fmtCell(value, type);
   const heatCls = heat ? heatClass(heat) : '';
+  if (readOnly) {
+    return <td className={`cell ${cls} ${heatCls} readonly`} title="materialized from the imported source · read-only">{text}</td>;
+  }
   return <td className={`cell ${cls} ${heatCls}`} onClick={startEdit} title={heat ? `${heat} write${heat===1?'':'s'} · click to edit` : 'click to edit · emits DEF'}>{text}</td>;
 }
 
@@ -258,7 +261,32 @@ function linksFromAnchor(anchor, otherType, state) {
 // ─────────────────────────────────────────────────────────────────────────
 
 function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showDDL, setSelection }) {
-  const { cols, rows, partitioned, partitionFromSchema } = useMemo(() => buildTable(entityType, state), [entityType, state]);
+  const built = useMemo(() => buildTable(entityType, state), [entityType, state]);
+
+  // Lazy-materialize rows from any import entity that produced this set.
+  // New imports emit a single INS (no per-row events); rows live in the
+  // source CSV blob and get parsed on demand here, then merged with any
+  // legacy per-row entities folded normally.
+  const imports = useMemo(
+    () => window.CsvImport?.importsForSet?.(state, entityType) || [],
+    [state, entityType]
+  );
+  const importsKey = imports.map(i => i._anchor).join('|');
+  const [materializedRows, setMaterializedRows] = useState([]);
+  useEffect(() => {
+    if (imports.length === 0) { setMaterializedRows([]); return; }
+    let cancelled = false;
+    Promise.all(imports.map(i => window.CsvImport.materializeImportRows(i)))
+      .then(arrays => { if (!cancelled) setMaterializedRows(arrays.flat()); })
+      .catch(e => { if (!cancelled) console.warn('[table-view] import materialization failed:', e); });
+    return () => { cancelled = true; };
+  }, [importsKey]);
+
+  const rows = useMemo(
+    () => materializedRows.length ? [...built.rows, ...materializedRows] : built.rows,
+    [built.rows, materializedRows]
+  );
+  const { cols, partitioned, partitionFromSchema } = built;
   const linkedTypes = useMemo(() => linkedTypesFor(entityType, state), [entityType, state]);
   const declaredInSchema = !!state.schema?.fields?.[entityType] || (state.schema?.tables || []).includes(entityType);
   const [heatOn, setHeatOn] = useState(false);
@@ -541,6 +569,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                       shouldFocus={pendingFocus?.anchor === r._anchor && pendingFocus?.field === c.name}
                       onFocusConsumed={() => setPendingFocus(null)}
                       onNavigate={(dir) => navigate(rIdx, cIdx, dir)}
+                      readOnly={!!r._materialized}
                     />
                   )
                 ))}
@@ -550,6 +579,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     type="text"
                     heat={0}
                     onCommit={(v) => commitPartition(r._anchor, v)}
+                    readOnly={!!r._materialized}
                   />
                 )}
                 {linkedTypes.map(t => (

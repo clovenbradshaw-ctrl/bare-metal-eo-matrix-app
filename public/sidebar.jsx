@@ -39,17 +39,35 @@ const PROJECTION_TYPES = ['table', 'kanban', 'timeline', 'graph'];
 // Derive the sets + their auto-projections from state.
 // ─────────────────────────────────────────────────────────────────────────
 
+// Sets that exist but shouldn't appear in the main sidebar list. They're
+// still real entity types — surfaced under the "raw" rail (imports) or
+// implicitly via the timeline / state tweaks (violations).
+const HIDDEN_SET_TYPES = new Set(['import']);
+
 function buildSets(state) {
-  const declared = state.schema?.tables || [];
+  const declared = (state.schema?.tables || []).filter(t => !HIDDEN_SET_TYPES.has(t));
   const observed = Array.from(new Set(
     Object.values(state.entities)
       .map(e => e._type)
-      .filter(t => t && !t.startsWith('_'))
+      .filter(t => t && !t.startsWith('_') && !HIDDEN_SET_TYPES.has(t))
   ));
   const userSets = Array.from(new Set([...declared, ...observed]));
 
+  // Import entities (hidden from the set list) declare a `derived_set` +
+  // `rows_imported` count. Folded rows live in state.entities; imported
+  // rows are materialized lazily by the table view but the count is
+  // already on the import entity, so the sidebar can show it without
+  // touching the source blob.
+  const importedRowsBySet = {};
+  for (const e of Object.values(state.entities)) {
+    if (e?._type === 'import' && e.derived_set && typeof e.rows_imported === 'number') {
+      importedRowsBySet[e.derived_set] = (importedRowsBySet[e.derived_set] || 0) + e.rows_imported;
+    }
+  }
+
   const sets = userSets.map(name => {
     const rows = Object.values(state.entities).filter(e => e._type === name);
+    const importedRowCount = importedRowsBySet[name] || 0;
     const hasPartitions = !!(state.schema?.partitions?.[name]) || rows.some(r => state.partitions[r._anchor]);
     const hasConnections = state.connections.some(c => {
       const s = state.entities[c.source]; const t = state.entities[c.target];
@@ -63,7 +81,7 @@ function buildSets(state) {
         ? [{ id: `${name}.notebook`, kind: 'notebook', name: 'notebook', tableId: name }] : []),
     ];
     return {
-      id: name, name, kind: 'entity', rows: rows.length,
+      id: name, name, kind: 'entity', rows: rows.length + importedRowCount,
       declared: declared.includes(name),
       hasPartitions, hasConnections,
       slices,
@@ -91,15 +109,12 @@ function buildSets(state) {
     });
   }
   // _schema isn't a top-level set — each set has its own schema, opened by clicking the set name above.
-  if (state._violations && state._violations.length > 0) {
-    meta.push({
-      id: '_violations', name: '_violations', kind: 'meta',
-      rows: state._violations.length, declared: false,
-      slices: [{ id: '_violations.table', kind: 'table', name: 'table', tableId: '_violations' }],
-    });
-  }
+  // _violations is intentionally not surfaced as a set — it's available via
+  // the "Show violations" tweak in the log view.
 
-  return { sets, meta };
+  const importsCount = Object.values(state.entities).filter(e => e._type === 'import').length;
+
+  return { sets, meta, importsCount };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -214,7 +229,7 @@ function Sidebar({
   room, state, selection, setSelection, onCreateTable, customSlices, onCreateSlice,
   eventsTotal, ephemeralsCount, onRenameRoom, lastEventTs,
 }) {
-  const { sets, meta } = useMemo(() => buildSets(state), [state]);
+  const { sets, meta, importsCount } = useMemo(() => buildSets(state), [state]);
   const allSets = [...sets, ...meta].map(t => {
     const extras = (customSlices?.[t.id] || []).map(s => ({
       id: `${t.id}.${s.name}`,
@@ -405,6 +420,17 @@ function Sidebar({
           <span className="sb-slice-name">ephemeral</span>
           <span className="sb-slice-meta">{ephemeralsCount}</span>
         </button>
+        {importsCount > 0 && (
+          <button
+            className={`sb-slice ${selection.kind === 'slice' && selection.tableId === 'import' ? 'active' : ''} kind-table`}
+            onClick={() => setSelection({ kind: 'slice', sliceId: 'import.table', tableId: 'import', sliceKind: 'table' })}
+            title="files imported into this space"
+          >
+            <span className="sb-slice-icon">⊞</span>
+            <span className="sb-slice-name">imports</span>
+            <span className="sb-slice-meta">{importsCount}</span>
+          </button>
+        )}
       </div>
 
       <div className="sb-foot">
