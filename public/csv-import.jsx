@@ -568,11 +568,19 @@
    *
    * Source blobs are immutable, so we cache parsed results in-memory for
    * the page lifetime keyed by import anchor.
+   *
+   * Return contract: a row array on success (possibly empty, e.g. a
+   * header-only file — that's a *real* zero-row result and gets cached).
+   * `null` means "couldn't materialize yet" — the import entity isn't
+   * fully assembled (the `file` DEF folds in just behind the INS that
+   * carries the field plan) or the source bytes weren't readable. The
+   * caller must distinguish these: caching a `null`/empty failure as if it
+   * were a real result leaves the rows blank until a full page reload.
    */
   const importRowCache = new Map();
 
   async function materializeImportRows(importEntity) {
-    if (!importEntity || !importEntity._anchor) return [];
+    if (!importEntity || !importEntity._anchor) return null;
     const cached = importRowCache.get(importEntity._anchor);
     if (cached) return cached;
 
@@ -580,24 +588,24 @@
     const ref = importEntity.file;
     const fieldPlan = importEntity.field_plan;
     const setName = importEntity.derived_set;
-    if (!ML?.readMedia || !ref || !Array.isArray(fieldPlan) || !setName) return [];
+    if (!ML?.readMedia || !ref || !Array.isArray(fieldPlan) || !setName) return null;
 
     let bytes;
     try { bytes = await ML.readMedia(ref); }
-    catch (e) { console.warn('[csv-import] could not read source blob:', e); return []; }
-    if (!bytes) return [];
+    catch (e) { console.warn('[csv-import] could not read source blob:', e); return null; }
+    if (!bytes) return null;
 
     let text;
     if (typeof bytes === 'string')         text = bytes;
     else if (bytes instanceof Blob)        text = await bytes.text();
     else if (bytes instanceof Uint8Array)  text = new TextDecoder().decode(bytes);
     else if (bytes instanceof ArrayBuffer) text = new TextDecoder().decode(new Uint8Array(bytes));
-    else                                   return [];
+    else                                   return null;
 
     let parsed;
     try { parsed = parseCSV(text); }
-    catch (e) { console.warn('[csv-import] parse failed:', e); return []; }
-    if (!Array.isArray(parsed) || parsed.length === 0) return [];
+    catch (e) { console.warn('[csv-import] parse failed:', e); return null; }
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
 
     const hasHeader = importEntity.has_header !== false;
     const dataRows  = hasHeader ? parsed.slice(1) : parsed;

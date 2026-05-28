@@ -505,11 +505,16 @@ function App() {
   // become records.
   const importRowsRef = useRef({});        // import anchor -> row entity[]
   const inFlightRef   = useRef(new Set());
+  const attemptsRef   = useRef({});        // import anchor -> failed-read count
   const [importRowsVersion, setImportRowsVersion] = useState(0);
 
   const importEntities = useMemo(() => Object.values(state.entities || {}).filter(
     e => e?._type === 'import' && e.derived_set && Array.isArray(e.field_plan)
   ), [state]);
+
+  // Cap retries for an import whose source blob is genuinely unreadable
+  // (deleted media, hard-offline) so we don't re-fetch on every fold.
+  const MAX_MATERIALIZE_ATTEMPTS = 10;
 
   useEffect(() => {
     const CI = window.CsvImport;
@@ -519,13 +524,26 @@ function App() {
       for (const imp of importEntities) {
         const a = imp._anchor;
         if (importRowsRef.current[a] || inFlightRef.current.has(a)) continue;
+        if ((attemptsRef.current[a] || 0) >= MAX_MATERIALIZE_ATTEMPTS) continue;
         inFlightRef.current.add(a);
         try {
           const rows = await CI.materializeImportRows(imp);
           if (cancelled) return;
-          importRowsRef.current[a] = rows || [];
-          setImportRowsVersion(v => v + 1);
+          if (rows) {
+            // Real result (even an empty one) — record it for good.
+            importRowsRef.current[a] = rows;
+            setImportRowsVersion(v => v + 1);
+          } else if (imp.file) {
+            // The file ref is folded but the bytes wouldn't read/parse —
+            // count it so a permanently-broken blob stops re-fetching.
+            attemptsRef.current[a] = (attemptsRef.current[a] || 0) + 1;
+          }
+          // else: the `file` DEF hasn't folded in behind the INS yet. Leave
+          // it un-materialized (no penalty) so the next fold retries — this
+          // is the common case right after an import and the reason rows
+          // used to show up blank until a full page reload.
         } catch (e) {
+          attemptsRef.current[a] = (attemptsRef.current[a] || 0) + 1;
           console.warn('[app] could not materialize import rows:', e);
         } finally {
           inFlightRef.current.delete(a);
