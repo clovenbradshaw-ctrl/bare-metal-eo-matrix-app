@@ -39,9 +39,23 @@ UI shows:
 * **`initialSyncLimit: 1`** — history comes from OPFS, so the SDK never needs
   a per-room timeline. Keep the initial sync burst to the minimum.
 * **`disablePresence: true`** — presence is never rendered; skip it.
+* **MatrixRTC disabled** (`client.matrixRTC.stop()` right after `startClient`).
+  The SDK otherwise spins up an Element-Call membership tracker for *every
+  room in the account* and re-scans them on every sync (the `[MatrixRTCSession
+  … No membership changes detected]` log spam) — pure overhead for an app with
+  no calls.
+
+One room at a time, period: the app is only ever used in a single room, so
+`MAX_OPEN_ROOMS = 1` and the governor releases the SDK live timeline for
+**every** room (including the active one) continuously. The app renders from
+OPFS + the fold, never the SDK timeline, and optimistic sends reconcile on the
+*remote* echo (its `transaction_id` arrives via sync), so dropping the timeline
+— even mid-bulk-write, where local/remote echoes pile up fastest — is free.
 
 Use `window.MatrixLive.getSdkStats()` to see the breakdown live:
-`{ sdkRooms, sdkLiveEvents, roomsWithMembersLoaded, openRooms, heldEvents }`.
+`{ sdkRooms, workspaceRooms, sdkLiveEvents, sdkMembers, sdkStateEvents,
+roomsWithMembersLoaded, openRooms, heldEvents }`. The governor also logs this
+breakdown when it sheds, so a console screenshot points at the real consumer.
 
 Further levers, deliberately **not** taken here because they carry trade-offs
 worth a decision:

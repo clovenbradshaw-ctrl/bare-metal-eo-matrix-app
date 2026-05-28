@@ -51,6 +51,14 @@ const SYNC_OPTS = {
   disablePresence: true,
 };
 
+// matrix-js-sdk spins up a MatrixRTCSession (Element-Call membership tracker)
+// for *every room in the account* and re-scans them on every sync — pure
+// overhead for a data app that has no calls. Tear it down right after
+// startClient. Safe: nothing in this app touches client.matrixRTC.
+function disableMatrixRTC(c) {
+  try { c.matrixRTC?.stop?.(); } catch (e) { progress(`RTC disable skipped: ${e.message}`); }
+}
+
 let progress = (msg) => console.log('[matrix]', msg);
 export function setProgress(fn) {
   progress = (msg) => { console.log('[matrix]', msg); fn(msg); };
@@ -497,6 +505,7 @@ export async function login(homeserver, username, password) {
 
   progress('Starting sync…');
   await client.startClient(SYNC_OPTS);
+  disableMatrixRTC(client);
   if (_watchSyncUnsub) _watchSyncUnsub();
   _watchSyncUnsub = watchSync(client);
   await waitForSync(client);

@@ -47,12 +47,12 @@ const ROOM_TYPE = 'eo.workspace';
 // footprint bounded regardless of how many rooms the user visits.
 const MEMORY_BUDGET_BYTES = 500 * 1024 * 1024;
 
-// How many rooms stay hydrated in memory at once. Each open room holds its
-// committed op-events plus a per-event dedup set, and pins the matrix-js-sdk
-// timeline for that room. Only the active room is ever read by the UI
-// (see useLiveStore), so a tiny LRU is plenty — switching back re-hydrates
-// from OPFS in a single decrypt pass. Lower this if rooms are very large.
-const MAX_OPEN_ROOMS = 3;
+// How many rooms stay hydrated in memory at once. The app is used one room
+// at a time, period — so we keep exactly one. Switching rooms closes the
+// previous one (dropping its events, dedup set, and SDK timeline) and
+// re-hydrates the new one from OPFS in a single decrypt pass. There is never
+// a reason to hold a second room's working set in memory.
+const MAX_OPEN_ROOMS = 1;
 
 setNamespace(NAMESPACE);
 
@@ -226,23 +226,77 @@ function makeOutboxFlusher() {
   });
 }
 
-// Start the heap governor and register the room evictor it runs under
-// pressure. Idempotent — safe to call on every (re)auth.
+// Reset the matrix-js-sdk live timeline for EVERY synced room, reclaiming the
+// decrypted MatrixEvent objects the SDK accumulates — both account-wide (every
+// room rides the full sync) and, crucially, in the active room during bulk
+// writes, where local + remote echoes pile up fastest.
+//
+// This is safe even for the active room and even mid-send: the UI renders
+// from OPFS + the fold, never the SDK timeline, and optimistic sends are
+// reconciled when the *remote* echo arrives via sync (its unsigned
+// transaction_id flows through onTimeline → reconcilePendingByTxn), which is
+// independent of whatever the local timeline holds. So dropping the timeline
+// costs nothing but frees the bytes.
+function shedSdkTimelines() {
+  const client = getClient();
+  if (!client) return false;
+  let freed = false;
+  for (const room of client.getRooms()) {
+    try { room.resetLiveTimeline(null, null); freed = true; } catch {}
+  }
+  return freed;
+}
+
+// Start the heap governor and register the evictors + diagnostics it runs
+// under pressure. Idempotent — safe to call on every (re)auth.
 function startMemoryGovernor() {
   memory.start({ budgetBytes: MEMORY_BUDGET_BYTES });
   if (unregisterRoomEvictor) unregisterRoomEvictor();
-  unregisterRoomEvictor = memory.registerEvictor('inactive-rooms', () => {
+
+  const offs = [];
+
+  // Soft: drop this app's inactive hydrated rooms + trim the log. Self-
+  // throttled — closing a room forces an OPFS re-read on return, so we don't
+  // want it firing every interval; the cheap SDK sweep below carries the
+  // continuous shedding.
+  let lastInactiveCloseAt = 0;
+  offs.push(memory.registerEvictor('inactive-rooms', () => {
+    const now = Date.now();
+    if (now - lastInactiveCloseAt < 30_000) return false;
+    lastInactiveCloseAt = now;
     const active = activeRoomId();
     let freed = false;
     for (const rid of [...openOrder]) {
       if (rid !== active) { closeRoom(rid); freed = true; }
     }
-    // Hard-trim the progress ring buffer too — cheap and it can hold
-    // chatty sync lines.
     if (progressLog.length > 12) { progressLog = progressLog.slice(-12); freed = true; }
     if (freed) notify('events');
     return freed;
-  }, { priority: 100, level: 'soft' });
+  }, { priority: 100, level: 'soft' }));
+
+  // Soft: release the SDK's timeline objects across all rooms. Cheap and
+  // non-disruptive (the app never renders from the SDK timeline), so it runs
+  // every interval and is the main continuous bound on SDK growth.
+  offs.push(memory.registerEvictor('sdk-timelines', () => shedSdkTimelines(),
+    { priority: 90, level: 'soft' }));
+
+  // Diagnostic: when under pressure, log where the memory actually is, so a
+  // console screenshot points straight at the real consumer instead of just
+  // "shed inactive state". Rate-limited by the governor's shed cooldown.
+  offs.push(memory.onPressure((level, sample) => {
+    try {
+      const s = getSdkStats();
+      console.warn(
+        `[memory] breakdown @ ${(sample.bytes / (1024 * 1024)).toFixed(0)}MB — ` +
+        `sdkRooms=${s.sdkRooms} (workspaces=${s.workspaceRooms}), ` +
+        `sdkMembers=${s.sdkMembers}, sdkStateEvents=${s.sdkStateEvents}, ` +
+        `sdkLiveEvents=${s.sdkLiveEvents}, membersLoaded=${s.roomsWithMembersLoaded}, ` +
+        `heldEvents=${s.heldEvents}, openRooms=${s.openRooms}`
+      );
+    } catch {}
+  }));
+
+  unregisterRoomEvictor = () => { for (const off of offs) { try { off(); } catch {} } };
 }
 
 async function afterAuth(userId, homeserver) {
@@ -825,22 +879,39 @@ async function loadMembers(roomId) {
 function getSdkStats() {
   const client = getClient();
   let sdkRooms = 0, sdkLiveEvents = 0, membersLoaded = 0;
+  let sdkMembers = 0, sdkStateEvents = 0, workspaceRooms = 0;
   if (client) {
     const rooms = client.getRooms();
     sdkRooms = rooms.length;
+    const metaType = `${NAMESPACE}.meta`;
     for (const r of rooms) {
       try { sdkLiveEvents += r.getLiveTimeline().getEvents().length; } catch {}
       try { if (r.membersLoaded?.()) membersLoaded++; } catch {}
+      // Member objects are the classic JS-heap hog for big accounts; counting
+      // them (even lazily-loaded ones the SDK already has) tells us if that's
+      // where the bytes are.
+      try { sdkMembers += r.getMembers().length; } catch {}
+      try {
+        // Sum state events across the room (members, power levels, etc.).
+        const cs = r.currentState;
+        if (cs?.events) for (const m of cs.events.values()) sdkStateEvents += m.size || 0;
+      } catch {}
+      // How many of the synced rooms are actually this app's workspaces vs.
+      // unrelated Matrix rooms riding along in the full-account sync.
+      try { if (r.currentState?.getStateEvents(metaType, '')) workspaceRooms++; } catch {}
     }
   }
   let heldEvents = 0;
   for (const arr of roomEvents.values()) heldEvents += arr.length;
   return {
     sdkRooms,
+    workspaceRooms,           // app rooms; sdkRooms - workspaceRooms = freeloaders
     sdkLiveEvents,
+    sdkMembers,               // total RoomMember objects the SDK holds
+    sdkStateEvents,
     roomsWithMembersLoaded: membersLoaded,
     openRooms: openOrder.length,
-    heldEvents,
+    heldEvents,               // this app's own committed op-events in memory
   };
 }
 
