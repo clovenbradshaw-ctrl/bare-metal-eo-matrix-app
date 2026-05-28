@@ -30,9 +30,12 @@ const SOFT_FRACTION = 0.80;      // begin shedding here (~400 MB at default)
 const CRITICAL_FRACTION = 0.92;  // shed aggressively here (~460 MB)
 const SAMPLE_INTERVAL_MS = 10_000;
 
+const LOG_COOLDOWN_MS = 30_000; // throttle pressure logging/listeners (not evictors)
+
 let budgetBytes = DEFAULT_BUDGET_BYTES;
 let timer = null;
 let evicting = false;
+let lastLogAt = 0;
 let lastSample = { bytes: 0, source: 'none', at: 0 };
 
 // Evictor: { name, priority (higher sheds first), level: 'soft' | 'critical', fn }
@@ -134,11 +137,20 @@ export async function checkPressure() {
 
   evicting = true;
   try {
-    for (const fn of pressureListeners) {
-      try { fn(level, s); } catch { /* listener errors are non-fatal */ }
-    }
+    // Run evictors every interval — the cheap ones (releasing the SDK
+    // timeline this app doesn't render from) should run often; the
+    // expensive/disruptive ones self-throttle internally. But only *log*
+    // and fire pressure listeners once per cooldown, so a heap that's
+    // pinned above budget doesn't flood the console every interval.
     await runEvictors(level);
-    console.warn(`[memory] ${level} pressure at ${(s.bytes / MB).toFixed(0)}MB / ${(budgetBytes / MB).toFixed(0)}MB — shed inactive state`);
+    const now = Date.now();
+    if (now - lastLogAt >= LOG_COOLDOWN_MS) {
+      lastLogAt = now;
+      for (const fn of pressureListeners) {
+        try { fn(level, s); } catch { /* listener errors are non-fatal */ }
+      }
+      console.warn(`[memory] ${level} pressure at ${(s.bytes / MB).toFixed(0)}MB / ${(budgetBytes / MB).toFixed(0)}MB — shedding`);
+    }
   } finally {
     evicting = false;
   }
