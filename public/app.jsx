@@ -505,6 +505,7 @@ function App() {
   // become records.
   const importRowsRef = useRef({});        // import anchor -> row entity[]
   const inFlightRef   = useRef(new Set());
+  const retryRef      = useRef({});        // import anchor -> retry attempts
   const [importRowsVersion, setImportRowsVersion] = useState(0);
 
   const importEntities = useMemo(() => Object.values(state.entities || {}).filter(
@@ -515,6 +516,7 @@ function App() {
     const CI = window.CsvImport;
     if (!CI?.materializeImportRows) return;
     let cancelled = false;
+    const timers = [];
     (async () => {
       for (const imp of importEntities) {
         const a = imp._anchor;
@@ -523,8 +525,27 @@ function App() {
         try {
           const rows = await CI.materializeImportRows(imp);
           if (cancelled) return;
-          importRowsRef.current[a] = rows || [];
-          setImportRowsVersion(v => v + 1);
+          if (Array.isArray(rows)) {
+            // Successfully parsed (possibly to zero rows). Cache and render.
+            importRowsRef.current[a] = rows;
+            setImportRowsVersion(v => v + 1);
+          } else {
+            // Couldn't materialize yet — the import entity's `file` ref
+            // hasn't folded in (it DEFs in after the INS), or the media
+            // mirror is still syncing after a reload. Do NOT cache an empty
+            // result (that would hide the rows permanently); retry instead.
+            // New events re-run this effect on their own; the timer covers
+            // the case where the blob becomes readable with no further
+            // events (e.g. the homeserver finishes its first sync).
+            const n = (retryRef.current[a] || 0) + 1;
+            retryRef.current[a] = n;
+            if (n <= 8) {
+              timers.push(setTimeout(
+                () => setImportRowsVersion(v => v + 1),
+                Math.min(2000, 250 * n),
+              ));
+            }
+          }
         } catch (e) {
           console.warn('[app] could not materialize import rows:', e);
         } finally {
@@ -532,8 +553,8 @@ function App() {
         }
       }
     })();
-    return () => { cancelled = true; };
-  }, [importEntities]);
+    return () => { cancelled = true; timers.forEach(clearTimeout); };
+  }, [importEntities, importRowsVersion]);
 
   // State the data views render from: the folded state plus any rows
   // reconstructed from imported source blobs. Real folded entities win on
