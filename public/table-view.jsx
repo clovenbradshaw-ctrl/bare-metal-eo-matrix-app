@@ -31,7 +31,7 @@ function fmtCell(value, type, opts) {
   if (type === 'boolean') return { cls: 'str', text: value ? '✓' : '✗' };
   if (type === 'date') {
     const f = formatDateCell(value, opts || {});
-    return { cls: `date ${f.tone}`, text: f.text, title: f.title };
+    return { cls: `date ${f.tone}`, text: f.text, sub: f.sub, tzLabel: f.tzLabel, title: f.title };
   }
   if (type === 'duration') {
     return { cls: 'num', text: formatDuration(value) };
@@ -158,55 +158,247 @@ function isoDate(d) {
   return `${y}-${m}-${day}`;
 }
 
-// Friendly display: "Today" / "Yesterday" / "in 3d" / "May 28" with absolute on hover.
+// ─────────────────────────────────────────────────────────────────────────
+// Timezone-aware date formatting.
+// Stored values are ISO strings (sometimes date-only `YYYY-MM-DD`, sometimes
+// full RFC3339). For date-only, we skip timezone conversion entirely — there
+// is no instant to project. For datetimes, we project into opts.timezone
+// (IANA id) or the browser's local zone.
+// ─────────────────────────────────────────────────────────────────────────
+
+const BROWSER_TZ = (typeof Intl !== 'undefined' && Intl.DateTimeFormat().resolvedOptions().timeZone) || 'UTC';
+
+const DEFAULT_DATE_OPTS = {
+  format: 'friendly',     // 'friendly' | 'absolute' | 'relative' | 'iso'
+  includeTime: false,
+  hour12: false,
+  showSeconds: false,
+  showWeekday: false,
+  showYear: 'auto',       // 'auto' | 'always' | 'never'
+  timezone: 'local',      // 'local' | 'utc' | IANA id
+  showRelativeSub: false, // render a small relative-time sub-line below the cell
+};
+
+// Curated, no-dependencies tz menu. The text input below it accepts any IANA id.
+const COMMON_TZS = [
+  'local',
+  'UTC',
+  'America/Los_Angeles',
+  'America/Denver',
+  'America/Chicago',
+  'America/New_York',
+  'America/Sao_Paulo',
+  'Europe/London',
+  'Europe/Berlin',
+  'Europe/Paris',
+  'Europe/Athens',
+  'Africa/Cairo',
+  'Asia/Dubai',
+  'Asia/Kolkata',
+  'Asia/Singapore',
+  'Asia/Tokyo',
+  'Australia/Sydney',
+  'Pacific/Auckland',
+];
+
+function isDateOnly(raw) {
+  return typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw);
+}
+
+// Extract Y/M/D/H/m/s/weekday of `d` rendered in IANA tz `tz`.
+function partsInTz(d, tz) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'short',
+    });
+    const out = {};
+    for (const p of fmt.formatToParts(d)) {
+      if (p.type !== 'literal') out[p.type] = p.value;
+    }
+    return {
+      year: +out.year, month: +out.month, day: +out.day,
+      hour: +out.hour, minute: +out.minute, second: +out.second,
+      weekday: out.weekday,
+    };
+  } catch {
+    return {
+      year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate(),
+      hour: d.getHours(), minute: d.getMinutes(), second: d.getSeconds(),
+      weekday: ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()],
+    };
+  }
+}
+
+// Short tz badge — "PDT", "JST", "UTC+5:30" — for the inline pill.
+function tzShortLabel(d, tz) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' }).formatToParts(d);
+    const name = parts.find(p => p.type === 'timeZoneName')?.value || '';
+    if (name && !/^GMT[+-]/.test(name)) return name;
+    return name || tz.split('/').pop();
+  } catch { return tz; }
+}
+
+function tzOffsetLabel(d, tz) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'shortOffset' }).formatToParts(d);
+    return parts.find(p => p.type === 'timeZoneName')?.value || '';
+  } catch { return ''; }
+}
+
+// Resolve the timezone string from opts.
+function resolveTz(opts) {
+  const t = opts && opts.timezone;
+  if (!t || t === 'local' || t === 'auto') return BROWSER_TZ;
+  if (t === 'utc' || t === 'UTC') return 'UTC';
+  return t;
+}
+
+// Day index in tz, used to compute "today/tomorrow" stable across DST.
+function dayKey(parts) {
+  return parts.year * 10000 + parts.month * 100 + parts.day;
+}
+
+// One human-friendly relative phrase. `nowMs` is the comparison point.
+function formatRelative(targetMs, nowMs, opts = {}) {
+  const diff = targetMs - nowMs;
+  const abs = Math.abs(diff);
+  const past = diff < 0;
+  // Less than a minute → "just now"
+  if (abs < 45_000) return past ? 'just now' : 'in a moment';
+  const MIN = 60_000, HR = 3_600_000, DAY = 86_400_000;
+  let n, unit;
+  if (abs < HR)              { n = Math.round(abs / MIN); unit = 'min'; }
+  else if (abs < DAY)        { n = Math.round(abs / HR);  unit = 'h';   }
+  else if (abs < 30 * DAY)   { n = Math.round(abs / DAY); unit = 'd';   }
+  else if (abs < 365 * DAY)  { n = Math.round(abs / (30 * DAY)); unit = 'mo'; }
+  else                       { n = Math.round(abs / (365 * DAY)); unit = 'y'; }
+  if (opts.long) {
+    const word = { min: 'minute', h: 'hour', d: 'day', mo: 'month', y: 'year' }[unit];
+    const plural = n === 1 ? word : word + 's';
+    return past ? `${n} ${plural} ago` : `in ${n} ${plural}`;
+  }
+  return past ? `${n}${unit} ago` : `in ${n}${unit}`;
+}
+
+// Format an absolute date+time string using opts and a target IANA tz.
+function formatAbsolute(d, opts, tz) {
+  const dtOpts = {
+    timeZone: tz,
+    month: 'short',
+    day: 'numeric',
+  };
+  // Year handling: 'auto' (only when different from current local year), 'always', 'never'.
+  const showYear = opts.showYear || 'auto';
+  const nowYear = partsInTz(new Date(), tz).year;
+  const dYear = partsInTz(d, tz).year;
+  if (showYear === 'always' || (showYear === 'auto' && dYear !== nowYear)) {
+    dtOpts.year = 'numeric';
+  }
+  if (opts.showWeekday) dtOpts.weekday = 'short';
+  if (opts.includeTime) {
+    dtOpts.hour = 'numeric';
+    dtOpts.minute = '2-digit';
+    if (opts.showSeconds) dtOpts.second = '2-digit';
+    dtOpts.hour12 = !!opts.hour12;
+  }
+  try { return new Intl.DateTimeFormat(undefined, dtOpts).format(d); }
+  catch { return d.toLocaleString(); }
+}
+
+// Friendly cell display: "today, 3:42 PM" / "yesterday" / "in 3d" / "May 28 · PDT".
 function formatDateCell(value, opts = {}) {
-  if (value === undefined || value === null || value === '') return { text: '', title: '', tone: '' };
-  const d = new Date(value);
-  if (isNaN(d.getTime())) return { text: '#date', title: String(value), tone: 'date-invalid' };
+  if (value === undefined || value === null || value === '') return { text: '', sub: '', title: '', tone: '', tzLabel: '' };
+  const raw = String(value);
+  const dateOnly = isDateOnly(raw);
+  // For date-only values, build a noon-local Date so toLocaleDateString lands on
+  // the same calendar day regardless of viewer's tz.
+  const d = dateOnly ? new Date(raw + 'T12:00:00') : new Date(raw);
+  if (isNaN(d.getTime())) return { text: '#date', sub: '', title: String(value), tone: 'date-invalid', tzLabel: '' };
 
+  const tz = dateOnly ? BROWSER_TZ : resolveTz(opts);
   const now = new Date();
-  const startToday = startOfDay(now);
-  const dDay = startOfDay(d);
-  const diffDays = Math.round((dDay.getTime() - startToday.getTime()) / DAY_MS);
+  const targetParts = partsInTz(d, tz);
+  const todayParts  = partsInTz(now, tz);
 
-  const fmt = opts.dateFormat || 'friendly';
-  const includeTime = opts.includeTime;
-  const sameYear = d.getFullYear() === now.getFullYear();
-  const absLabel = d.toLocaleString(undefined, {
-    month: 'short', day: 'numeric',
-    year: sameYear ? undefined : 'numeric',
-    hour: includeTime ? '2-digit' : undefined,
-    minute: includeTime ? '2-digit' : undefined,
-  });
-  const isoLabel = d.toISOString();
+  // diffDays: how many calendar days apart in the display timezone.
+  const targetMid = Date.UTC(targetParts.year, targetParts.month - 1, targetParts.day);
+  const todayMid  = Date.UTC(todayParts.year, todayParts.month - 1, todayParts.day);
+  const diffDays = Math.round((targetMid - todayMid) / DAY_MS);
 
-  let text;
-  if (fmt === 'iso') text = isoLabel;
-  else if (fmt === 'relative') text = relativeLabel(diffDays);
-  else { // friendly
-    if (diffDays === 0) text = includeTime ? `today, ${d.toLocaleTimeString(undefined, {hour:'2-digit',minute:'2-digit'})}` : 'today';
-    else if (diffDays === -1) text = 'yesterday';
-    else if (diffDays === 1)  text = 'tomorrow';
-    else if (diffDays >= -7 && diffDays < 0) text = `${-diffDays}d ago`;
-    else if (diffDays > 1 && diffDays <= 7) text = `in ${diffDays}d`;
-    else text = absLabel;
+  const includeTime = !dateOnly && !!opts.includeTime;
+  const abs = formatAbsolute(d, { ...opts, includeTime }, tz);
+
+  // Time-only fragment for "today, 3:42 PM" friendly mode.
+  let timeFrag = '';
+  if (includeTime) {
+    try {
+      timeFrag = new Intl.DateTimeFormat(undefined, {
+        timeZone: tz, hour: 'numeric', minute: '2-digit',
+        second: opts.showSeconds ? '2-digit' : undefined,
+        hour12: !!opts.hour12,
+      }).format(d);
+    } catch { timeFrag = ''; }
   }
 
-  // tone — for conditional formatting
+  const fmt = opts.format || opts.dateFormat || 'friendly';
+  let text;
+  if (fmt === 'iso') {
+    text = dateOnly ? raw : d.toISOString();
+  } else if (fmt === 'absolute') {
+    text = abs;
+  } else if (fmt === 'relative') {
+    text = formatRelative(d.getTime(), now.getTime(), { long: false });
+  } else { // friendly
+    if (diffDays === 0)       text = timeFrag ? `today, ${timeFrag}` : 'today';
+    else if (diffDays === -1) text = timeFrag ? `yesterday, ${timeFrag}` : 'yesterday';
+    else if (diffDays === 1)  text = timeFrag ? `tomorrow, ${timeFrag}` : 'tomorrow';
+    else if (diffDays >= -7 && diffDays < 0) text = `${-diffDays}d ago${timeFrag ? `, ${timeFrag}` : ''}`;
+    else if (diffDays > 1 && diffDays <= 7)  text = `in ${diffDays}d${timeFrag ? `, ${timeFrag}` : ''}`;
+    else text = abs;
+  }
+
+  // Optional sub-line — opposite of whatever's in the headline.
+  let sub = '';
+  if (opts.showRelativeSub) {
+    if (fmt === 'friendly' || fmt === 'iso' || fmt === 'absolute') {
+      // headline is absolute-ish → sub gets relative
+      if (Math.abs(diffDays) > 7 || fmt === 'iso' || fmt === 'absolute') {
+        sub = formatRelative(d.getTime(), now.getTime(), { long: false });
+      }
+    } else if (fmt === 'relative') {
+      sub = abs;
+    }
+  }
+
+  // Tooltip — multi-line, rich.
+  const tooltipLines = [
+    abs,
+    formatRelative(d.getTime(), now.getTime(), { long: true }),
+  ];
+  if (!dateOnly) {
+    const offset = tzOffsetLabel(d, tz);
+    const tzShort = tzShortLabel(d, tz);
+    if (tz !== BROWSER_TZ) tooltipLines.push(`${tzShort} (${offset}) · ${tz}`);
+    else if (offset)       tooltipLines.push(`${tzShort} ${offset}`);
+    tooltipLines.push(d.toISOString());
+  }
+  const title = tooltipLines.join('  ·  ');
+
+  // tz badge: only shown when the display tz differs from the browser's,
+  // and only for instants (not date-only).
+  const tzLabel = (!dateOnly && tz !== BROWSER_TZ) ? tzShortLabel(d, tz) : '';
+
+  // Conditional formatting tone.
   let tone = '';
   if (diffDays < 0) tone = 'date-past';
   else if (diffDays === 0) tone = 'date-today';
   else if (diffDays <= 7) tone = 'date-soon';
   else tone = 'date-future';
 
-  return { text, title: `${absLabel}  ·  ${isoLabel}`, tone };
-}
-function relativeLabel(diffDays) {
-  if (diffDays === 0) return 'today';
-  if (diffDays === -1) return 'yesterday';
-  if (diffDays === 1)  return 'tomorrow';
-  if (diffDays < 0) return `${-diffDays}d ago`;
-  return `in ${diffDays}d`;
+  return { text, sub, title, tone, tzLabel };
 }
 
 // Duration field — stored as seconds. Display as "2h 30m" / "1d 4h" / "45m".
@@ -248,10 +440,15 @@ function parseDuration(input) {
 // _schema.fields.<set>.{formula | rollup} and is authored by room members.
 // ─────────────────────────────────────────────────────────────────────────
 
-function FormulaCell({ formula, record, state }) {
+function FormulaCell({ formula, record, state, events, fieldName, entityType }) {
   const r = (window.Formula && window.Formula.evaluate)
-    ? window.Formula.evaluate(formula, { record, state })
+    ? window.Formula.evaluate(formula, { record, state, events, entityType })
     : { ok: false, value: null, error: 'formula.js not loaded' };
+  // EVA failure check — does the host entity have a failed evaluation tagged to this field's name?
+  const failedEva = (events && record?._anchor && fieldName)
+    ? (window.Formula?.Field?.evaluations(events, record._anchor, fieldName) || []).slice(-1)[0]
+    : null;
+  const evaFailed = failedEva && failedEva.result === 'fail';
   if (!r.ok) {
     return (
       <td className="cell formula has-error" title={`formula error · ${r.error}\n= ${formula || ''}`}>
@@ -261,8 +458,9 @@ function FormulaCell({ formula, record, state }) {
   }
   const { cls, text } = fmtCell(r.value, typeof r.value === 'number' ? 'number' : 'text');
   return (
-    <td className={`cell formula ${cls}`} title={formula ? `= ${formula}` : 'formula · set the expression in the schema view'}>
+    <td className={`cell formula ${cls} ${evaFailed ? 'eva-failed' : ''}`} title={(formula ? `= ${formula}` : 'formula · set the expression in the schema view') + (evaFailed ? `\n⊨ EVA failed · ${failedEva.criterion}${failedEva.note ? ' — ' + failedEva.note : ''}` : '')}>
       {text}
+      {evaFailed && <span className="eva-mark" title={`⊨ ${failedEva.criterion}: ${failedEva.result}`}>⊨</span>}
     </td>
   );
 }
@@ -295,10 +493,23 @@ function RollupCell({ rollup, record, state }) {
   );
 }
 
-function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsumed, onNavigate }) {
+function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsumed, onNavigate, events, anchor, fieldName, options, dateOpts }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const inputRef = useRef(null);
+
+  // EVA validation indicator — does this entity have a failed EVA whose
+  // criterion or note mentions this field, or which is explicitly tagged
+  // to this field via content.field? Surfaces as a subtle ⊨ glyph.
+  const failedEva = (events && anchor && fieldName)
+    ? (window.Formula?.Field?.evaluations(events, anchor) || [])
+        .filter(e => e.result === 'fail' && (
+          e.field === fieldName ||
+          String(e.criterion || '').toLowerCase() === String(fieldName).toLowerCase() ||
+          String(e.note || '').toLowerCase().includes('{' + String(fieldName).toLowerCase() + '}')
+        ))
+        .slice(-1)[0]
+    : null;
 
   function draftFromValue(v) {
     return v === undefined || v === null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
@@ -331,6 +542,12 @@ function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsume
       if (!isNaN(n)) parsed = n;
     } else if (type === 'json') {
       try { parsed = JSON.parse(draft); } catch {}
+    } else if (type === 'date') {
+      // Smart parse: keep ISO if already so, else best-effort. Empty draft → ''.
+      if (draft && draft.trim()) {
+        const t = window.Formula?.parseDateLike ? window.Formula.parseDateLike(draft) : Date.parse(draft);
+        if (t != null && !isNaN(t)) parsed = new Date(t).toISOString();
+      }
     }
     if (parsed !== value) onCommit(parsed);
   }
@@ -340,6 +557,75 @@ function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsume
   }
 
   if (editing) {
+    // Date type → native date or datetime picker (airtable-style); also accepts free text on blur.
+    if (type === 'date') {
+      const wantsTime = !!(dateOpts && dateOpts.includeTime);
+      if (wantsTime) {
+        // For datetime-local we need a `YYYY-MM-DDTHH:MM` string in local tz.
+        let dtLocal = '';
+        if (draft) {
+          const parsed = new Date(draft);
+          if (!isNaN(parsed.getTime())) {
+            const pad = (n) => String(n).padStart(2, '0');
+            dtLocal = `${parsed.getFullYear()}-${pad(parsed.getMonth()+1)}-${pad(parsed.getDate())}T${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+          }
+        }
+        return (
+          <td className="cell editing date-editing">
+            <input
+              ref={inputRef}
+              type="datetime-local"
+              value={dtLocal}
+              onChange={e => setDraft(e.target.value)}
+              onBlur={commit}
+              onKeyDown={e => {
+                if (e.key === 'Enter') { e.preventDefault(); commitAndNavigate('enter'); }
+                else if (e.key === 'Tab') { e.preventDefault(); commitAndNavigate(e.shiftKey ? 'shift-tab' : 'tab'); }
+                else if (e.key === 'Escape') setEditing(false);
+              }}
+            />
+          </td>
+        );
+      }
+      const isoDay = draft && /^\d{4}-\d{2}-\d{2}/.test(draft) ? draft.slice(0, 10) : '';
+      return (
+        <td className="cell editing date-editing">
+          <input
+            ref={inputRef}
+            type="date"
+            value={isoDay}
+            onChange={e => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.preventDefault(); commitAndNavigate('enter'); }
+              else if (e.key === 'Tab') { e.preventDefault(); commitAndNavigate(e.shiftKey ? 'shift-tab' : 'tab'); }
+              else if (e.key === 'Escape') setEditing(false);
+            }}
+          />
+        </td>
+      );
+    }
+    // Single-select → dropdown of the declared options.
+    if (type === 'select' && Array.isArray(options) && options.length) {
+      return (
+        <td className="cell editing">
+          <select
+            ref={inputRef}
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.preventDefault(); commitAndNavigate('enter'); }
+              else if (e.key === 'Tab') { e.preventDefault(); commitAndNavigate(e.shiftKey ? 'shift-tab' : 'tab'); }
+              else if (e.key === 'Escape') setEditing(false);
+            }}
+          >
+            <option value="">—</option>
+            {options.map(o => <option key={o} value={o}>{o}</option>)}
+          </select>
+        </td>
+      );
+    }
     return (
       <td className="cell editing">
         <input
@@ -356,9 +642,21 @@ function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsume
       </td>
     );
   }
-  const { cls, text } = fmtCell(value, type);
+  const { cls, text, sub, tzLabel } = fmtCell(value, type, type === 'date' ? (dateOpts || {}) : undefined);
   const heatCls = heat ? heatClass(heat) : '';
-  return <td className={`cell ${cls} ${heatCls}`} onClick={startEdit} title={heat ? `${heat} write${heat===1?'':'s'} · click to edit` : 'click to edit · emits DEF'}>{text}</td>;
+  const evaFailed = !!failedEva;
+  const baseTitle = heat ? `${heat} write${heat===1?'':'s'} · click to edit` : 'click to edit · emits DEF';
+  const evaTitle = evaFailed ? `\n⊨ EVA failed · ${failedEva.criterion}${failedEva.note ? ' — ' + failedEva.note : ''}` : '';
+  const dateTitle = type === 'date' && fmtCell(value, type, dateOpts || {}).title;
+  const titleText = (dateTitle ? dateTitle + '\n' : '') + baseTitle + evaTitle;
+  return (
+    <td className={`cell ${cls} ${heatCls} ${evaFailed ? 'eva-failed' : ''}`} onClick={startEdit} title={titleText}>
+      <span className="cell-main">{text}</span>
+      {tzLabel && <span className="date-tz-pill" aria-hidden="true">{tzLabel}</span>}
+      {sub && <span className="cell-sub">{sub}</span>}
+      {evaFailed && <span className="eva-mark">⊨</span>}
+    </td>
+  );
 }
 
 function heatClass(n) {
@@ -408,7 +706,7 @@ function buildTable(entityType, state) {
   let cols;
   if (Array.isArray(schemaFields)) {
     const declared = new Set(schemaFields.map(f => f.name));
-    cols = schemaFields.map(f => ({ name: f.name, type: f.type, options: f.options, formula: f.formula, rollup: f.rollup, schematized: true }));
+    cols = schemaFields.map(f => ({ name: f.name, type: f.type, options: f.options, formula: f.formula, rollup: f.rollup, dateOpts: f.dateOpts, schematized: true }));
     // any data-only columns get appended
     const extras = new Set();
     for (const r of rows) {
@@ -477,7 +775,8 @@ function linksFromAnchor(anchor, otherType, state) {
 // One table
 // ─────────────────────────────────────────────────────────────────────────
 
-function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showDDL, setSelection }) {
+function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showDDL, setSelection, allEventsInRoom }) {
+  const events = allEventsInRoom || [];
   const { cols, rows, partitioned, partitionFromSchema } = useMemo(() => buildTable(entityType, state), [entityType, state]);
   const linkedTypes = useMemo(() => linkedTypesFor(entityType, state), [entityType, state]);
   const declaredInSchema = !!state.schema?.fields?.[entityType] || (state.schema?.tables || []).includes(entityType);
@@ -513,6 +812,8 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
       else if (typeof u.formula !== 'string') u.formula = '';
       if (newType !== 'rollup') delete u.rollup;
       else if (!u.rollup || typeof u.rollup !== 'object') u.rollup = { via: '', field: '', fn: 'count' };
+      if (newType !== 'date') delete u.dateOpts;
+      else if (!u.dateOpts) u.dateOpts = { ...DEFAULT_DATE_OPTS };
       return u;
     });
     onEmit(TV_OP.DEF, { anchor: null, path: `_schema.fields.${entityType}`, value: next });
@@ -581,6 +882,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     if (type === 'select' || type === 'multiselect') newField.options = [];
     if (type === 'formula') newField.formula = '';
     if (type === 'rollup')  newField.rollup  = { via: '', field: '', fn: 'count' };
+    if (type === 'date')    newField.dateOpts = { ...DEFAULT_DATE_OPTS };
     onEmit(TV_OP.DEF, {
       anchor: null,
       path: `_schema.fields.${entityType}`,
@@ -762,26 +1064,31 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                 const isRenaming = renameable && renamingField?.oldName === c.name;
                 const showGlyph = c.isPk || isFormula || isRollup;
                 const canEdit = !c.isPk && c.type !== 'linked' && c.type !== 'partition' && c.schematized !== false;
+                // Operator-typed glyph for formula columns. Classified by the formula's structure;
+                // rollup is structurally aggregation (△ SYN). pk is identity (● INS).
+                const fclass = isFormula ? (window.Formula?.classify ? window.Formula.classify(c.formula || '') : null) : null;
+                const glyphChar = c.isPk ? '●' : isRollup ? '△' : (fclass?.glyph || 'ƒ');
+                const glyphLabel = c.isPk ? 'INS · identity' : isRollup ? 'SYN · synthesis (rollup)' : (fclass ? `${fclass.op} · ${fclass.label}` : 'formula');
                 const headerTitle = c.isPk
                   ? '_anchor · formula field, derived from INS payload'
                   : isFormula
-                    ? (c.formula ? `formula: ${c.formula}` : 'formula field · click to set the expression')
+                    ? (c.formula ? `${glyphLabel}\n= ${c.formula}` : `${glyphLabel} · click to set the expression`)
                     : isRollup
-                      ? (c.rollup?.via ? `rollup: ${c.rollup.fn || 'count'}(${c.rollup.field || ''}) via ${c.rollup.via}` : 'rollup field · click to set via / field / fn')
+                      ? (c.rollup?.via ? `△ rollup: ${c.rollup.fn || 'count'}(${c.rollup.field || ''}) via ${c.rollup.via}` : '△ rollup field · click to set via / field / fn')
                       : (c.schematized === false ? 'in data but not in _schema' : canEdit ? 'click to edit field · rename, change type, set params' : '');
                 const openMenu = (canEdit && !isRenaming) ? (e) => {
                   // never hijack clicks inside the inline rename input
                   if (e.target.tagName === 'INPUT') return;
                   e.preventDefault();
                   const r = e.currentTarget.getBoundingClientRect();
-                  setColMenu({ name: c.name, currentType: c.type, options: c.options, formula: c.formula, rollup: c.rollup, x: r.left, y: r.bottom });
+                  setColMenu({ name: c.name, currentType: c.type, options: c.options, formula: c.formula, rollup: c.rollup, dateOpts: c.dateOpts, x: r.left, y: r.bottom });
                 } : undefined;
                 return (
                   <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''} ${showGlyph ? 'formula' : ''} ${canEdit ? 'editable' : ''}`}
                       title={headerTitle}
                       onClick={openMenu}
                       onContextMenu={openMenu}>
-                    {showGlyph && <span className="formula-glyph" title="formula field">ƒ </span>}
+                    {showGlyph && <span className={`formula-glyph op-${c.isPk ? 'ins' : isRollup ? 'syn' : (fclass?.op || 'def').toLowerCase()}`} title={glyphLabel}>{glyphChar} </span>}
                     {isRenaming ? (
                       <input
                         autoFocus
@@ -841,7 +1148,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                 ))}
                 {cols.map((c, cIdx) => (
                   c.type === 'formula' ? (
-                    <FormulaCell key={c.name} formula={c.formula} record={r} state={state} />
+                    <FormulaCell key={c.name} formula={c.formula} record={r} state={state} events={events} fieldName={c.name} entityType={entityType} />
                   ) : c.type === 'rollup' ? (
                     <RollupCell key={c.name} rollup={c.rollup} record={r} state={state} />
                   ) : (
@@ -854,6 +1161,11 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                       shouldFocus={pendingFocus?.anchor === r._anchor && pendingFocus?.field === c.name}
                       onFocusConsumed={() => setPendingFocus(null)}
                       onNavigate={(dir) => navigate(rIdx, cIdx, dir)}
+                      events={events}
+                      anchor={r._anchor}
+                      fieldName={c.name}
+                      options={c.options}
+                      dateOpts={c.dateOpts}
                     />
                   )
                 ))}
@@ -959,7 +1271,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
           ))}
 
           {/* Params editor — only when not in creating mode and type has params */}
-          {!colMenu.creating && (colMenu.currentType === 'formula' || colMenu.currentType === 'rollup' || colMenu.currentType === 'select' || colMenu.currentType === 'multiselect') && (
+          {!colMenu.creating && (colMenu.currentType === 'formula' || colMenu.currentType === 'rollup' || colMenu.currentType === 'select' || colMenu.currentType === 'multiselect' || colMenu.currentType === 'date') && (
             <ColMenuParams
               menu={colMenu}
               state={state}
@@ -980,33 +1292,11 @@ function sqlType(t) {
 
 // Short docs for the most commonly used functions (used by the autocomplete
 // popover when a suggestion is hovered/active). Falls back to empty hint.
-const FORMULA_HINTS = {
-  SUM: 'SUM(num, …) → total', AVG: 'AVG(num, …)', AVERAGE: 'AVERAGE(num, …)',
-  MIN: 'MIN(num, …)', MAX: 'MAX(num, …)', COUNT: 'COUNT(num, …)', COUNTA: 'COUNTA(any, …)',
-  ROUND: 'ROUND(n, digits=0)', ROUNDUP: 'ROUNDUP(n, digits=0)', ROUNDDOWN: 'ROUNDDOWN(n, digits=0)',
-  ABS: 'ABS(n)', FLOOR: 'FLOOR(n)', CEIL: 'CEIL(n)', CEILING: 'CEILING(n)', INT: 'INT(n)',
-  POW: 'POW(base, exp)', POWER: 'POWER(base, exp)', SQRT: 'SQRT(n)', MOD: 'MOD(a, b)', EXP: 'EXP(n)', LOG: 'LOG(n, base=10)',
-  IF: 'IF(cond, then, else)', AND: 'AND(a, …) → all truthy',
-  OR: 'OR(a, …) → any truthy', NOT: 'NOT(x)', BLANK: 'BLANK(v)',
-  IFERROR: 'IFERROR(value, fallback)', SWITCH: 'SWITCH(expr, key, val, …, default?)',
-  CONCAT: 'CONCAT(a, …)', CONCATENATE: 'CONCATENATE(a, …)',
-  LEN: 'LEN(str)', LOWER: 'LOWER(str)', UPPER: 'UPPER(str)', TRIM: 'TRIM(str)',
-  LEFT: 'LEFT(str, n)', RIGHT: 'RIGHT(str, n)', MID: 'MID(str, start, count)',
-  FIND: 'FIND(needle, hay, start=0) → 1-indexed', SEARCH: 'SEARCH(needle, hay) → case-insensitive',
-  SUBSTITUTE: 'SUBSTITUTE(str, find, rep, [index])', REPLACE: 'REPLACE(str, find, rep)',
-  REPT: 'REPT(str, n)', T: 'T(value) → str or blank',
-  ENCODE_URL_COMPONENT: 'ENCODE_URL_COMPONENT(str)',
-  REGEX_MATCH: 'REGEX_MATCH(str, pattern) → bool', REGEX_EXTRACT: 'REGEX_EXTRACT(str, pattern)',
-  REGEX_REPLACE: 'REGEX_REPLACE(str, pattern, rep)',
-  TODAY: 'TODAY() → YYYY-MM-DD', NOW: 'NOW() → ISO timestamp',
-  YEAR: 'YEAR(date)', MONTH: 'MONTH(date)', DAY: 'DAY(date)',
-  HOUR: 'HOUR(date)', MINUTE: 'MINUTE(date)', SECOND: 'SECOND(date)', WEEKDAY: 'WEEKDAY(date) → 0..6',
-  DATEADD: 'DATEADD(date, n, "days"|"hours"|…)',
-  DATETIME_DIFF: 'DATETIME_DIFF(a, b, unit="days")',
-  DATETIME_FORMAT: 'DATETIME_FORMAT(date, "YYYY-MM-DD HH:mm")',
-  RECORD_ID: 'RECORD_ID() → this row\'s _anchor',
-  CREATED_TIME: 'CREATED_TIME() → row created ts',
-  LAST_MODIFIED_TIME: 'LAST_MODIFIED_TIME() → last update ts',
+// We delegate to window.Formula.HINTS at runtime so this stays in lockstep
+// with formula.js — the local map below is just a fallback / smaller subset.
+const FORMULA_HINTS = (window.Formula && window.Formula.HINTS) ? window.Formula.HINTS : {
+  SUM: 'SUM(num, …) → total', AVG: 'AVG(num, …)', IF: 'IF(cond, then, else)',
+  CONCATENATE: 'CONCATENATE(a, …)', UPPER: 'UPPER(s)', LOWER: 'LOWER(s)',
 };
 
 function FormulaEditor({ value, entityType, state, onCommit }) {
@@ -1020,7 +1310,16 @@ function FormulaEditor({ value, entityType, state, onCommit }) {
   const FUNCS = window.Formula?.FUNCTIONS || [];
   const HELPERS = ['RECORD_ID', 'CREATED_TIME', 'LAST_MODIFIED_TIME', 'TRUE', 'FALSE', 'NULL', 'PI', 'E'];
   const ALL_IDENTS = [...FUNCS, ...HELPERS];
-  const fields = (state.schema?.fields?.[entityType] || []).map(f => f.name);
+  // Real (stored) fields PLUS linked-record column names (entity types this
+  // table connects to). Linked refs resolve to an array of linked-row labels
+  // at evaluate time — same value the cell renders.
+  const realFields = (state.schema?.fields?.[entityType] || []).map(f => f.name);
+  const linkSet = new Set();
+  for (const l of (state.schema?.links || [])) {
+    if (l.from === entityType) linkSet.add(l.to);
+    if (l.to === entityType)   linkSet.add(l.from);
+  }
+  const fields = [...realFields, ...[...linkSet].filter(n => !realFields.includes(n))];
 
   // Recompute suggestions every time the textarea content changes or caret moves.
   function recomputeSuggestions() {
@@ -1094,8 +1393,10 @@ function FormulaEditor({ value, entityType, state, onCommit }) {
       }
       if (e.key === 'Escape') { e.preventDefault(); setSugg(null); return; }
     }
-    if ((e.key === 'Enter' && (e.metaKey || e.ctrlKey)) || (e.key === 'Enter' && !sugg && e.shiftKey === false)) {
-      if (e.metaKey || e.ctrlKey) { e.preventDefault(); commit(); }
+    // ⏎ (without suggestions) or ⌘/Ctrl+⏎ → save. Shift+⏎ inserts a newline.
+    if (e.key === 'Enter' && !sugg && !e.shiftKey) {
+      e.preventDefault();
+      commit();
     }
   }
 
@@ -1114,7 +1415,15 @@ function FormulaEditor({ value, entityType, state, onCommit }) {
           placeholder="UPPER({Name})  ·  {price} * {qty}  ·  IF({done}, 'shipped', 'wip')"
           rows={3}
           spellCheck={false}
-          onChange={(e) => { setDraft(e.target.value); recomputeSuggestions(); }}
+          onChange={(e) => {
+            const v = e.target.value;
+            setDraft(v);
+            recomputeSuggestions();
+            // Live commit — every keystroke writes the formula. Matches Airtable
+            // and avoids the lost-on-unmount bug where clicking outside the menu
+            // never fires onBlur.
+            if (v !== (value || '')) onCommit(v);
+          }}
           onClick={recomputeSuggestions}
           onKeyUp={(e) => {
             // Reposition popover after arrow nav inside textarea
@@ -1140,7 +1449,7 @@ function FormulaEditor({ value, entityType, state, onCommit }) {
         )}
       </div>
       <div className="ctm-hint-line">
-        type <code>{'{'}</code> for fields · letters for functions · ↑↓ to nav · ⏎/⇥ to accept · ⌘/Ctrl+⏎ to save
+        type <code>{'{'}</code> for fields · letters for functions · ↑↓ to nav · ⏎/⇥ to accept · saves as you type
       </div>
     </div>
   );
@@ -1243,20 +1552,128 @@ function ColMenuParams({ menu, state, entityType, linkedTypes, onPatch }) {
       </div>
     );
   }
+  if (t === 'date') {
+    return <DateParams menu={menu} onPatch={onPatch} />;
+  }
   return null;
+}
+
+function DateParams({ menu, onPatch }) {
+  const opts = { ...DEFAULT_DATE_OPTS, ...(menu.dateOpts || {}) };
+  const set = (patch) => onPatch({ dateOpts: { ...opts, ...patch } });
+
+  // Live preview, refreshed on each render — uses the current instant.
+  const sample = new Date();
+  const preview = formatDateCell(sample.toISOString(), opts);
+
+  return (
+    <div className="ctm-params date-params">
+      <div className="ctm-section-label">display</div>
+
+      <div className="dp-row dp-segmented">
+        {[
+          { v: 'friendly', l: 'friendly', h: 'today · in 3d · May 28' },
+          { v: 'absolute', l: 'absolute', h: 'May 28, 3:42 PM' },
+          { v: 'relative', l: 'relative', h: '3d ago · in 2mo' },
+          { v: 'iso',      l: 'iso',      h: '2026-05-28T15:42…' },
+        ].map(o => (
+          <button
+            key={o.v}
+            className={`dp-seg ${opts.format === o.v ? 'on' : ''}`}
+            onClick={() => set({ format: o.v })}
+            title={o.h}
+          >{o.l}</button>
+        ))}
+      </div>
+
+      <div className="dp-row dp-toggles">
+        <label className="dp-toggle">
+          <input type="checkbox" checked={!!opts.includeTime} onChange={e => set({ includeTime: e.target.checked })} />
+          <span>include time</span>
+        </label>
+        <label className={`dp-toggle ${!opts.includeTime ? 'is-disabled' : ''}`}>
+          <input type="checkbox" disabled={!opts.includeTime} checked={!!opts.hour12} onChange={e => set({ hour12: e.target.checked })} />
+          <span>12-hour</span>
+        </label>
+        <label className={`dp-toggle ${!opts.includeTime ? 'is-disabled' : ''}`}>
+          <input type="checkbox" disabled={!opts.includeTime} checked={!!opts.showSeconds} onChange={e => set({ showSeconds: e.target.checked })} />
+          <span>seconds</span>
+        </label>
+        <label className="dp-toggle">
+          <input type="checkbox" checked={!!opts.showWeekday} onChange={e => set({ showWeekday: e.target.checked })} />
+          <span>weekday</span>
+        </label>
+        <label className="dp-toggle">
+          <input type="checkbox" checked={!!opts.showRelativeSub} onChange={e => set({ showRelativeSub: e.target.checked })} />
+          <span>relative sub</span>
+        </label>
+      </div>
+
+      <div className="dp-row dp-pair">
+        <label>year</label>
+        <select value={opts.showYear} onChange={e => set({ showYear: e.target.value })}>
+          <option value="auto">auto · if different from current</option>
+          <option value="always">always</option>
+          <option value="never">never</option>
+        </select>
+      </div>
+
+      <div className="dp-row dp-pair">
+        <label>timezone</label>
+        <select value={opts.timezone} onChange={e => set({ timezone: e.target.value })}>
+          {COMMON_TZS.map(tz => {
+            const lbl = tz === 'local' ? `local · ${BROWSER_TZ}` : tz;
+            return <option key={tz} value={tz}>{lbl}</option>;
+          })}
+          {!COMMON_TZS.includes(opts.timezone) && <option value={opts.timezone}>{opts.timezone}</option>}
+        </select>
+      </div>
+
+      <div className="dp-row dp-pair">
+        <label>custom tz</label>
+        <input
+          type="text"
+          className="dp-tz-input"
+          placeholder="IANA id · e.g. America/Argentina/Buenos_Aires"
+          defaultValue={COMMON_TZS.includes(opts.timezone) ? '' : opts.timezone}
+          onBlur={(e) => {
+            const v = e.target.value.trim();
+            if (!v) return;
+            try { new Intl.DateTimeFormat('en-US', { timeZone: v }); set({ timezone: v }); }
+            catch { /* ignore invalid */ }
+          }}
+          onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
+        />
+      </div>
+
+      <div className="ctm-section-label">preview</div>
+      <div className="dp-preview">
+        <div className="dp-preview-row">
+          <span className={`dp-preview-cell date ${preview.tone}`}>
+            <span>{preview.text}</span>
+            {preview.tzLabel && <span className="date-tz-pill">{preview.tzLabel}</span>}
+          </span>
+          {preview.sub && <span className="dp-preview-sub">{preview.sub}</span>}
+        </div>
+        <div className="dp-preview-meta">{preview.title}</div>
+      </div>
+    </div>
+  );
 }
 
 function fmtAbsDate(ts) {
   const d = new Date(ts);
-  return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  if (isNaN(d.getTime())) return '—';
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    year: sameYear ? undefined : 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  });
 }
 function fmtRelTime(ts) {
-  const diff = Date.now() - ts;
-  if (diff < 0) return 'just now';
-  if (diff < 60000) return 'just now';
-  if (diff < 3600000) return `${Math.floor(diff/60000)}m ago`;
-  if (diff < 86400000) return `${Math.floor(diff/3600000)}h ago`;
-  return `${Math.floor(diff/86400000)}d ago`;
+  if (!ts) return '';
+  return formatRelative(ts, Date.now(), { long: false });
 }
 
 // Standard field types — the type picker offers these.
@@ -2107,7 +2524,7 @@ function CreateTableForm({ state, room, onEmit, onCancel, defaultName = '' }) {
 // Root
 // ─────────────────────────────────────────────────────────────────────────
 
-function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead, setSelection }) {
+function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead, setSelection, allEventsInRoom }) {
   const [jumpHighlight, setJumpHighlight] = useState(null);
   const [activeTable, setActiveTable] = useState(null);
   const [creating, setCreating] = useState(false);
@@ -2218,6 +2635,7 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
             jumpHighlight={jumpHighlight}
             showDDL={tweaks?.showSchemaDDL}
             setSelection={setSelection}
+            allEventsInRoom={allEventsInRoom || []}
           />
         )}
         {!creating && active?.kind === 'syntheses' && (
