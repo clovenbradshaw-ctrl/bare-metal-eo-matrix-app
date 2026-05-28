@@ -505,16 +505,29 @@ function App() {
   // become records.
   const importRowsRef = useRef({});        // import anchor -> row entity[]
   const inFlightRef   = useRef(new Set());
+  const mountedRef    = useRef(true);
   const [importRowsVersion, setImportRowsVersion] = useState(0);
+
+  useEffect(() => () => { mountedRef.current = false; }, []);
 
   const importEntities = useMemo(() => Object.values(state.entities || {}).filter(
     e => e?._type === 'import' && e.derived_set && Array.isArray(e.field_plan)
   ), [state]);
 
+  // `importEntities` gets a fresh array reference on every fold, so this
+  // effect re-runs (and its cleanup fires) on unrelated timeline activity —
+  // e.g. the import's own `file`/`imported_at` DEFs or schema DEFs echoing
+  // back from the server while a materialization is still awaiting the blob.
+  // We must NOT drop an in-flight result when that happens: the rows are
+  // keyed by an immutable content-addressed anchor sourced from an immutable
+  // blob, so caching them is always valid no matter which run produced them.
+  // Bailing early here used to strand the rows (the superseding run had
+  // already skipped the in-flight anchor), leaving the table empty until a
+  // manual refresh. So we always store the result and only gate the state
+  // bump on the component still being mounted.
   useEffect(() => {
     const CI = window.CsvImport;
     if (!CI?.materializeImportRows) return;
-    let cancelled = false;
     (async () => {
       for (const imp of importEntities) {
         const a = imp._anchor;
@@ -522,9 +535,8 @@ function App() {
         inFlightRef.current.add(a);
         try {
           const rows = await CI.materializeImportRows(imp);
-          if (cancelled) return;
           importRowsRef.current[a] = rows || [];
-          setImportRowsVersion(v => v + 1);
+          if (mountedRef.current) setImportRowsVersion(v => v + 1);
         } catch (e) {
           console.warn('[app] could not materialize import rows:', e);
         } finally {
@@ -532,7 +544,6 @@ function App() {
         }
       }
     })();
-    return () => { cancelled = true; };
   }, [importEntities]);
 
   // State the data views render from: the folded state plus any rows
