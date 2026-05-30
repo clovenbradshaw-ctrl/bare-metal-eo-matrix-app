@@ -137,12 +137,21 @@ export function discoverRooms(roomType = null) {
       inviter = myMember?.events?.member?.getSender() || null;
     }
 
+    // Trust signal. The meta state event is just an unprivileged custom
+    // event any room creator can set, so its presence alone does NOT mean
+    // the room is one of ours — a stranger can stamp it and invite us. A
+    // genuine app room is E2EE (createRoom always sets m.room.encryption).
+    // Surface whether the room actually carries that state so the UI can
+    // flag/quarantine rooms that claim to be ours but aren't encrypted.
+    const encrypted = !!room.currentState.getStateEvents('m.room.encryption', '');
+
     appRooms.push({
       roomId: room.roomId,
       name: room.name,
       roomType: content.room_type,
       membership,
       inviter,
+      encrypted,
       meta: content,
     });
   }

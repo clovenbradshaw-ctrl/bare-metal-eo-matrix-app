@@ -19,8 +19,7 @@
 import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
          tryAutoUnlock, wipeLocalData,
-         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider,
-         getStashedRecoveryKey } from './client.js';
+         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
 import { planLazyImport } from './dataset.js';
@@ -382,12 +381,20 @@ function refreshManifestFromLive() {
   if (!userId) return;
   const live = discoverRooms(ROOM_TYPE);
   if (live.length === 0) return;
-  const snapshot = live.map(r => ({
-    roomId: r.roomId,
-    name: r.name || null,
-    roomType: r.roomType || null,
-    membership: r.membership || 'join',
-  }));
+  // Only persist rooms we've actually joined. Pending invites are
+  // attacker-controllable (anyone can stamp the meta event and invite us),
+  // so caching them into the offline manifest would let a stranger's room
+  // survive in the workspace list even offline. Invites still surface live
+  // via discoverRooms; they just never get baked into the cache.
+  const snapshot = live
+    .filter(r => (r.membership || 'join') === 'join')
+    .map(r => ({
+      roomId: r.roomId,
+      name: r.name || null,
+      roomType: r.roomType || null,
+      membership: 'join',
+    }));
+  if (snapshot.length === 0) return;
   const key = JSON.stringify(snapshot);
   if (key === roomManifestKey) return;
   roomManifest = snapshot;
@@ -495,6 +502,7 @@ function listRooms() {
       membership: r.membership,
       roomType: r.roomType,
       inviter: r.inviter,
+      encrypted: r.encrypted,
     }));
   }
   return roomManifest.map(r => ({
@@ -1011,10 +1019,6 @@ window.MatrixLive = {
   subscribe: (fn) => { subscribers.add(fn); return () => subscribers.delete(fn); },
   // Progress log
   getProgressLog: () => progressLog.slice(),
-  // Recovery key — opt-in surface for a settings UI to display the
-  // encoded recovery key to the user. Returns null until secure backup
-  // has been set up for this user on this device.
-  getRecoveryKey: () => getStashedRecoveryKey(),
 };
 
 // ── Service worker (PWA shell) ──
