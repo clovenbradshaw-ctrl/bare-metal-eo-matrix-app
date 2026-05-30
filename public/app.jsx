@@ -171,18 +171,24 @@ function WorkspacesHome({
               const title = r.title || 'untitled space';
               const initial = (title[0] || '?').toUpperCase();
               const isInvite = r.membership === 'invite';
+              // App-created rooms are always E2EE. An invite that claims to
+              // be a workspace but isn't encrypted didn't come from this app
+              // — most likely a stranger who stamped the app's meta event to
+              // get their room into your list. Flag it; don't auto-hide
+              // (a pre-E2EE collaborator could send a legit unencrypted one).
+              const suspectInvite = isInvite && r.encrypted === false;
               return (
                 <button
                   key={r.id}
-                  className={`wh-card ${isInvite ? 'wh-card-invite' : ''}`}
+                  className={`wh-card ${isInvite ? 'wh-card-invite' : ''} ${suspectInvite ? 'wh-card-suspect' : ''}`}
                   onClick={() => isInvite ? onAcceptInvite?.(r.id) : onEnter(r.id)}
-                  title={r.id}
+                  title={suspectInvite ? `${r.id}\n⚠ This invite is not encrypted and may not be from this app.` : r.id}
                 >
                   <span className="wh-card-sigil">{initial}</span>
                   <span className="wh-card-name">{title}</span>
                   <span className="wh-card-meta">
                     {isInvite
-                      ? `invite${r.inviter ? ` from ${r.inviter}` : ''}`
+                      ? `${suspectInvite ? '⚠ unencrypted invite' : 'invite'}${r.inviter ? ` from ${r.inviter}` : ''}`
                       : r.eventCount > 0
                         ? `${r.eventCount} events`
                         : 'empty'}
