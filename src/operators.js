@@ -56,7 +56,7 @@ export const OP = {
   SIG: { key: 'sig', glyph: '○', triad: 'existence',    order: 1, stored: false },
   INS: { key: 'ins', glyph: '●', triad: 'existence',    order: 2, stored: true  },
   SEG: { key: 'seg', glyph: '｜', triad: 'structure',    order: 3, stored: true  },
-  CON: { key: 'con', glyph: '⋈', triad: 'structure',    order: 4, stored: true  },
+  CON: { key: 'con', glyph: '⤫', triad: 'structure',    order: 4, stored: true  },
   SYN: { key: 'syn', glyph: '△', triad: 'structure',    order: 5, stored: true  },
   DEF: { key: 'def', glyph: '⊢', triad: 'significance', order: 6, stored: true  },
   EVA: { key: 'eva', glyph: '⊨', triad: 'significance', order: 7, stored: true  },
