@@ -68,6 +68,7 @@ export function eventType(op) {
 }
 
 export function parseEventType(type) {
+  if (typeof type !== 'string') return null;
   if (!type.startsWith(NS + '.')) return null;
   const suffix = type.slice(NS.length + 1);
   return Object.values(OP).find(op => op.key === suffix) || null;
