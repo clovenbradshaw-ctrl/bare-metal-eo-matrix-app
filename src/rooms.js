@@ -4,6 +4,7 @@
  * Rooms are tables. Room membership is access control.
  *
  * Rooms created by this module get:
+ *   - m.room.encryption (Megolm) so events never hit the server in cleartext
  *   - A state event marking them as app rooms (for discovery)
  *   - Private visibility (invite-only)
  */
@@ -31,6 +32,13 @@ export async function createRoom(name, roomType, meta = {}) {
     visibility: 'private',
     preset: 'private_chat',
     initial_state: [
+      // E2EE on by default. Matrix is the transport; without this the
+      // operator events go to the homeserver in cleartext.
+      {
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      },
       {
         type: META_TYPE(),
         state_key: '',
@@ -44,7 +52,48 @@ export async function createRoom(name, roomType, meta = {}) {
     ],
   });
 
-  return resp.room_id;
+  const roomId = resp.room_id;
+
+  // createRoom resolves when the server made the room, but local sync may
+  // not have processed the encryption state yet, so an immediate emit could
+  // still go out cleartext. Wait until the crypto layer reports the room
+  // encrypted, then prime the outbound session. Best effort: never throws.
+  await confirmEncryption(roomId);
+
+  return roomId;
+}
+
+/**
+ * Bounded wait for E2EE readiness on a freshly created room. Polls the
+ * crypto layer until it reports the room encrypted (then pre-shares the
+ * outbound Megolm session), or gives up after the ceiling. Never throws,
+ * so a slow homeserver cannot break room creation; the outbox backstop
+ * still guarantees no cleartext send if this times out.
+ */
+async function confirmEncryption(roomId, { intervalMs = 250, timeoutMs = 15_000 } = {}) {
+  const client = getClient();
+  const crypto = client?.getCrypto?.();
+  if (!crypto) return;
+
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (Date.now() < deadline) {
+      let enabled = false;
+      try { enabled = await crypto.isEncryptionEnabledInRoom(roomId); }
+      catch { enabled = false; }
+
+      if (enabled) {
+        const room = client.getRoom(roomId);
+        // Pre-share the outbound session so the first emit is Megolm.
+        if (room) { try { await crypto.prepareToEncrypt(room); } catch {} }
+        return;
+      }
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    console.warn(`[rooms] E2EE not confirmed for ${roomId} within ${timeoutMs}ms; sends stay pending until it is live`);
+  } catch (e) {
+    console.warn(`[rooms] confirmEncryption error for ${roomId}:`, e?.message || e);
+  }
 }
 
 /**
