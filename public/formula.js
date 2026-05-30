@@ -212,8 +212,7 @@ function evaluate(expr, ctx) {
     transformed = String(expr).replace(/\{([^}]+)\}/g, (_, name) => '__f(' + JSON.stringify(name.trim()) + ')');
     // 2. Normalize known identifiers (functions + constants) to uppercase.
     transformed = transformed.replace(FUNC_RE, (m) => m.toUpperCase());
-    // 3. Airtable "&" string concat → JS "+" (but leave "&&" alone).
-    transformed = transformed.replace(/(?<![&])&(?![&])/g, '+');
+    // (Airtable "&" concat is handled natively by the evaluator below.)
   } catch (e) {
     return { ok: false, value: null, error: 'parse: ' + (e?.message || String(e)) };
   }
@@ -226,11 +225,16 @@ function evaluate(expr, ctx) {
   });
 
   try {
-    // eslint-disable-next-line no-new-func
-    const fn = new Function('__env',
-      'with (__env) { try { return (' + transformed + '); } catch (e) { return { __isErr: true, message: String(e && e.message || e) }; } }'
-    );
-    const value = fn(env);
+    // Parse to an AST and interpret against the curated env. We deliberately
+    // do NOT use new Function/eval: the formula string is remote, attacker-
+    // controllable data (DEF _schema.fields.<set>.formula set by any room
+    // member), so executing it as JS would be client-side RCE in every
+    // viewer's browser. The interpreter below supports only literals,
+    // arithmetic/comparison/logic operators, parenthesised grouping, and
+    // calls to allowlisted FUNCS/CONSTS — no property access, no globals,
+    // no assignment, no arbitrary identifiers.
+    const ast = parseFormula(transformed);
+    const value = evalNode(ast, env);
     if (value && typeof value === 'object' && value.__isErr) {
       return { ok: false, value: null, error: value.message };
     }
@@ -241,6 +245,190 @@ function evaluate(expr, ctx) {
   } catch (e) {
     return { ok: false, value: null, error: 'eval: ' + (e?.message || String(e)) };
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Safe expression evaluator (tokenizer + Pratt parser + tree-walk interpreter)
+//
+// Grammar (precedence low→high):
+//   || , && , (== != < <= > >=) , (+ - &) , (* / %) , unary(! - +) , call/atom
+// Atoms: number, string, identifier (resolved ONLY against env), (group),
+//        FUNC(args...). No member access, no assignment, no `this`/globals.
+// ─────────────────────────────────────────────────────────────────────────
+
+function tokenize(src) {
+  const toks = [];
+  let i = 0;
+  const n = src.length;
+  const isIdStart = (c) => /[A-Za-z_$]/.test(c);
+  const isIdPart  = (c) => /[A-Za-z0-9_$]/.test(c);
+  while (i < n) {
+    const c = src[i];
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
+    // string literal (single or double); supports \\ and \" / \' escapes
+    if (c === '"' || c === "'") {
+      const quote = c; let j = i + 1; let out = '';
+      while (j < n && src[j] !== quote) {
+        if (src[j] === '\\' && j + 1 < n) { out += src[j + 1]; j += 2; }
+        else { out += src[j]; j++; }
+      }
+      if (j >= n) throw new Error('unterminated string');
+      toks.push({ t: 'str', v: out }); i = j + 1; continue;
+    }
+    // number (integer or decimal)
+    if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(src[i + 1] || ''))) {
+      let j = i; while (j < n && /[0-9.]/.test(src[j])) j++;
+      const raw = src.slice(i, j);
+      if ((raw.match(/\./g) || []).length > 1) throw new Error('bad number: ' + raw);
+      toks.push({ t: 'num', v: parseFloat(raw) }); i = j; continue;
+    }
+    // identifier
+    if (isIdStart(c)) {
+      let j = i; while (j < n && isIdPart(src[j])) j++;
+      toks.push({ t: 'id', v: src.slice(i, j) }); i = j; continue;
+    }
+    // multi-char operators
+    const two = src.slice(i, i + 2);
+    if (two === '==' || two === '!=' || two === '<=' || two === '>=' || two === '&&' || two === '||') {
+      toks.push({ t: 'op', v: two }); i += 2; continue;
+    }
+    // single-char operators / punctuation
+    if ('+-*/%<>!&(),'.includes(c)) { toks.push({ t: 'op', v: c }); i++; continue; }
+    throw new Error('unexpected character: ' + JSON.stringify(c));
+  }
+  toks.push({ t: 'eof' });
+  return toks;
+}
+
+function parseFormula(src) {
+  const toks = tokenize(src);
+  let p = 0;
+  const peek = () => toks[p];
+  const next = () => toks[p++];
+  const expect = (v) => {
+    const tk = next();
+    if (tk.t === 'op' && tk.v === v) return tk;
+    throw new Error('expected "' + v + '"');
+  };
+
+  // operator-precedence climbing
+  const BIN = [
+    ['||'],
+    ['&&'],
+    ['==', '!=', '<', '<=', '>', '>='],
+    ['+', '-', '&'],
+    ['*', '/', '%'],
+  ];
+
+  function parseExpr(level) {
+    if (level >= BIN.length) return parseUnary();
+    let left = parseExpr(level + 1);
+    for (;;) {
+      const tk = peek();
+      if (tk.t === 'op' && BIN[level].includes(tk.v)) {
+        next();
+        const right = parseExpr(level + 1);
+        left = { k: 'bin', op: tk.v, left, right };
+      } else break;
+    }
+    return left;
+  }
+
+  function parseUnary() {
+    const tk = peek();
+    if (tk.t === 'op' && (tk.v === '!' || tk.v === '-' || tk.v === '+')) {
+      next();
+      return { k: 'un', op: tk.v, arg: parseUnary() };
+    }
+    return parseAtom();
+  }
+
+  function parseAtom() {
+    const tk = next();
+    if (tk.t === 'num') return { k: 'num', v: tk.v };
+    if (tk.t === 'str') return { k: 'str', v: tk.v };
+    if (tk.t === 'op' && tk.v === '(') {
+      const e = parseExpr(0);
+      expect(')');
+      return e;
+    }
+    if (tk.t === 'id') {
+      // function call?
+      if (peek().t === 'op' && peek().v === '(') {
+        next(); // consume '('
+        const args = [];
+        if (!(peek().t === 'op' && peek().v === ')')) {
+          args.push(parseExpr(0));
+          while (peek().t === 'op' && peek().v === ',') { next(); args.push(parseExpr(0)); }
+        }
+        expect(')');
+        return { k: 'call', name: tk.v, args };
+      }
+      return { k: 'id', name: tk.v };
+    }
+    throw new Error('unexpected token: ' + (tk.t === 'eof' ? 'end of formula' : JSON.stringify(tk.v)));
+  }
+
+  const ast = parseExpr(0);
+  if (peek().t !== 'eof') throw new Error('trailing input after expression');
+  return ast;
+}
+
+function evalNode(node, env) {
+  switch (node.k) {
+    case 'num': return node.v;
+    case 'str': return node.v;
+    case 'id': {
+      // Identifiers resolve ONLY against the curated env (own properties).
+      if (Object.prototype.hasOwnProperty.call(env, node.name)) {
+        const v = env[node.name];
+        return typeof v === 'function' ? v() : v; // zero-arg callables (RECORD_ID, etc.)
+      }
+      throw new Error('unknown identifier: ' + node.name);
+    }
+    case 'un': {
+      const a = evalNode(node.arg, env);
+      if (node.op === '!') return !truthy(a);
+      if (node.op === '-') return -num(a);
+      return +num(a);
+    }
+    case 'bin': {
+      const op = node.op;
+      if (op === '&&') { const l = evalNode(node.left, env); return truthy(l) ? evalNode(node.right, env) : l; }
+      if (op === '||') { const l = evalNode(node.left, env); return truthy(l) ? l : evalNode(node.right, env); }
+      const l = evalNode(node.left, env);
+      const r = evalNode(node.right, env);
+      switch (op) {
+        case '+': return (typeof l === 'string' || typeof r === 'string') ? stringify(l) + stringify(r) : num(l) + num(r);
+        case '&': return stringify(l) + stringify(r);
+        case '-': return num(l) - num(r);
+        case '*': return num(l) * num(r);
+        case '/': return num(l) / num(r);
+        case '%': return num(l) % num(r);
+        case '==': return l === r;
+        case '!=': return l !== r;
+        case '<':  return num(l) <  num(r);
+        case '<=': return num(l) <= num(r);
+        case '>':  return num(l) >  num(r);
+        case '>=': return num(l) >= num(r);
+      }
+      throw new Error('bad operator: ' + op);
+    }
+    case 'call': {
+      const fn = Object.prototype.hasOwnProperty.call(env, node.name) ? env[node.name] : undefined;
+      if (typeof fn !== 'function') throw new Error('unknown function: ' + node.name);
+      // IF needs lazy branches so the untaken side can't error; the rest are eager.
+      if (node.name === 'IF') {
+        const c = node.args.length > 0 ? evalNode(node.args[0], env) : undefined;
+        return truthy(c)
+          ? (node.args[1] !== undefined ? evalNode(node.args[1], env) : null)
+          : (node.args[2] !== undefined ? evalNode(node.args[2], env) : null);
+      }
+      const args = node.args.map(a => evalNode(a, env));
+      return fn(...args);
+    }
+  }
+  throw new Error('bad node');
 }
 
 // ─────────────────────────────────────────────────────────────────────────
