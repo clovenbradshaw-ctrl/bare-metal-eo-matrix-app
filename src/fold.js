@@ -296,11 +296,40 @@ function dispatch(state, event) {
 // ── Public API ──
 
 /**
+ * Stable chronological sort for a batch of events.
+ *
+ * Events reach the fold in *arrival* order, which is not chronological:
+ * backfill pages, federation, and especially late `onDecrypted` events
+ * (an `m.room.encrypted` event whose key arrives after later events were
+ * already stored) land out of order. Operators carry hard dependency
+ * ordering (INS before its DEFs), so folding out of order produces spurious
+ * `missing_ins` violations and silently dropped DEFs. Sort by
+ * (origin_server_ts, event_id) before folding so order is deterministic and
+ * dependency-correct regardless of how events arrived. Ties on ts (same-ms
+ * emits) break by event_id for stability.
+ */
+function chronological(events) {
+  const ts = (e) => (typeof e?.getTs === 'function' ? e.getTs() : e?.origin_server_ts) || 0;
+  const id = (e) => (typeof e?.getId === 'function' ? e.getId() : e?.event_id) || '';
+  return events
+    .map((e, i) => [e, i])
+    .sort((a, b) => {
+      const d = ts(a[0]) - ts(b[0]);
+      if (d !== 0) return d;
+      const ia = id(a[0]), ib = id(b[0]);
+      if (ia < ib) return -1;
+      if (ia > ib) return 1;
+      return a[1] - b[1]; // preserve input order for full ties
+    })
+    .map((pair) => pair[0]);
+}
+
+/**
  * Fold an array of events into state from scratch.
- * Events should be in chronological order.
+ * Events are sorted into chronological order first (see `chronological`).
  */
 export function fold(events) {
-  return events.reduce(dispatch, initial());
+  return chronological(events).reduce(dispatch, initial());
 }
 
 /**
@@ -313,7 +342,7 @@ export function fold(events) {
  * @returns {FoldState}
  */
 export function foldFrom(state, newEvents) {
-  return newEvents.reduce(dispatch, state);
+  return chronological(newEvents).reduce(dispatch, state);
 }
 
 // ── Query helpers ──

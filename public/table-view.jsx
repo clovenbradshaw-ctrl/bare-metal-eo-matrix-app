@@ -1276,23 +1276,33 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
 
   // DDL string for the table header — only schema-declared fields counted as part of schema
   const ddl = useMemo(() => {
+    // entityType, field names, and linked-type names are remote, attacker-
+    // controllable data (any room member can DEF a field named
+    // "<img onerror=...>"). This string is rendered via dangerouslySetInnerHTML
+    // below, so every interpolated value MUST be HTML-escaped. The static
+    // <span> scaffolding is ours; only the data is escaped, and padding is
+    // applied before escaping so column alignment is preserved.
+    const esc = (s) => String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    const pad = (s, w) => esc(String(s).padEnd(w));
     const schemaFields = cols.filter(c => c.schematized);
     const extras = cols.filter(c => !c.schematized);
     const lines = [
-      `<span class="kw">CREATE TABLE</span> <span class="id">${entityType}</span> (`,
+      `<span class="kw">CREATE TABLE</span> <span class="id">${esc(entityType)}</span> (`,
       `  <span class="id">_anchor</span>    <span class="ty">TEXT</span>     <span class="kw">PRIMARY KEY</span>,`,
-      ...schemaFields.map(c => `  <span class="id">${c.name.padEnd(10)}</span> <span class="ty">${sqlType(c.type).padEnd(8)}</span>,`),
+      ...schemaFields.map(c => `  <span class="id">${pad(c.name, 10)}</span> <span class="ty">${pad(sqlType(c.type), 8)}</span>,`),
       ...(partitioned && partitionFromSchema
-        ? [`  <span class="id">_partition </span> <span class="ty">TEXT</span>,     <span class="cmt">-- from _schema.partitions.${entityType} via SEG</span>`]
+        ? [`  <span class="id">_partition </span> <span class="ty">TEXT</span>,     <span class="cmt">-- from _schema.partitions.${esc(entityType)} via SEG</span>`]
         : partitioned
         ? [`  <span class="id">_partition </span> <span class="ty">TEXT</span>?    <span class="cmt">-- observed in data, not in schema</span>`]
         : []),
-      ...linkedTypes.map(t => `  <span class="id">${t.padEnd(10)}</span> <span class="ty">LINK&lt;${t}&gt;</span>  <span class="cmt">-- derived from CON edges${state.schema?.links ? ' (in schema)' : ''}</span>`),
-      ...extras.map(c => `  <span class="cmt">-- ! </span><span class="id">${c.name.padEnd(8)}</span> <span class="ty">${sqlType(c.type).padEnd(8)}</span>  <span class="cmt">-- in data but not in _schema.fields.${entityType}</span>`),
+      ...linkedTypes.map(t => `  <span class="id">${pad(t, 10)}</span> <span class="ty">LINK&lt;${esc(t)}&gt;</span>  <span class="cmt">-- derived from CON edges${state.schema?.links ? ' (in schema)' : ''}</span>`),
+      ...extras.map(c => `  <span class="cmt">-- ! </span><span class="id">${pad(c.name, 8)}</span> <span class="ty">${pad(sqlType(c.type), 8)}</span>  <span class="cmt">-- in data but not in _schema.fields.${esc(entityType)}</span>`),
       `);`,
     ];
     if (!declaredInSchema) {
-      lines.unshift(`<span class="cmt">-- ! ${entityType} not declared in _schema.tables; appearing because of data</span>`);
+      lines.unshift(`<span class="cmt">-- ! ${esc(entityType)} not declared in _schema.tables; appearing because of data</span>`);
     }
     return lines.join('\n');
   }, [entityType, JSON.stringify(cols), partitioned, partitionFromSchema, linkedTypes.join(','), declaredInSchema]);

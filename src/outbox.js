@@ -285,6 +285,20 @@ export class OutboxFlusher {
   }
 
   async _send(client, item) {
+    // Never transmit plaintext. If the room is not yet encrypted (sync race
+    // after createRoom, or a legacy unencrypted room), leave the item
+    // pending without marking it inflight or failed; the next flush retries
+    // once E2EE is live. This check must not throw: a transient error here
+    // would otherwise count an attempt and eventually dead-letter a real
+    // event. On any uncertainty we hold rather than leak.
+    const crypto = client.getCrypto?.();
+    if (crypto) {
+      let enabled = false;
+      try { enabled = await crypto.isEncryptionEnabledInRoom(item.roomId); }
+      catch { enabled = false; }
+      if (!enabled) return;
+    }
+
     await markInflight(item.localId);
     let contentToSend = item.content;
     let hoisted = 0;

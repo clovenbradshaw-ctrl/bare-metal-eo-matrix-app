@@ -17,7 +17,7 @@ const OP = {
   SIG: { key: 'sig', glyph: '○', name: 'Signal',          triad: 'existence',    order: 1, stored: false },
   INS: { key: 'ins', glyph: '●', name: 'Instantiate',     triad: 'existence',    order: 2, stored: true  },
   SEG: { key: 'seg', glyph: '｜', name: 'Segment',         triad: 'structure',    order: 3, stored: true  },
-  CON: { key: 'con', glyph: '⋈', name: 'Connect',         triad: 'structure',    order: 4, stored: true  },
+  CON: { key: 'con', glyph: '⤫', name: 'Connect',         triad: 'structure',    order: 4, stored: true  },
   SYN: { key: 'syn', glyph: '△', name: 'Synthesize',      triad: 'structure',    order: 5, stored: true  },
   DEF: { key: 'def', glyph: '⊢', name: 'Define',          triad: 'significance', order: 6, stored: true  },
   EVA: { key: 'eva', glyph: '⊨', name: 'Evaluate',        triad: 'significance', order: 7, stored: true  },

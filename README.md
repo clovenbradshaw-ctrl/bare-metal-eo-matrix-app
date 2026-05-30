@@ -36,7 +36,7 @@ Nine operators. A closed algebra. Every change to application state decomposes i
 | SIG | ○ | Attention (ephemeral, not stored) |
 | **INS** | ● | Instantiate — create a new entity with a permanent anchor ID |
 | **SEG** | ｜ | Segment — move an entity across a partition boundary |
-| **CON** | ⋈ | Connect — typed relationship between two anchors |
+| **CON** | ⤫ | Connect — typed relationship between two anchors |
 | **SYN** | △ | Synthesize — merge inputs into a whole |
 | **DEF** | ⊢ | Define — set a value within the current frame |
 | **EVA** | ⊨ | Evaluate — test a particular against a general |
