@@ -580,6 +580,7 @@ function App() {
 
   const [customSlices, setCustomSlices] = useState({});
   const [csvImport, setCsvImport] = useState(null); // {id, file, roomId} | null
+  const [airtableImport, setAirtableImport] = useState(null); // {id} | null
   // Time-travel scrubber: collapsed by default; opens via the topbar toggle.
   // We also force-open it whenever the cursor is *not* live, so the user
   // can always see/return from a scrubbed state.
@@ -956,6 +957,7 @@ function App() {
           selection={selection}
           setSelection={setSelection}
           customSlices={customSlices}
+          onAirtableSchema={() => setAirtableImport({ id: Date.now() })}
           onCreateSlice={(tableId, slice) => {
             setCustomSlices(s => ({ ...s, [tableId]: [...(s[tableId] || []), slice] }));
           }}
@@ -1102,6 +1104,15 @@ function App() {
           state={state}
           onEmit={onEmit}
           onClose={() => setCsvImport(null)}
+        />
+      )}
+
+      {airtableImport && window.AirtableSchemaModal && (
+        <window.AirtableSchemaModal
+          schemaImport={airtableImport}
+          state={state}
+          onEmit={onEmit}
+          onClose={() => setAirtableImport(null)}
         />
       )}
     </div>

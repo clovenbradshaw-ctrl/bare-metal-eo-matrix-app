@@ -221,7 +221,7 @@ function relativeTime(ts) {
 
 function Sidebar({
   room, state, selection, setSelection, onCreateTable, customSlices, onCreateSlice,
-  eventsTotal, ephemeralsCount, onRenameRoom, lastEventTs,
+  eventsTotal, ephemeralsCount, onRenameRoom, lastEventTs, onAirtableSchema,
 }) {
   const { sets, meta, raw } = useMemo(() => buildSets(state), [state]);
   const withCustomSlices = (t) => {
@@ -385,7 +385,13 @@ function Sidebar({
             <button onClick={() => { if (newName) { onCreateTable(newName); setNewName(''); setCreating(false); } }}>+</button>
           </div>
         ) : (
-          <button className="sb-add-table" onClick={() => setCreating(true)}>+ new set</button>
+          <div className="sb-add-row">
+            <button className="sb-add-table" onClick={() => setCreating(true)}>+ new set</button>
+            {onAirtableSchema && (
+              <button className="sb-add-table sb-add-airtable" onClick={onAirtableSchema}
+                title="paste an Airtable schema JSON to create tables (with computed fields) — no data">⊞ airtable schema</button>
+            )}
+          </div>
         )}
         {allSets.map(renderSet)}
         {allSets.length === 0 && (
