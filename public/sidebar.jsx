@@ -91,15 +91,24 @@ function buildSets(state) {
     });
   }
   // _schema isn't a top-level set — each set has its own schema, opened by clicking the set name above.
+
+  // Raw sets live down by the log, not up with the user's data sets. The
+  // `import` staging set and `_violations` are byproducts of the pipeline
+  // rather than first-class sets, so we pull them out of `sets`/`meta`.
+  const raw = [];
+  const importIdx = sets.findIndex(s => s.id === 'import');
+  if (importIdx !== -1) {
+    raw.push(sets.splice(importIdx, 1)[0]);
+  }
   if (state._violations && state._violations.length > 0) {
-    meta.push({
+    raw.push({
       id: '_violations', name: '_violations', kind: 'meta',
       rows: state._violations.length, declared: false,
       slices: [{ id: '_violations.table', kind: 'table', name: 'table', tableId: '_violations' }],
     });
   }
 
-  return { sets, meta };
+  return { sets, meta, raw };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -214,8 +223,8 @@ function Sidebar({
   room, state, selection, setSelection, onCreateTable, customSlices, onCreateSlice,
   eventsTotal, ephemeralsCount, onRenameRoom, lastEventTs,
 }) {
-  const { sets, meta } = useMemo(() => buildSets(state), [state]);
-  const allSets = [...sets, ...meta].map(t => {
+  const { sets, meta, raw } = useMemo(() => buildSets(state), [state]);
+  const withCustomSlices = (t) => {
     const extras = (customSlices?.[t.id] || []).map(s => ({
       id: `${t.id}.${s.name}`,
       kind: s.kind,
@@ -224,7 +233,9 @@ function Sidebar({
       custom: true,
     }));
     return { ...t, slices: [...t.slices, ...extras] };
-  });
+  };
+  const allSets = [...sets, ...meta].map(withCustomSlices);
+  const rawSets = raw.map(withCustomSlices);
   // Sets are open unless the user explicitly collapsed them. Storing
   // collapsed state (rather than open state) avoids the first-mount race
   // where the seed fold hasn't populated entities yet.
@@ -321,7 +332,7 @@ function Sidebar({
     );
   }
 
-  const setsCount = allSets.length;
+  const setsCount = allSets.length + rawSets.length;
   const lastEditLabel = relativeTime(lastEventTs);
   const headerName = room?.title || 'untitled workspace';
 
@@ -386,6 +397,7 @@ function Sidebar({
         <div className="sb-section-head">
           <span>raw</span>
         </div>
+        {rawSets.map(renderSet)}
         <button
           className={`sb-slice ${selection.kind === 'log' ? 'active' : ''} kind-log`}
           onClick={() => setSelection({ kind: 'log' })}
@@ -398,7 +410,7 @@ function Sidebar({
           className={`sb-slice ${selection.kind === 'ephemeral' ? 'active' : ''} kind-ephemeral`}
           onClick={() => setSelection({ kind: 'log' })}
           disabled
-          title="ephemeral lane is visible inside the log view"
+          title="SIGs you fire while navigating — never written into the log"
         >
           <span className="sb-slice-icon">∅</span>
           <span className="sb-slice-name">ephemeral</span>
