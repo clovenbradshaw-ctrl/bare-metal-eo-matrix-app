@@ -915,7 +915,7 @@ function HidePanel({ items, hidden, setHidden }) {
 // One table
 // ─────────────────────────────────────────────────────────────────────────
 
-function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showDDL, setSelection }) {
+function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showDDL, setSelection, savedView, onUpdateView, onSaveAsView }) {
   const { cols, rows, partitioned, partitionFromSchema } = useMemo(() => buildTable(entityType, state), [entityType, state]);
   const linkedTypes = useMemo(() => linkedTypesFor(entityType, state), [entityType, state]);
   const declaredInSchema = !!state.schema?.fields?.[entityType] || (state.schema?.tables || []).includes(entityType);
@@ -927,12 +927,45 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   const [colMenu, setColMenu] = useState(null);
   // Anchor of the record whose detail side panel is open, or null.
   const [detailAnchor, setDetailAnchor] = useState(null);
-  // View-local controls — none of these emit events; they only reshape the grid.
-  const [sorts, setSorts] = useState([]);       // [{ field, dir: 'asc'|'desc' }]
-  const [filters, setFilters] = useState([]);   // [{ id, field, op, value }]
-  const [hidden, setHidden] = useState(() => new Set()); // column keys: 'f:Name' | 'l:Type' | 'p:_partition'
+  // View controls. Seeded from the saved view (if this is one) so a view
+  // remembers its own filters/sorts/hidden fields — Airtable-style. When this
+  // table is rendered as a *saved* view (onUpdateView present), changes are
+  // persisted back to the log; otherwise they stay local to this session and
+  // can be captured via "save as view".
+  const [sorts, setSorts] = useState(() => (savedView?.sorts || []).map(s => ({ ...s })));         // [{ field, dir: 'asc'|'desc' }]
+  const [filters, setFilters] = useState(() => (savedView?.filters || []).map(f => ({ ...f })));    // [{ id, field, op, value }]
+  const [hidden, setHidden] = useState(() => new Set(savedView?.hidden || []));                     // column keys: 'f:Name' | 'l:Type' | 'p:_partition'
   const [toolPanel, setToolPanel] = useState(null); // 'filter' | 'sort' | 'hide' | null
   const scrollRef = useRef(null);
+
+  // Persist filter/sort/hidden changes back into the saved view (debounced so a
+  // typed filter value doesn't emit an event per keystroke). The first run is
+  // skipped — that's just the initial seed, not a user edit. `onUpdateView` is
+  // read through a ref so its changing identity doesn't retrigger the effect.
+  const updateViewRef = useRef(onUpdateView);
+  updateViewRef.current = onUpdateView;
+  const persistFirstRef = useRef(true);
+  const persistTimerRef = useRef(null);
+  const pendingSnapshotRef = useRef(null);
+  useEffect(() => {
+    if (!updateViewRef.current) return;
+    if (persistFirstRef.current) { persistFirstRef.current = false; return; }
+    const snapshot = { filters, sorts, hidden: [...hidden] };
+    pendingSnapshotRef.current = snapshot;
+    clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = setTimeout(() => {
+      pendingSnapshotRef.current = null;
+      if (updateViewRef.current) updateViewRef.current(snapshot);
+    }, 500);
+    return () => clearTimeout(persistTimerRef.current);
+  }, [filters, sorts, hidden]);
+  // Flush a pending save when leaving the view, so a fast navigation right
+  // after an edit doesn't drop it.
+  useEffect(() => () => {
+    if (pendingSnapshotRef.current && updateViewRef.current) {
+      updateViewRef.current(pendingSnapshotRef.current);
+    }
+  }, []);
 
   // Close any open toolbar dropdown on Escape or an outside click.
   useEffect(() => {
@@ -1344,6 +1377,11 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
         ><i className={`ph ph-${hiddenCount ? 'eye-slash' : 'eye'}`} aria-hidden="true"></i> {hiddenCount ? `${hiddenCount} hidden` : 'hide fields'}</button>
         {(filters.length || sorts.length || hiddenCount) ? (
           <button className="tv-tool-reset" onClick={() => { setFilters([]); setSorts([]); setHidden(new Set()); setToolPanel(null); }} title="clear all view controls">reset view</button>
+        ) : null}
+        {onUpdateView ? (
+          <span className="tv-tool-saved" title="changes to this view are saved automatically and shared with everyone in the room" style={{ marginLeft: 'auto', alignSelf: 'center', fontSize: 11, opacity: 0.55 }}>⊢ saved view · auto-saves</span>
+        ) : (onSaveAsView && (filters.length || sorts.length || hiddenCount)) ? (
+          <button className="tv-tool-btn tv-tool-save" onClick={() => onSaveAsView({ filters, sorts, hidden: [...hidden] })} title="save this filter / sort / hidden-field set as a reusable, shared view" style={{ marginLeft: 'auto' }}>+ save as view</button>
         ) : null}
         {toolPanel === 'filter' && <FilterPanel cols={cols} filters={filters} setFilters={setFilters} />}
         {toolPanel === 'sort' && <SortPanel cols={cols} sorts={sorts} setSorts={setSorts} />}
@@ -2836,7 +2874,7 @@ function CreateTableForm({ state, room, onEmit, onCancel, defaultName = '' }) {
 // Root
 // ─────────────────────────────────────────────────────────────────────────
 
-function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead, setSelection }) {
+function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead, setSelection, savedView, onUpdateView, onSaveAsView }) {
   const [jumpHighlight, setJumpHighlight] = useState(null);
   const [activeTable, setActiveTable] = useState(null);
   const [creating, setCreating] = useState(false);
@@ -2947,6 +2985,9 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
             jumpHighlight={jumpHighlight}
             showDDL={tweaks?.showSchemaDDL}
             setSelection={setSelection}
+            savedView={savedView}
+            onUpdateView={onUpdateView}
+            onSaveAsView={onSaveAsView}
           />
         )}
         {!creating && active?.kind === 'syntheses' && (
