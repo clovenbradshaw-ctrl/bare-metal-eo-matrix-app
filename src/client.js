@@ -91,6 +91,53 @@ function disableMatrixRTC(c) {
   try { c.groupCallEventHandler?.stop?.(); } catch (e) { progress(`GroupCall disable skipped: ${e.message}`); }
 }
 
+// The app uses Matrix purely as a transport + signal layer for its OWN rooms:
+// history is read from OPFS, and the SDK is needed only to receive new events
+// and exchange E2EE keys for the rooms the app actually uses. Left to itself,
+// matrix-js-sdk syncs the user's ENTIRE account and — fatally for accounts in
+// many rooms — has the Rust crypto track the devices of every member of every
+// encrypted room. That lives in WASM memory which only ever grows, so a single
+// idle workspace on a busy account climbs into the gigabytes regardless of how
+// little the app holds. Scoping /sync to the app's rooms keeps crypto tracking
+// (and everything else the SDK retains) bounded to what the app actually uses.
+//
+// The app layer injects which rooms those are (it knows the namespace/room
+// type). When it returns a non-empty list we admit ONLY those rooms via a
+// server-side filter — and the SDK applies that filter to the INITIAL sync too
+// (sync.js getFilter copies our definition into the initial filter), so even a
+// fresh login never downloads the whole account. Any failure falls back to the
+// normal full sync, so this can never block login.
+let workspaceScopeProvider = null;
+export function setWorkspaceScopeProvider(fn) { workspaceScopeProvider = fn; }
+
+async function startScopedSync(c) {
+  let opts = SYNC_OPTS;
+  try {
+    const ids = workspaceScopeProvider
+      ? await withTimeout(Promise.resolve(workspaceScopeProvider(c)), 15000, 'Workspace scope')
+      : null;
+    if (Array.isArray(ids) && ids.length > 0) {
+      const filter = new sdk.Filter(c.getUserId());
+      filter.setDefinition({
+        room: {
+          rooms: ids,                       // admit ONLY the app's rooms
+          timeline: { limit: 1 },            // history lives in OPFS; just the live signal
+          ephemeral: { not_types: ['*'] },   // no typing/receipts
+          state: { lazy_load_members: true },
+        },
+        presence: { not_types: ['*'] },
+      });
+      opts = { ...SYNC_OPTS, filter };
+      progress(`Scoped sync to ${ids.length} room(s); the rest of the account stays unsynced`);
+    } else {
+      progress('No room scope yet — syncing normally (scope applies next launch)');
+    }
+  } catch (e) {
+    progress(`Sync scope skipped (${e?.message || e}); syncing normally`);
+  }
+  await c.startClient(opts);
+}
+
 let progress = (msg) => console.log('[matrix]', msg);
 export function setProgress(fn) {
   progress = (msg) => { console.log('[matrix]', msg); fn(msg); };
@@ -537,7 +584,7 @@ export async function login(homeserver, username, password, { persist = false } 
   await initCryptoWithRetry(client);
 
   progress('Starting sync…');
-  await client.startClient(SYNC_OPTS);
+  await startScopedSync(client);
   disableMatrixRTC(client);
   if (_watchSyncUnsub) _watchSyncUnsub();
   _watchSyncUnsub = watchSync(client);
@@ -592,7 +639,7 @@ export async function restoreSession(userId) {
 
   let sessionExpired = false;
   try {
-    await client.startClient(SYNC_OPTS);
+    await startScopedSync(client);
     disableMatrixRTC(client);
     if (_watchSyncUnsub) _watchSyncUnsub();
     _watchSyncUnsub = watchSync(client);

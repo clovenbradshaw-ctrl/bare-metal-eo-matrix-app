@@ -32,10 +32,22 @@ really is just a CSV-sized fold); the SDK underneath it is what's heavy.
 Mitigations in `src/client.js` (`SYNC_OPTS`), none of which touch what the
 UI shows:
 
-* **`lazyLoadMembers: true`** — the biggest lever. The SDK no longer pulls
-  or tracks member lists during sync; they load on demand only when a member
-  list is opened (`loadRoomMembers` / `MatrixLive.loadMembers`). Sending to
-  encrypted rooms still works — the crypto layer loads its targets first.
+* **Scoped sync — admit only this app's rooms** (`setWorkspaceScopeProvider`
+  in `src/main.js` → `startScopedSync` in `src/client.js`). This is the
+  decisive lever for accounts in many rooms. The app injects the workspace
+  room IDs (from the persisted manifest); the connection layer builds a
+  server-side `Filter` with `room.rooms` set to that allowlist, so `/sync`
+  returns **only** those rooms — and the SDK copies the definition into the
+  *initial* sync filter too (`sync.js` `getFilter`), so even a fresh login
+  never pulls the whole account. The Rust crypto then tracks devices only for
+  members of the app's rooms. **This is the only lever that bounds the crypto
+  cost** (below); the others trim the JS-heap side. Falls back to a normal
+  full sync when the manifest is empty (first launch on a device), so it can
+  never block login; the scope applies once the manifest populates.
+* **`lazyLoadMembers: true`** — the SDK no longer pulls or tracks member lists
+  during sync; they load on demand only when a member list is opened
+  (`loadRoomMembers` / `MatrixLive.loadMembers`). Sending to encrypted rooms
+  still works — the crypto layer loads its targets first.
 * **`initialSyncLimit: 1`** — history comes from OPFS, so the SDK never needs
   a per-room timeline. Keep the initial sync burst to the minimum.
 * **`disablePresence: true`** — presence is never rendered; skip it.
@@ -44,6 +56,35 @@ UI shows:
   room in the account* and re-scans them on every sync (the `[MatrixRTCSession
   … No membership changes detected]` log spam) — pure overhead for an app with
   no calls.
+
+### The Rust-crypto device store is the *real* elephant, and it's in WASM
+
+On an account in many encrypted rooms, the dominant cost is **not** any
+JavaScript structure — `getSdkStats()` can report `sdkRooms=5, sdkMembers=7,
+sdkLiveEvents=43` while the tab sits at **3.5 GB and climbing**. That memory is
+the Rust crypto `OlmMachine`, which tracks the identity + device keys of every
+member of every encrypted room the account syncs. It lives in **WebAssembly
+linear memory, which only ever grows** — it is never returned to the OS during
+the session, so a transient key-download spike becomes permanent resident
+footprint. Two consequences:
+
+* `removeRoom`/timeline shedding **cannot reclaim it** — those free JS objects;
+  the crypto store is independent and native.
+* The heap governor **cannot shed it** — even when `performance.memory` reports
+  the large figure, the registered evictors only free JS.
+
+The only thing that bounds it is **not syncing those rooms in the first place**
+— the scoped-sync filter above. With the account's other rooms excluded from
+`/sync`, the server never sends their `device_lists`, so the crypto store never
+tracks them. This is why scoped sync, not shedding, is the fix for large
+accounts.
+
+> **Trade-off (current limitation):** a `room.rooms` allowlist also hides
+> *invites* to rooms not already in the manifest, and rooms joined on another
+> device won't sync until this device learns their IDs. For multi-party
+> workflows that rely on receiving invites, pair this with a lightweight invite
+> poll or move to sliding sync (MSC4186), which scopes rooms natively and keeps
+> invite discovery — recent Synapse supports it.
 
 One room at a time, period: the app is only ever used in a single room, so
 `MAX_OPEN_ROOMS = 1` and the governor releases the SDK live timeline for

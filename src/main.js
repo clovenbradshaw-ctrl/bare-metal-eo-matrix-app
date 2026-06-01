@@ -19,7 +19,8 @@
 import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
          tryAutoUnlock, wipeLocalData,
-         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
+         setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider,
+         setWorkspaceScopeProvider } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
 import { planLazyImport } from './dataset.js';
@@ -104,6 +105,29 @@ function notify(reason) {
 }
 
 setProgress(logProgress);
+
+// Tell the connection layer which rooms to scope /sync to: this app's own
+// workspaces, read from the persisted manifest (the workspaces we've seen
+// joined). This keeps the SDK — and crucially the Rust-crypto device tracking,
+// which otherwise grows unbounded with the account's room count — limited to
+// the app's rooms. Returns null when the manifest is empty (first login on a
+// device): the connection layer then syncs normally, the manifest populates,
+// and the scope applies on the next launch. The app is used one room at a time,
+// so this set stays tiny.
+setWorkspaceScopeProvider(async (client) => {
+  try {
+    const userId = client?.getUserId?.() || vault.getUserId();
+    if (!userId) return null;
+    const manifest = await loadManifest(userId);
+    const ids = (manifest || [])
+      .map(r => r && r.roomId)
+      .filter(id => typeof id === 'string' && id.startsWith('!'));
+    return ids.length > 0 ? ids : null;
+  } catch (e) {
+    console.warn('[bridge] workspace scope lookup failed:', e);
+    return null;
+  }
+});
 
 // ── Plain-event conversion ──
 //
@@ -309,7 +333,9 @@ function shedNonWorkspaceRooms() {
       if (roomStores.has(rid) || openOrder.includes(rid)) continue;
       if (room.getMyMembership?.() === 'invite') continue;  // keep invites visible
       if (isWorkspaceRoom(room)) continue;                  // keep our workspaces
-      try { room.resetLiveTimeline(null, null); } catch {}  // free decrypted events first
+      // removeRoom drops the whole Room (timeline included); calling
+      // resetLiveTimeline first is redundant and triggers a [getVersion]
+      // warning per room — skip it.
       store.removeRoom(rid);
       removed++;
     } catch {}
