@@ -53,6 +53,16 @@ const MEMORY_BUDGET_BYTES = 500 * 1024 * 1024;
 // a reason to hold a second room's working set in memory.
 const MAX_OPEN_ROOMS = 1;
 
+// How often to sweep the matrix-js-sdk store and drop rooms this app never
+// reads (see shedNonWorkspaceRooms). The SDK syncs the user's whole account;
+// this app only ever touches its own eo.workspace rooms, so everything else is
+// pure resident-memory cost we reclaim on this cadence.
+const SDK_MAINTENANCE_INTERVAL_MS = 15_000;
+
+// State-event type stamped on every room this app creates. Its presence is how
+// we tell "a workspace this app owns" from "some other room the account is in".
+const META_STATE_TYPE = `${NAMESPACE}.meta`;
+
 setNamespace(NAMESPACE);
 
 // ── Live state ──
@@ -67,6 +77,7 @@ const sentEventToLocalId = new Map();
 let outboxFlusher = null;
 let unsubRoomChanges = null;
 let unregisterRoomEvictor = null;
+let sdkMaintenanceTimer = null;
 let netState = 'offline';
 let activeSession = null;               // { mxid, homeserver, device_id, ... }
 let progressLog = [];                   // ring buffer of recent log lines
@@ -259,6 +270,79 @@ function shedSdkTimelines() {
   return freed;
 }
 
+// A room this app owns. App-created workspaces carry a `<ns>.meta` state event;
+// unrelated rooms the account happens to be in (DMs, public rooms) do not.
+function isWorkspaceRoom(room) {
+  try { return !!room.currentState?.getStateEvents(META_STATE_TYPE, ''); }
+  catch { return false; }
+}
+
+// Drop every JOINED room that isn't one of this app's workspaces from the SDK's
+// in-memory store. This is the real fix for the "idle elephant": matrix-js-sdk
+// is a full chat client, so it syncs the user's ENTIRE account and keeps every
+// room — DMs, big public rooms, their state and decrypted timelines — resident
+// forever. This app reads none of it: history comes from OPFS, live updates from
+// the signal sync. So we use the SDK as a transport + signal layer for our own
+// rooms and shed the rest.
+//
+// Safe here: the UI only ever lists/opens eo.workspace rooms (discoverRooms
+// filters to ROOM_TYPE), so a dropped room is invisible to the app. Nothing is
+// lost on the server — if a quiet room ever has new activity, sync re-adds it
+// and the next sweep drops it right back. Invites and any room the app is
+// actively using are always kept.
+function shedNonWorkspaceRooms() {
+  const client = getClient();
+  if (!client) return 0;
+  // Only sweep once the initial sync has populated room state — otherwise a
+  // workspace room whose `<ns>.meta` state event hasn't arrived yet would look
+  // like a stranger's room and get dropped (then re-synced) needlessly.
+  const syncState = client.getSyncState?.();
+  if (syncState !== 'PREPARED' && syncState !== 'SYNCING') return 0;
+  const store = client.store;
+  if (!store || typeof store.removeRoom !== 'function') return 0;
+
+  let removed = 0;
+  for (const room of client.getRooms()) {
+    try {
+      const rid = room.roomId;
+      // Never drop a room the app has hydrated or is actively viewing.
+      if (roomStores.has(rid) || openOrder.includes(rid)) continue;
+      if (room.getMyMembership?.() === 'invite') continue;  // keep invites visible
+      if (isWorkspaceRoom(room)) continue;                  // keep our workspaces
+      try { room.resetLiveTimeline(null, null); } catch {}  // free decrypted events first
+      store.removeRoom(rid);
+      removed++;
+    } catch {}
+  }
+  return removed;
+}
+
+// Structural, deterministic memory bound — it does NOT depend on the heap
+// governor firing. (The governor reads `performance.memory`, which counts only
+// the JS heap and is blind to the SDK's native structures and the Rust-crypto
+// WASM heap, so it never sees this memory and never sheds it.) On a fixed
+// interval we release SDK timelines and drop non-workspace rooms, so the
+// resident set stays bounded to this app's own rooms no matter how large the
+// account is.
+function startSdkMaintenance() {
+  if (sdkMaintenanceTimer) return; // idempotent
+  const sweep = () => {
+    try {
+      const dropped = shedNonWorkspaceRooms();
+      shedSdkTimelines();
+      if (dropped > 0) {
+        logProgress(`Released ${dropped} non-workspace room${dropped === 1 ? '' : 's'} from memory`);
+      }
+    } catch (e) { console.warn('[bridge] SDK maintenance failed:', e); }
+  };
+  sweep();
+  sdkMaintenanceTimer = setInterval(sweep, SDK_MAINTENANCE_INTERVAL_MS);
+}
+
+function stopSdkMaintenance() {
+  if (sdkMaintenanceTimer) { clearInterval(sdkMaintenanceTimer); sdkMaintenanceTimer = null; }
+}
+
 // Start the heap governor and register the evictors + diagnostics it runs
 // under pressure. Idempotent — safe to call on every (re)auth.
 function startMemoryGovernor() {
@@ -309,6 +393,10 @@ function startMemoryGovernor() {
   }));
 
   unregisterRoomEvictor = () => { for (const off of offs) { try { off(); } catch {} } };
+
+  // The structural bound that actually holds the line — independent of whether
+  // the heap governor above ever fires.
+  startSdkMaintenance();
 }
 
 async function afterAuth(userId, homeserver) {
@@ -454,6 +542,7 @@ async function tearDownLiveState() {
   if (manifestSaveTimer) { clearTimeout(manifestSaveTimer); manifestSaveTimer = null; }
   if (unregisterRoomEvictor) { unregisterRoomEvictor(); unregisterRoomEvictor = null; }
   memory.stop();
+  stopSdkMaintenance();
   for (const [, fns] of roomUnsubs) fns.forEach(fn => { try { fn(); } catch {} });
   roomUnsubs.clear();
   roomStores.clear();
@@ -1006,6 +1095,10 @@ window.MatrixLive = {
   // Memory governor
   getMemoryStats: () => memory.getStats(),
   getSdkStats,
+  // Force a non-workspace room sweep now (the maintenance loop runs it every
+  // SDK_MAINTENANCE_INTERVAL_MS). Returns how many rooms were dropped — pair it
+  // with getSdkStats() to watch sdkRooms fall toward workspaceRooms.
+  purgeNonWorkspaceRooms: () => shedNonWorkspaceRooms(),
   setMemoryBudget: (bytes) => memory.setBudget(bytes),
   onMemoryPressure: (fn) => memory.onPressure(fn),
   checkMemory: () => memory.checkPressure(),

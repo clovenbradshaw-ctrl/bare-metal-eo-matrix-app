@@ -10,7 +10,7 @@ actually reports heap pressure.
 
 | Source | Growth | Status |
 |--------|--------|--------|
-| **matrix-js-sdk sync store** — every room in the account + E2EE member/device lists | scales with the *whole account*, not just this app's rooms | **cut** by lazy-load + minimal sync (below) |
+| **matrix-js-sdk sync store** — every room in the account + E2EE member/device lists | scales with the *whole account*, not just this app's rooms | **cut** by lazy-load + minimal sync, then **bounded to this app's rooms** by shedding non-workspace rooms (below) |
 | `roomEvents` in `src/main.js` — committed op-events per visited room | one array per room, forever | **bounded** by LRU (below) |
 | `EventStore._eventIdSet` — per-event dedup key per open room | one entry per event × open rooms | **bounded** by LRU |
 | matrix-js-sdk live timeline — decrypted `MatrixEvent` objects | one per synced/paginated event, kept forever | **released** on room close / heavy seed |
@@ -91,8 +91,24 @@ visited rooms could blow past 500 MB on their own.
   the SDK cache, so nothing is lost — only re-read on demand. This matches
   the existing architecture note in `src/rooms.js` (`loadTimelineSince`).
 
-Steady-state footprint is therefore bounded by
-`MAX_OPEN_ROOMS × (one room's events)` no matter how many rooms exist.
+* **Non-workspace room shedding** (`shedNonWorkspaceRooms`, swept every
+  `SDK_MAINTENANCE_INTERVAL_MS`). matrix-js-sdk is a *full chat client*: it
+  syncs the user's entire account and keeps every room — DMs, big public
+  rooms, their state and decrypted timelines — resident forever. This app
+  reads none of it (history is in OPFS; live updates arrive via the signal
+  sync), so the maintenance loop drops every joined room that isn't one of
+  this app's `eo.workspace` rooms (identified by the `<ns>.meta` state event)
+  straight out of the SDK store. Rooms the app is actively using and pending
+  invites are always kept; a shed room re-appears from sync only if it has new
+  activity, and the next sweep drops it again. This runs on a fixed interval —
+  **not** behind the heap governor, which reads `performance.memory` and is
+  blind to the SDK's native + Rust-crypto-WASM memory, so it never sees this
+  cost. Use `window.MatrixLive.purgeNonWorkspaceRooms()` to force a sweep and
+  watch `getSdkStats().sdkRooms` fall toward `workspaceRooms`.
+
+Steady-state footprint is therefore bounded by this app's own rooms — roughly
+`MAX_OPEN_ROOMS × (one room's events)` plus the cheap state of any other joined
+workspaces — no matter how many unrelated rooms the account is in.
 
 ### 2. Adaptive governor (catches the rest) — `src/memory.js`
 
