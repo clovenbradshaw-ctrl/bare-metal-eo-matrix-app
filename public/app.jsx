@@ -578,7 +578,6 @@ function App() {
 
   const [membersDialogRoomId, setMembersDialogRoomId] = useState(null);
 
-  const [customSlices, setCustomSlices] = useState({});
   const [csvImport, setCsvImport] = useState(null); // {id, file, roomId} | null
   const [airtableImport, setAirtableImport] = useState(null); // {id} | null
   // Time-travel scrubber: collapsed by default; opens via the topbar toggle.
@@ -835,6 +834,52 @@ function App() {
     return id;
   }
 
+  // ── Saved views (Airtable-style) ────────────────────────────────────────
+  // A view is a named, persisted bundle of {kind, filters, sorts, hidden}
+  // stored in the log as DEF _schema.views.<set>. Because it lives in the same
+  // encrypted timeline as the data, every collaborator and device sees the
+  // same views — no separate store, no extra sync.
+  const viewsFor = (setId) => (state.schema?.views?.[setId]) || [];
+  function writeViews(setId, next) {
+    onEmit(ME.OP.DEF, { anchor: null, path: `_schema.views.${setId}`, value: next });
+  }
+  function nextViewName(setId, kind) {
+    const label = kind ? kind[0].toUpperCase() + kind.slice(1) : 'View';
+    const n = viewsFor(setId).filter(v => v.kind === kind).length + 2; // built-in auto view is #1
+    return `${label} ${n}`;
+  }
+  function createView(setId, { name, kind, filters = [], sorts = [], hidden = [] }) {
+    const id = 'v' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
+    const view = { id, name: (name || '').trim() || nextViewName(setId, kind), kind, filters, sorts, hidden };
+    writeViews(setId, [...viewsFor(setId), view]);
+    return view;
+  }
+  function updateViewConfig(setId, viewId, patch) {
+    writeViews(setId, viewsFor(setId).map(v => v.id === viewId ? { ...v, ...patch } : v));
+  }
+  function renameView(setId, viewId, name) {
+    const n = (name || '').trim();
+    if (!n) return;
+    updateViewConfig(setId, viewId, { name: n });
+  }
+  function duplicateView(setId, viewId) {
+    const src = viewsFor(setId).find(v => v.id === viewId);
+    if (!src) return null;
+    const id = 'v' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
+    const copy = { ...src, id, name: `${src.name} copy` };
+    writeViews(setId, [...viewsFor(setId), copy]);
+    return copy;
+  }
+  function deleteView(setId, viewId) {
+    writeViews(setId, viewsFor(setId).filter(v => v.id !== viewId));
+    if (selection.viewId === viewId && selection.tableId === setId) {
+      setSelection({ kind: 'slice', sliceId: `${setId}.table`, tableId: setId, sliceKind: 'table' });
+    }
+  }
+  const activeSavedView = (selection.kind === 'slice' && selection.viewId)
+    ? viewsFor(selection.tableId).find(v => v.id === selection.viewId) || null
+    : null;
+
   function toggleDemo() {
     // Demo toggle only meaningful when *already* in demo mode. In live mode
     // it's hidden by the RoomPicker prop below.
@@ -956,11 +1001,11 @@ function App() {
           state={renderState}
           selection={selection}
           setSelection={setSelection}
-          customSlices={customSlices}
           onAirtableSchema={() => setAirtableImport({ id: Date.now() })}
-          onCreateSlice={(tableId, slice) => {
-            setCustomSlices(s => ({ ...s, [tableId]: [...(s[tableId] || []), slice] }));
-          }}
+          onCreateView={createView}
+          onRenameView={renameView}
+          onDuplicateView={duplicateView}
+          onDeleteView={deleteView}
           onCreateTable={(name) => {
             const ME = window.MatrixEngine;
             const existing = state.schema?.tables || [];
@@ -1012,6 +1057,7 @@ function App() {
           )}
           {selection.kind === 'slice' && (selection.sliceKind === 'table') && (
             <window.TableView
+              key={selection.sliceId}
               room={rooms.find(r => r.id === currentRoomId)}
               state={renderState}
               onEmit={onEmit}
@@ -1019,6 +1065,16 @@ function App() {
               scrubber={scrubberEl}
               forceTable={selection.tableId}
               setSelection={setSelection}
+              savedView={activeSavedView || selection._seed || null}
+              onUpdateView={selection.viewId
+                ? (patch) => updateViewConfig(selection.tableId, selection.viewId, patch)
+                : null}
+              onSaveAsView={(cfg) => {
+                const v = createView(selection.tableId, { name: nextViewName(selection.tableId, 'table'), kind: 'table', ...cfg });
+                // Carry the config on the selection so the grid mounts with it
+                // even before the new view's DEF has folded back in (live mode).
+                setSelection({ kind: 'slice', sliceId: `${selection.tableId}.view.${v.id}`, tableId: selection.tableId, sliceKind: 'table', viewId: v.id, _seed: { filters: cfg.filters, sorts: cfg.sorts, hidden: cfg.hidden } });
+              }}
             />
           )}
           {selection.kind === 'slice' && selection.sliceKind === 'schema' && (
