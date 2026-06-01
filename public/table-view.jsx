@@ -44,6 +44,309 @@ function fmtCell(value, type, opts) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Single-/multi-select — Airtable-style colored option chips plus a
+// searchable dropdown that lets you pick, toggle, clear, and create options
+// inline. Option values stay plain strings (stored as `field.options: []`);
+// an optional `field.optionColors: { [value]: paletteName }` map overrides
+// the deterministic per-value color. Everything degrades gracefully when
+// those are absent, so legacy data and CSV imports keep working.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Soft tinted backgrounds with a mid-tone border and dark text — distinct but
+// at home on the white workbench ground. `name` is what gets persisted.
+const SELECT_PALETTE = [
+  { name: 'slate',   bg: '#eceef2', border: '#c4cad4', text: '#3b4350' },
+  { name: 'red',     bg: '#fbe4e2', border: '#f1b9b4', text: '#8f2d27' },
+  { name: 'orange',  bg: '#fdebd9', border: '#f4c89a', text: '#8a4b12' },
+  { name: 'amber',   bg: '#fbf0cf', border: '#e8cd7e', text: '#6f5310' },
+  { name: 'lime',    bg: '#eaf3d2', border: '#c5da92', text: '#4d6314' },
+  { name: 'green',   bg: '#ddf1e3', border: '#a7d6b6', text: '#1d6b3f' },
+  { name: 'teal',    bg: '#d6f0ee', border: '#99d6cf', text: '#16695f' },
+  { name: 'cyan',    bg: '#d9eef7', border: '#9fcfe4', text: '#155f78' },
+  { name: 'blue',    bg: '#e3ecfb', border: '#b3ccf2', text: '#234a86' },
+  { name: 'indigo',  bg: '#e6e6fb', border: '#bdbcf0', text: '#3a2f8f' },
+  { name: 'violet',  bg: '#efe3fa', border: '#cdb0ec', text: '#5a2c8c' },
+  { name: 'magenta', bg: '#fbe2f3', border: '#f0b0d8', text: '#8c2167' },
+  { name: 'pink',    bg: '#fce3ec', border: '#f3b3c9', text: '#8f2a4f' },
+  { name: 'brown',   bg: '#efe6dc', border: '#d2bda3', text: '#6a4d2e' },
+];
+const PALETTE_BY_NAME = Object.fromEntries(SELECT_PALETTE.map(p => [p.name, p]));
+
+function hashString(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+// Resolve a value to a palette entry: explicit color from the field's map wins,
+// otherwise a stable hash of the value picks one (same value → same color
+// everywhere it appears, the way Airtable feels).
+function optionPalette(value, colorMap) {
+  const named = colorMap && colorMap[value];
+  if (named && PALETTE_BY_NAME[named]) return PALETTE_BY_NAME[named];
+  return SELECT_PALETTE[hashString(value == null ? '' : String(value)) % SELECT_PALETTE.length];
+}
+function chipStyle(value, colorMap) {
+  const p = optionPalette(value, colorMap);
+  return { background: p.bg, borderColor: p.border, color: p.text };
+}
+// Normalize a cell value into the array shape both modes work with internally.
+function selValues(value, multi) {
+  if (multi) {
+    if (Array.isArray(value)) return value.map(String).filter(v => v !== '');
+    return value == null || value === '' ? [] : [String(value)];
+  }
+  return value == null || value === '' ? [] : [String(value)];
+}
+
+function SelectChip({ value, colorMap, onRemove }) {
+  return (
+    <span className="sel-chip" style={chipStyle(value, colorMap)} title={String(value)}>
+      <span className="sel-chip-label">{String(value)}</span>
+      {onRemove && (
+        <button
+          className="sel-chip-x"
+          tabIndex={-1}
+          title="remove"
+          onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRemove(); }}
+        >×</button>
+      )}
+    </span>
+  );
+}
+
+// A colored option chip with an inline color picker + remove, used by the
+// field-config popover so a curator can recolor / drop options.
+function OptionChipEditor({ value, colorMap, onRecolor, onRemove }) {
+  const [pickOpen, setPickOpen] = useState(false);
+  const cur = optionPalette(value, colorMap);
+  return (
+    <span className="ctm-opt" style={chipStyle(value, colorMap)}>
+      <button
+        className="ctm-opt-swatch"
+        title="change color"
+        style={{ background: cur.border }}
+        onClick={(e) => { e.stopPropagation(); setPickOpen(o => !o); }}
+      />
+      <span className="ctm-opt-label">{value}</span>
+      <button className="ctm-opt-x" title="remove option" onClick={(e) => { e.stopPropagation(); onRemove(); }}>×</button>
+      {pickOpen && (
+        <span className="ctm-palette" onMouseLeave={() => setPickOpen(false)}>
+          {SELECT_PALETTE.map(p => (
+            <button
+              key={p.name}
+              className={`ctm-palette-dot ${cur.name === p.name ? 'on' : ''}`}
+              title={p.name}
+              style={{ background: p.bg, borderColor: p.border }}
+              onClick={(e) => { e.stopPropagation(); onRecolor(p.name); setPickOpen(false); }}
+            />
+          ))}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// The dropdown itself — portaled to <body> and pinned to the cell's rect so it
+// escapes the scroll/overflow clipping of the grid. Handles search, keyboard
+// navigation, inline create, and clear.
+function SelectMenu({ anchorRect, options, colorMap, selected, multi, onPick, onCreate, onClear, onClose, onNavigate }) {
+  const [q, setQ] = useState('');
+  const [hi, setHi] = useState(0);
+  const inputRef = useRef(null);
+  const menuRef = useRef(null);
+
+  const sel = new Set(selected);
+  const query = q.trim();
+  const ql = query.toLowerCase();
+  const filtered = options.filter(o => o.toLowerCase().includes(ql));
+  const exact = options.some(o => o.toLowerCase() === ql);
+  const canCreate = query.length > 0 && !exact;
+  const rowCount = filtered.length + (canCreate ? 1 : 0);
+
+  useEffect(() => { if (inputRef.current) inputRef.current.focus(); }, []);
+  useEffect(() => { setHi(0); }, [q]);
+
+  // Outside-click + scroll/resize all dismiss. The cell rect is captured once
+  // at open, so a scroll would leave the menu floating — close instead.
+  useEffect(() => {
+    function onDown(e) { if (menuRef.current && !menuRef.current.contains(e.target)) onClose(); }
+    function onScroll(e) { if (menuRef.current && menuRef.current.contains(e.target)) return; onClose(); }
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', onClose);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', onClose);
+    };
+  }, [onClose]);
+
+  function choose(idx) {
+    if (idx < filtered.length) onPick(filtered[idx]);
+    else if (canCreate) { onCreate(query); setQ(''); }
+  }
+
+  function onKeyDown(e) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); setHi(h => Math.min(h + 1, rowCount - 1)); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setHi(h => Math.max(h - 1, 0)); }
+    else if (e.key === 'Enter') { e.preventDefault(); if (rowCount > 0) choose(hi); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); onClose(); }
+    else if (e.key === 'Tab') {
+      e.preventDefault();
+      if (!multi && rowCount > 0) choose(hi);
+      onClose();
+      if (onNavigate) onNavigate(e.shiftKey ? 'shift-tab' : 'tab');
+    } else if (e.key === 'Backspace' && q === '' && multi && selected.length > 0) {
+      e.preventDefault();
+      onPick(selected[selected.length - 1]); // toggle the last chip off
+    }
+  }
+
+  // Pin to the cell; flip above when there isn't room below, clamp to viewport.
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const width = Math.min(Math.max(anchorRect.width, 220), Math.max(220, vw - 16));
+  let left = anchorRect.left;
+  if (left + width > vw - 8) left = Math.max(8, vw - 8 - width);
+  const below = vh - anchorRect.bottom;
+  const openUp = below < 220 && anchorRect.top > below;
+  const style = openUp
+    ? { left, bottom: Math.round(vh - anchorRect.top + 3), width, maxHeight: Math.min(320, anchorRect.top - 12) }
+    : { left, top: Math.round(anchorRect.bottom + 3), width, maxHeight: Math.min(320, below - 12) };
+
+  return ReactDOM.createPortal(
+    <div className="sel-menu" ref={menuRef} style={style} onKeyDown={onKeyDown}>
+      <div className="sel-menu-search">
+        <i className="ph ph-magnifying-glass" aria-hidden="true"></i>
+        <input
+          ref={inputRef}
+          value={q}
+          onChange={e => setQ(e.target.value)}
+          placeholder={multi ? 'search or add an option…' : 'search…'}
+          spellCheck={false}
+        />
+      </div>
+      <div className="sel-menu-list">
+        {filtered.map((o, i) => (
+          <button
+            key={o}
+            className={`sel-menu-row ${i === hi ? 'hi' : ''} ${sel.has(o) ? 'on' : ''}`}
+            onMouseEnter={() => setHi(i)}
+            onClick={() => choose(i)}
+          >
+            <SelectChip value={o} colorMap={colorMap} />
+            {sel.has(o) && <i className="ph ph-check sel-menu-check" aria-hidden="true"></i>}
+          </button>
+        ))}
+        {filtered.length === 0 && !canCreate && <div className="sel-menu-empty">no options yet — type to add one</div>}
+        {canCreate && (
+          <button
+            className={`sel-menu-row sel-menu-create ${hi === filtered.length ? 'hi' : ''}`}
+            onMouseEnter={() => setHi(filtered.length)}
+            onClick={() => choose(filtered.length)}
+          >
+            <i className="ph ph-plus sel-menu-plus" aria-hidden="true"></i>
+            <span className="sel-menu-create-label">create</span>
+            <SelectChip value={query} colorMap={colorMap} />
+          </button>
+        )}
+      </div>
+      {selected.length > 0 && onClear && (
+        <button className="sel-menu-clear" onClick={() => { onClear(); if (!multi) onClose(); }}>
+          <i className="ph ph-x-circle" aria-hidden="true"></i> clear {multi ? 'all' : 'selection'}
+        </button>
+      )}
+    </div>,
+    document.body
+  );
+}
+
+// Shared trigger + chip display for both single and multi select. Renders a
+// <td> for the grid (wrapTd) or a bare control for the record-detail panel.
+function SelectControl({ value, options, colorMap, multi, onCommit, onAddOption, heat, autoOpen, onAutoOpenConsumed, onNavigate, wrapTd }) {
+  const [open, setOpen] = useState(false);
+  const [rect, setRect] = useState(null);
+  const ref = useRef(null);
+
+  const opts = options || [];
+  const selected = selValues(value, multi);
+
+  function openMenu() {
+    if (ref.current) setRect(ref.current.getBoundingClientRect());
+    setOpen(true);
+  }
+  function close() { setOpen(false); }
+
+  useEffect(() => {
+    if (autoOpen && !open) { openMenu(); if (onAutoOpenConsumed) onAutoOpenConsumed(); }
+  // eslint-disable-next-line
+  }, [autoOpen]);
+
+  function pick(v) {
+    if (multi) {
+      const next = selected.includes(v) ? selected.filter(x => x !== v) : [...selected, v];
+      onCommit(next);
+    } else {
+      if (v !== value) onCommit(v);
+      close();
+    }
+  }
+  function create(v) {
+    if (onAddOption) onAddOption(v);
+    if (multi) {
+      if (!selected.includes(v)) onCommit([...selected, v]);
+    } else {
+      onCommit(v);
+      close();
+    }
+  }
+  function removeChip(v) { onCommit(multi ? selected.filter(x => x !== v) : ''); }
+  function clearAll() { onCommit(multi ? [] : ''); }
+
+  const empty = selected.length === 0;
+  const heatCls = heat ? heatClass(heat) : '';
+
+  const inner = (
+    <>
+      <div
+        ref={ref}
+        className={`sel-control ${multi ? 'multi' : 'single'} ${empty ? 'is-empty' : ''}`}
+        onClick={(e) => { e.stopPropagation(); openMenu(); }}
+        title="click to choose · emits DEF"
+      >
+        <div className="sel-chips">
+          {empty
+            ? <span className="sel-placeholder">empty</span>
+            : selected.map(v => (
+                <SelectChip key={v} value={v} colorMap={colorMap} onRemove={multi ? () => removeChip(v) : undefined} />
+              ))}
+        </div>
+        <i className="ph ph-caret-down sel-caret" aria-hidden="true"></i>
+      </div>
+      {open && rect && (
+        <SelectMenu
+          anchorRect={rect}
+          options={opts}
+          colorMap={colorMap}
+          selected={selected}
+          multi={multi}
+          onPick={pick}
+          onCreate={create}
+          onClear={clearAll}
+          onClose={close}
+          onNavigate={onNavigate}
+        />
+      )}
+    </>
+  );
+
+  if (wrapTd) {
+    return <td className={`cell sel-td ${multi ? 'ms' : 'ss'} ${empty ? 'null' : 'str'} ${open ? 'sel-open' : ''} ${heatCls}`}>{inner}</td>;
+  }
+  return inner;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Date utilities — smart parse + friendly display + tone (past/today/future).
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -465,8 +768,8 @@ function DetailField({ value, type, onCommit }) {
 }
 
 function RecordDetailPanel({
-  record, records, entityType, room, cols, partitioned, linkedTypes, state,
-  onClose, onCommitCell, onCommitPartition, onJump, onSelectRecord, onViewTimeline,
+  record, records, entityType, room, cols, partitioned, linkedTypes, state, selectOptions,
+  onClose, onCommitCell, onCommitPartition, onAddOption, onJump, onSelectRecord, onViewTimeline,
 }) {
   // Escape closes the panel. Re-registered per record so it stays live.
   useEffect(() => {
@@ -560,6 +863,21 @@ function RecordDetailPanel({
                 </div>
               );
             }
+            if (c.type === 'select' || c.type === 'multiselect') {
+              return (
+                <div className="rd-field" key={c.name}>
+                  <label className="rd-label">{c.name} <span className="rd-type">{c.type === 'multiselect' ? 'multi-select' : 'single-select'}</span></label>
+                  <SelectControl
+                    multi={c.type === 'multiselect'}
+                    value={record[c.name]}
+                    options={(selectOptions && selectOptions[c.name]) || c.options || []}
+                    colorMap={c.optionColors}
+                    onCommit={(v) => onCommitCell(record._anchor, c.name, v)}
+                    onAddOption={(v) => onAddOption && onAddOption(c.name, v)}
+                  />
+                </div>
+              );
+            }
             return (
               <div className="rd-field" key={c.name}>
                 <label className="rd-label">{c.name} <span className="rd-type">{c.type}</span></label>
@@ -601,7 +919,7 @@ function buildTable(entityType, state) {
   let cols;
   if (Array.isArray(schemaFields)) {
     const declared = new Set(schemaFields.map(f => f.name));
-    cols = schemaFields.map(f => ({ name: f.name, type: f.type, options: f.options, formula: f.formula, rollup: f.rollup, schematized: true }));
+    cols = schemaFields.map(f => ({ name: f.name, type: f.type, options: f.options, optionColors: f.optionColors, formula: f.formula, rollup: f.rollup, schematized: true }));
     // any data-only columns get appended
     const extras = new Set();
     for (const r of rows) {
@@ -965,7 +1283,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     const next = existing.map(f => {
       if (f.name !== fieldName) return f;
       const u = { ...f, type: newType };
-      if (newType !== 'select' && newType !== 'multiselect') delete u.options;
+      if (newType !== 'select' && newType !== 'multiselect') { delete u.options; delete u.optionColors; }
       else if (!u.options) u.options = [];
       if (newType !== 'formula') delete u.formula;
       else if (typeof u.formula !== 'string') u.formula = '';
@@ -1202,6 +1520,38 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
     onEmit(TV_OP.SEG, { anchor, partition });
   }
 
+  // Effective options for each select/multiselect column: declared options
+  // first (preserving the curator's order), then any stray values that exist in
+  // the data but were never registered — so the dropdown never hides a value a
+  // record actually holds (CSV imports, hand edits, schema drift).
+  const selectOptions = useMemo(() => {
+    const out = {};
+    for (const c of cols) {
+      if (c.type !== 'select' && c.type !== 'multiselect') continue;
+      const declared = Array.isArray(c.options) ? c.options.map(String) : [];
+      const seen = new Set(declared);
+      const merged = declared.slice();
+      for (const v of collectFieldValues(state, entityType, c.name)) {
+        if (!seen.has(v)) { seen.add(v); merged.push(v); }
+      }
+      out[c.name] = merged;
+    }
+    return out;
+  }, [cols, state, entityType]);
+
+  // Register a new option on a schematized select field so it persists and is
+  // offered to every record. Data-only columns have no schema row to write to;
+  // there the value still lands on the cell and resurfaces via selectOptions.
+  function addFieldOption(fieldName, value) {
+    const v = String(value).trim();
+    if (!v) return;
+    const f = (state.schema?.fields?.[entityType] || []).find(x => x.name === fieldName);
+    if (!f) return;
+    const opts = Array.isArray(f.options) ? f.options : [];
+    if (opts.includes(v)) return;
+    patchField(fieldName, { options: [...opts, v] });
+  }
+
   function nextUniqueTs() {
     const now = Date.now();
     tsCounterRef.current = Math.max(tsCounterRef.current + 1, now);
@@ -1378,7 +1728,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                   if (e.target.tagName === 'INPUT') return;
                   e.preventDefault();
                   const r = e.currentTarget.getBoundingClientRect();
-                  setColMenu({ name: c.name, currentType: c.type, options: c.options, formula: c.formula, rollup: c.rollup, x: r.left, y: r.bottom });
+                  setColMenu({ name: c.name, currentType: c.type, options: c.options, optionColors: c.optionColors, formula: c.formula, rollup: c.rollup, x: r.left, y: r.bottom });
                 } : undefined;
                 return (
                   <th key={c.name} className={`${c.isPk ? 'pk' : ''} ${c.schematized === false ? 'unschematized' : ''} ${showGlyph ? 'formula' : ''} ${canEdit ? 'editable' : ''}`}
@@ -1453,6 +1803,21 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     <FormulaCell key={c.name} formula={c.formula} record={r} state={state} />
                   ) : c.type === 'rollup' ? (
                     <RollupCell key={c.name} rollup={c.rollup} record={r} state={state} />
+                  ) : (c.type === 'select' || c.type === 'multiselect') ? (
+                    <SelectControl
+                      key={c.name}
+                      wrapTd
+                      multi={c.type === 'multiselect'}
+                      value={r[c.name]}
+                      options={selectOptions[c.name] || []}
+                      colorMap={c.optionColors}
+                      heat={heatOn ? (r._writes?.[c.name] || 0) : 0}
+                      onCommit={(v) => commitCell(r._anchor, c.name, v)}
+                      onAddOption={(v) => addFieldOption(c.name, v)}
+                      autoOpen={pendingFocus?.anchor === r._anchor && pendingFocus?.field === c.name}
+                      onAutoOpenConsumed={() => setPendingFocus(null)}
+                      onNavigate={(dir) => navigate(rIdx, cIdx, dir)}
+                    />
                   ) : (
                     <EditableCell
                       key={c.name}
@@ -1600,9 +1965,11 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             partitioned={partitioned}
             linkedTypes={linkedTypes}
             state={state}
+            selectOptions={selectOptions}
             onClose={() => setDetailAnchor(null)}
             onCommitCell={commitCell}
             onCommitPartition={commitPartition}
+            onAddOption={addFieldOption}
             onJump={onJump}
             onSelectRecord={setDetailAnchor}
             onViewTimeline={(anchor) => {
@@ -1882,7 +2249,14 @@ function ColMenuParams({ menu, state, entityType, linkedTypes, onPatch }) {
 
   if (t === 'select' || t === 'multiselect') {
     const opts = menu.options || [];
-    const removeOption = (o) => onPatch({ options: opts.filter(x => x !== o) });
+    const colors = menu.optionColors || {};
+    // Drop the option and forget its color override in one write.
+    const removeOption = (o) => {
+      const nextColors = { ...colors };
+      delete nextColors[o];
+      onPatch({ options: opts.filter(x => x !== o), optionColors: nextColors });
+    };
+    const recolor = (o, name) => onPatch({ optionColors: { ...colors, [o]: name } });
     // Distinct values actually present in the data for this field. A schema's
     // declared options can drift from reality (CSV imports, hand edits), so we
     // surface every value found in the records and let the user register the
@@ -1893,12 +2267,15 @@ function ColMenuParams({ menu, state, entityType, linkedTypes, onPatch }) {
     return (
       <div className="ctm-params">
         <div className="ctm-section-label">options</div>
-        <div className="ctm-chips">
+        <div className="ctm-opts">
           {opts.map(o => (
-            <span key={o} className="ctm-chip">
-              {o}
-              <button className="ctm-chip-x" onClick={() => removeOption(o)} title="remove">×</button>
-            </span>
+            <OptionChipEditor
+              key={o}
+              value={o}
+              colorMap={colors}
+              onRecolor={(name) => recolor(o, name)}
+              onRemove={() => removeOption(o)}
+            />
           ))}
           {opts.length === 0 && <span className="ctm-empty">no options yet</span>}
         </div>
@@ -1925,16 +2302,17 @@ function ColMenuParams({ menu, state, entityType, linkedTypes, onPatch }) {
                 onClick={() => onPatch({ options: [...opts, ...missing] })}
               >add all</button>
             </div>
-            <div className="ctm-chips">
+            <div className="ctm-opts">
               {missing.map(v => (
                 <button
                   key={v}
-                  className="ctm-chip ctm-chip-suggested"
+                  className="ctm-opt ctm-opt-suggested"
+                  style={chipStyle(v, colors)}
                   title="click to add as an option"
                   onClick={() => addOption(v)}
                 >
-                  {v}
-                  <span className="ctm-chip-plus" aria-hidden="true">+</span>
+                  <span className="ctm-opt-label">{v}</span>
+                  <span className="ctm-opt-plus" aria-hidden="true">+</span>
                 </button>
               ))}
             </div>
@@ -2091,7 +2469,7 @@ function TableSchemaView({ entityType, state, room, scrubber, onEmit }) {
       if (f.name !== fieldName) return f;
       const updated = { ...f, type: newType };
       // Manage options vs other params on type swap
-      if (newType !== 'select' && newType !== 'multiselect') delete updated.options;
+      if (newType !== 'select' && newType !== 'multiselect') { delete updated.options; delete updated.optionColors; }
       else if (!updated.options) updated.options = [];
       if (newType !== 'formula') delete updated.formula;
       else if (typeof updated.formula !== 'string') updated.formula = '';
