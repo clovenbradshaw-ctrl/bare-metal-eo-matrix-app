@@ -122,6 +122,11 @@
     return s || fallback;
   }
 
+  /* formula/rollup fields are derived at render time — not import targets */
+  function isComputedField(f) {
+    return f && (f.type === 'formula' || f.type === 'rollup');
+  }
+
   /* ── The modal ────────────────────────────────────────────────────── */
   function CsvImportModal({ csvImport, state, onEmit, onClose }) {
     if (!csvImport) return null;
@@ -193,12 +198,21 @@
     useEffect(() => {
       if (!columns.length) return;
       const existingFields = (dest !== 'new' && state?.schema?.fields?.[dest]) ? state.schema.fields[dest] : [];
-      const existingByLower = new Map(existingFields.map(f => [f.name.toLowerCase(), f]));
+      // Computed fields (formula / rollup) are derived at render time — they
+      // are NEVER data targets. Drop them from auto-match + the picker, and if
+      // an incoming column matches a computed field name (Airtable exports the
+      // pre-computed values under that header), default it to skip so we don't
+      // import a frozen snapshot over a live formula.
+      const computedByLower = new Map(existingFields.filter(isComputedField).map(f => [f.name.toLowerCase(), f]));
+      const dataByLower = new Map(existingFields.filter(f => !isComputedField(f)).map(f => [f.name.toLowerCase(), f]));
       setMapping(columns.map(col => {
         if (dest === 'new') {
           return { target: '__new__', newName: col.name, type: col.type };
         }
-        const match = existingByLower.get(col.name.toLowerCase());
+        if (computedByLower.has(col.name.toLowerCase())) {
+          return { target: '__skip__', newName: col.name, type: col.type, _computed: true };
+        }
+        const match = dataByLower.get(col.name.toLowerCase());
         if (match) return { target: match.name, newName: '', type: match.type };
         return { target: '__new__', newName: col.name, type: col.type };
       }));
@@ -257,6 +271,9 @@
           } else {
             fieldName = m.target;
             const existing = existingByName.get(fieldName);
+            // Never write data into a computed field — its value is derived at
+            // render time, so an imported snapshot would be dead weight.
+            if (existing && isComputedField(existing)) return null;
             if (existing) fieldType = existing.type;
           }
           return { name: fieldName, type: fieldType, csvIdx: i };
@@ -427,7 +444,8 @@
                       const m = mapping[i] || { target: '__new__', newName: col.name, type: col.type };
                       const isSkip = m.target === '__skip__';
                       const isNew  = m.target === '__new__';
-                      const existingFields = (dest !== 'new' && state?.schema?.fields?.[dest]) ? state.schema.fields[dest] : [];
+                      const allExistingFields = (dest !== 'new' && state?.schema?.fields?.[dest]) ? state.schema.fields[dest] : [];
+                      const existingFields = allExistingFields.filter(f => !isComputedField(f));
                       return (
                         <div key={i} className={`csv-map-row ${isSkip ? 'skip' : ''}`}>
                           <div className="csv-map-csvcol" title={col.name}>

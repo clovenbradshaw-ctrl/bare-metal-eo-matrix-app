@@ -103,6 +103,9 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .sb-slice-meta{font-size:10.5px;color:var(--text-dim);padding:0 6px;border:1px solid var(--border);background:#fff;font-weight:500}
 .sb-add-table{margin:4px 14px 0;padding:5px 8px;background:#fff;border:1px dashed var(--border-strong);color:var(--text-dim);font-family:var(--mono);font-size:11.5px;text-align:left;cursor:pointer;font-weight:500}
 .sb-add-table:hover{border-style:solid;color:var(--text-bright);border-color:#000}
+.sb-add-row{display:flex;gap:6px;margin:4px 14px 0}
+.sb-add-row .sb-add-table{margin:0;flex:1 1 auto;white-space:nowrap}
+.sb-add-row .sb-add-airtable{flex:0 1 auto}
 .sb-new-table{display:flex;gap:4px;padding:4px 14px}
 
 /* ── New-slice creator ───────────────────────────────────────────────── */
@@ -1292,9 +1295,11 @@ table.csv-preview tr:last-child td{border-bottom:none}
 
 <script src="engine.js"></script>
 <script src="formula.js"></script>
+<script src="airtable-schema.js"></script>
 <script type="text/babel" data-presets="react" src="tweaks-panel.jsx"></script>
 <script type="text/babel" data-presets="react" src="matrix-auth.jsx"></script>
 <script type="text/babel" data-presets="react" src="csv-import.jsx"></script>
+<script type="text/babel" data-presets="react" src="airtable-import.jsx"></script>
 <script type="text/babel" data-presets="react" src="sidebar.jsx"></script>
 <script type="text/babel" data-presets="react" src="entity-timeline.jsx"></script>
 <script type="text/babel" data-presets="react" src="db-view.jsx"></script>

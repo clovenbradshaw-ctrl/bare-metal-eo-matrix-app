@@ -579,6 +579,7 @@ function App() {
   const [membersDialogRoomId, setMembersDialogRoomId] = useState(null);
 
   const [csvImport, setCsvImport] = useState(null); // {id, file, roomId} | null
+  const [airtableImport, setAirtableImport] = useState(null); // {id} | null
   // Time-travel scrubber: collapsed by default; opens via the topbar toggle.
   // We also force-open it whenever the cursor is *not* live, so the user
   // can always see/return from a scrubbed state.
@@ -1000,6 +1001,7 @@ function App() {
           state={renderState}
           selection={selection}
           setSelection={setSelection}
+          onAirtableSchema={() => setAirtableImport({ id: Date.now() })}
           onCreateView={createView}
           onRenameView={renameView}
           onDuplicateView={duplicateView}
@@ -1158,6 +1160,15 @@ function App() {
           state={state}
           onEmit={onEmit}
           onClose={() => setCsvImport(null)}
+        />
+      )}
+
+      {airtableImport && window.AirtableSchemaModal && (
+        <window.AirtableSchemaModal
+          schemaImport={airtableImport}
+          state={state}
+          onEmit={onEmit}
+          onClose={() => setAirtableImport(null)}
         />
       )}
     </div>

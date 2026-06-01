@@ -101,6 +101,39 @@ languages, on different homeservers, see the same database.** That is the
 federation guarantee. The homeserver only stores ciphertext; the agreement
 lives in the namespace + taxonomy + field paths + schema log.
 
+### Computed fields are schema, not data
+
+A `_schema.fields.<set>` entry can declare a field as **computed**:
+
+```js
+{ name: 'Label',   type: 'formula', formula: 'CONCATENATE({Name}, " — ", {Status})' }
+{ name: 'Hours',   type: 'rollup',  rollup: { via: 'Tasks', field: 'Hours', fn: 'sum' } }
+```
+
+The **expression lives in the schema log; the value is never stored.**
+`public/formula.js` derives it at render time from the current fold state
+(`window.Formula.evaluate` / `evaluateRollup`). A formula cell ignores any
+value stored under its key — replay the log to any cursor and the computed
+column re-derives for that moment. So you never `DEF` a computed value; you
+`DEF` the formula once and the fold does the rest. The dialect is
+Airtable-flavoured (`{Field}` refs, `&` concat, `SUM`/`IF`/`CONCATENATE`/
+`REGEX_*`/`DATETIME_*`, …); rollups aggregate a field across `CON` edges of a
+named relation.
+
+### Importing an Airtable base schema
+
+`public/airtable-schema.js` + the **"⊞ airtable schema"** button (sidebar)
+turn an Airtable Metadata API response
+(`GET /v0/meta/bases/{baseId}/tables`) into this schema **without importing a
+single row**. Airtable's `formula` / `rollup` / `lookup` / `count` /
+`createdTime` columns map to the computed definitions above (formula field-id
+references are rewritten to `{Field Name}`); selects carry their choices;
+record links become `_schema.links` + a `linked` field. Then import real rows
+with the normal CSV/JSON importer — the importer **refuses computed fields as
+data targets**, so Airtable's exported pre-computed values are dropped and the
+formulas recompute live against your data. Pure transform, headlessly tested
+in `test/airtable-schema.test.cjs` (`node test/airtable-schema.test.cjs`).
+
 ---
 
 ## 4. Building a new app — the minimum viable path
