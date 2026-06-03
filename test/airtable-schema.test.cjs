@@ -81,6 +81,8 @@ const sample = {
 const r = AirtableSchema.parse(sample);
 check('parse ok', r.ok === true);
 eq('two tables', r.tables.map(t => t.name), ['Projects', 'Tasks']);
+// table ids are carried through so the PAT widget can fetch each table's records
+eq('table ids preserved', r.tables.map(t => t.id), ['tblProjects', 'tblTasks']);
 
 const proj = r.tables[0];
 const byName = Object.fromEntries(proj.fields.map(f => [f.name, f]));

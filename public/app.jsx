@@ -654,49 +654,72 @@ function App() {
     e => e?._type === 'import' && e.derived_set && Array.isArray(e.field_plan)
   ), [state]);
 
+  // The table the user is looking at — its import chunks materialize first.
+  const activeSet = selection?.tableId || null;
+
   useEffect(() => {
     const CI = window.CsvImport;
     if (!CI?.materializeImportRows) return;
     let cancelled = false;
     const timers = [];
-    (async () => {
-      for (const imp of importEntities) {
-        const a = imp._anchor;
-        if (importRowsRef.current[a] || inFlightRef.current.has(a)) continue;
-        inFlightRef.current.add(a);
-        try {
-          const rows = await CI.materializeImportRows(imp);
-          if (cancelled) return;
-          if (Array.isArray(rows)) {
-            // Successfully parsed (possibly to zero rows). Cache and render.
-            importRowsRef.current[a] = rows;
-            setImportRowsVersion(v => v + 1);
-          } else {
-            // Couldn't materialize yet — the import entity's `file` ref
-            // hasn't folded in (it DEFs in after the INS), or the media
-            // mirror is still syncing after a reload. Do NOT cache an empty
-            // result (that would hide the rows permanently); retry instead.
-            // New events re-run this effect on their own; the timer covers
-            // the case where the blob becomes readable with no further
-            // events (e.g. the homeserver finishes its first sync).
-            const n = (retryRef.current[a] || 0) + 1;
-            retryRef.current[a] = n;
-            if (n <= 8) {
-              timers.push(setTimeout(
-                () => setImportRowsVersion(v => v + 1),
-                Math.min(2000, 250 * n),
-              ));
-            }
-          }
-        } catch (e) {
-          console.warn('[app] could not materialize import rows:', e);
-        } finally {
-          inFlightRef.current.delete(a);
+
+    // Materialize the OPEN table's chunks first, then the rest in chunk order.
+    // On a fresh device the media cache is cold, so each chunk is a network
+    // download + decrypt + parse; ordering by the active set means the table
+    // you opened paints before the rest of the base streams in behind it.
+    const queue = importEntities.slice().sort((a, b) => {
+      const aa = a.derived_set === activeSet ? 0 : 1;
+      const bb = b.derived_set === activeSet ? 0 : 1;
+      if (aa !== bb) return aa - bb;
+      const ac = a.chunk_index ?? 0;
+      const bc = b.chunk_index ?? 0;
+      if (ac !== bc) return ac - bc;
+      return (a._created || 0) - (b._created || 0);
+    });
+
+    async function materialize(imp) {
+      const a = imp._anchor;
+      if (importRowsRef.current[a] || inFlightRef.current.has(a)) return;
+      inFlightRef.current.add(a);
+      try {
+        const rows = await CI.materializeImportRows(imp);
+        if (Array.isArray(rows)) {
+          // Successfully parsed (possibly to zero rows). Cache always — even if
+          // this run was superseded — so a re-run skips the work instead of
+          // re-downloading; only nudge a render while still current.
+          importRowsRef.current[a] = rows;
+          if (!cancelled) setImportRowsVersion(v => v + 1);
+        } else if (!cancelled) {
+          // Couldn't materialize yet — the import entity's `file` ref hasn't
+          // folded in (it DEFs in after the INS), or the media mirror is still
+          // syncing after a reload. Do NOT cache an empty result (that would
+          // hide the rows permanently); retry with backoff instead. New events
+          // re-run this effect; the timer covers the blob becoming readable
+          // with no further events (e.g. the homeserver finishes first sync).
+          const n = (retryRef.current[a] || 0) + 1;
+          retryRef.current[a] = n;
+          if (n <= 8) timers.push(setTimeout(() => setImportRowsVersion(v => v + 1), Math.min(2000, 250 * n)));
         }
+      } catch (e) {
+        console.warn('[app] could not materialize import rows:', e);
+      } finally {
+        inFlightRef.current.delete(a);
       }
-    })();
+    }
+
+    // Bounded-concurrency pool over the priority-ordered queue: a few parallel
+    // chunk downloads warm the open table fast without flooding the network.
+    let idx = 0;
+    const CONCURRENCY = 4;
+    async function worker() {
+      while (!cancelled && idx < queue.length) await materialize(queue[idx++]);
+    }
+    const workers = [];
+    for (let i = 0; i < Math.min(CONCURRENCY, queue.length); i++) workers.push(worker());
+    Promise.all(workers).catch(() => {});
+
     return () => { cancelled = true; timers.forEach(clearTimeout); };
-  }, [importEntities, importRowsVersion]);
+  }, [importEntities, importRowsVersion, activeSet]);
 
   // State the data views render from: the folded state plus any rows
   // reconstructed from imported source blobs. Real folded entities win on
@@ -1166,6 +1189,7 @@ function App() {
       {airtableImport && window.AirtableSchemaModal && (
         <window.AirtableSchemaModal
           schemaImport={airtableImport}
+          roomId={currentRoomId}
           state={state}
           onEmit={onEmit}
           onClose={() => setAirtableImport(null)}

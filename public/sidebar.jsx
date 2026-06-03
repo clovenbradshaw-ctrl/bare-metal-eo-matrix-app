@@ -524,7 +524,7 @@ function Sidebar({
             <button className="sb-add-table" onClick={() => setCreating(true)}>+ new set</button>
             {onAirtableSchema && (
               <button className="sb-add-table sb-add-airtable" onClick={onAirtableSchema}
-                title="paste an Airtable schema JSON to create tables (with computed fields) — no data">⊞ airtable schema</button>
+                title="connect to Airtable with a personal-access token — pick a base, pull its schema (computed fields included) and optionally its records">⊞ airtable</button>
             )}
           </div>
         )}
