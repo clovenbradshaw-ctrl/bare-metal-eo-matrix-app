@@ -61,7 +61,9 @@
     checkbox: 'boolean',
     date: 'date',
     dateTime: 'date',
-    multipleAttachments: 'json',
+    // Attachment files aren't re-hosted (their Airtable URLs expire); the PAT
+    // importer stores a short text summary, so the column is plain text.
+    multipleAttachments: 'text',
   };
 
   // Airtable rollup/lookup aggregations → formula.js ROLLUP_FNS.

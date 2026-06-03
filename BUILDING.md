@@ -146,11 +146,22 @@ pure transform, headlessly tested in `test/airtable-schema.test.cjs` +
 Tick **"also import each table's records"** (live workspaces only) and the
 widget additionally pulls every table's rows via the data API and feeds them
 through the same lazy importer the CSV/JSON path uses (`ML.importFile`,
-`materialize: false`): each table is stored once as a JSON blob in the media
-store and materialized on demand — no per-row events. Only data fields get an
-extraction plan; **computed and linked fields are never written as data**, so
-Airtable's pre-computed values are dropped and the formulas recompute live
-against your rows (links become `CON` edges you draw after import).
+`materialize: false`) — no per-row events. Records are **streamed and written
+as ordered chunks** (~10k rows each), every chunk its own `import` entity
+sharing the table's `derived_set`; the materializer concatenates them by row
+anchor, so chunking needs no reader changes. Chunking bounds the upload's
+peak memory and, more importantly, makes **first paint on a fresh device** fast:
+`app.jsx` materializes the **open table's chunks first** (priority-ordered, with
+a small concurrency pool) so the table you're looking at streams in before the
+rest of the base — instead of every table's blob downloading up front in
+arbitrary order against a cold media cache.
+
+Only data fields get an extraction plan; **computed and linked fields are never
+written as data**, so Airtable's pre-computed values are dropped and the
+formulas recompute live against your rows (links become `CON` edges you draw
+after import). **Attachment fields** become a short text summary (filename +
+count) — their files are not re-hosted and Airtable's URLs expire, so the raw
+links are deliberately dropped.
 
 ---
 

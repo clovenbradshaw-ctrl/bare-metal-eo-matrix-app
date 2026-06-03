@@ -77,22 +77,25 @@
     return atFetch(token, `/meta/bases/${baseId}/tables`);
   }
 
-  // Every record in a table (paginated, 100/page). Needs data.records:read.
-  // `onPage(count)` reports progress as pages stream in.
-  async function fetchRecords(token, baseId, tableIdOrName, { onPage } = {}) {
-    const records = [];
+  // Stream a table's records page-by-page (100/page) so the importer can flush
+  // chunks as they arrive without holding the whole table in memory. Needs
+  // data.records:read. `onBatch(pageRecords, totalSoFar)` is awaited per page;
+  // returns the total record count.
+  async function fetchRecords(token, baseId, tableIdOrName, { onBatch } = {}) {
     let offset;
     let guard = 0;
+    let total = 0;
     do {
       const j = await atFetch(token, `/${baseId}/${encodeURIComponent(tableIdOrName)}`, {
         pageSize: 100,
         ...(offset ? { offset } : {}),
       });
-      for (const r of (j.records || [])) records.push(r);
+      const page = j.records || [];
+      total += page.length;
+      if (onBatch) await onBatch(page, total);
       offset = j.offset;
-      onPage?.(records.length);
-    } while (offset && ++guard < 1000);
-    return records;
+    } while (offset && ++guard < 100000);
+    return total;
   }
 
   const AirtableAPI = { listBases, fetchBaseSchema, fetchRecords };
@@ -125,30 +128,81 @@
       .map(f => ({ name: f.name, type: f.type, jsonKey: f.name }));
   }
 
-  // Pull a table's records and import them through the lazy media-blob path
-  // (no per-row events). Returns the row count imported.
-  async function importTableRecords({ token, baseId, table, roomId, onPage }) {
+  // Airtable attachment fields come back as arrays of { url, filename, … }
+  // whose URLs expire in ~2h, so persisting them is pointless — and we do not
+  // re-host the files. Store a lightweight text summary instead. Detected
+  // structurally (objects with a url + filename/type) so linked-record arrays
+  // (ids) and lookup arrays are left untouched.
+  function summarizeAttachments(value) {
+    if (!Array.isArray(value) || value.length === 0) return value;
+    const isAttachment = value.every(v => v && typeof v === 'object' && typeof v.url === 'string' && ('filename' in v || 'type' in v));
+    if (!isAttachment) return value;
+    const names = value.map(v => v.filename || v.type || 'file');
+    const shown = names.slice(0, 5).join(', ');
+    const more = names.length > 5 ? ` +${names.length - 5} more` : '';
+    return `${value.length} file${value.length === 1 ? '' : 's'}: ${shown}${more}`;
+  }
+
+  // Rows per import blob. The homeserver accepts large blobs, but one giant
+  // blob per table means a fresh device must download + decrypt + parse the
+  // whole thing before a single row shows. Splitting into ordered chunks lets
+  // the open table paint its first rows fast and stream the rest, and keeps
+  // each decrypt+parse a quick, non-janky unit of work.
+  const CHUNK_ROWS = 10000;
+
+  // Pull a table's records (streamed) and import them through the lazy
+  // media-blob path as one or more ordered chunks — each its own `import`
+  // entity sharing `derived_set`, which the existing materializer concatenates
+  // by row anchor. No per-row events. Returns { rows, chunks }.
+  async function importTableChunked({ token, baseId, table, roomId, onProgress }) {
     const ML = window.MatrixLive;
     if (!ML?.importFile) throw new Error('a live workspace is required to import records');
-    const records = await fetchRecords(token, baseId, table.id || table.name, { onPage });
-    const rows = records.map(r => (r && r.fields) || {});
-    const json = JSON.stringify(rows);
-    const file = new File([json], `${table.name}.airtable.json`, { type: 'application/json' });
-    await ML.importFile(roomId, file, {
-      materialize: false,
-      name: `${table.name} · airtable`,
-      payload: {
-        derived_set: table.name,
-        rows_imported: rows.length,
-        has_header: false,
-        shape: 'json',
-        field_plan: dataFieldPlan(table.fields),
-        source: 'airtable',
-        airtable_base: baseId,
-        airtable_table: table.id || undefined,
+    const plan = dataFieldPlan(table.fields);
+    const group = `at:${baseId}:${table.id || table.name}:${Date.now()}`;
+    let buffer = [];
+    let chunkIndex = 0;
+    let total = 0;
+
+    async function flush() {
+      if (!buffer.length) return;
+      const idx = chunkIndex++;
+      const count = buffer.length;
+      const json = JSON.stringify(buffer);
+      buffer = [];
+      const file = new File([json], `${table.name}.airtable.${idx}.json`, { type: 'application/json' });
+      await ML.importFile(roomId, file, {
+        materialize: false,
+        name: `${table.name} · airtable${idx ? ` ·${idx}` : ''}`,
+        payload: {
+          derived_set: table.name,
+          rows_imported: count,
+          has_header: false,
+          shape: 'json',
+          field_plan: plan,
+          source: 'airtable',
+          airtable_base: baseId,
+          airtable_table: table.id || undefined,
+          import_group: group,
+          chunk_index: idx,
+        },
+      });
+    }
+
+    await fetchRecords(token, baseId, table.id || table.name, {
+      onBatch: async (page) => {
+        for (const r of page) {
+          const f = (r && r.fields) || {};
+          const row = {};
+          for (const k of Object.keys(f)) row[k] = summarizeAttachments(f[k]);
+          buffer.push(row);
+          total++;
+        }
+        onProgress?.(total);
+        if (buffer.length >= CHUNK_ROWS) await flush();
       },
     });
-    return rows.length;
+    await flush();
+    return { rows: total, chunks: chunkIndex };
   }
 
   function FieldRow({ f }) {
@@ -319,10 +373,11 @@
       try {
         for (const t of includedTables) {
           setProgress({ table: t.name, fetched: 0, doneTables, totalTables: tablesCreated });
-          rows += await importTableRecords({
+          const res = await importTableChunked({
             token: token.trim(), baseId: base.id, table: t, roomId,
-            onPage: (n) => setProgress({ table: t.name, fetched: n, doneTables, totalTables: tablesCreated }),
+            onProgress: (n) => setProgress({ table: t.name, fetched: n, doneTables, totalTables: tablesCreated }),
           });
+          rows += res.rows;
           doneTables++;
         }
         setResult({ tables: tablesCreated, rows, withData: true });
@@ -449,7 +504,7 @@
                     ? <>table {Math.min(progress.doneTables + 1, progress.totalTables)}/{progress.totalTables} · <b>{progress.table}</b> · {progress.fetched.toLocaleString()} rows</>
                     : 'fetching from Airtable…'}
                 </div>
-                <div className="csv-state-sub">each table is stored once as a blob and materializes on demand — no per-row events</div>
+                <div className="csv-state-sub">rows stream into ordered chunks in the media store and materialize on demand — no per-row events</div>
               </div>
             )}
 
@@ -575,7 +630,7 @@
                             onChange={e => setWithData(e.target.checked)} />
                           <span style={{ color: 'var(--text-bright)' }}>also import each table's records</span>
                           <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
-                            {liveRoom ? 'via data.records:read — computed/linked fields stay derived' : 'open a live workspace to import rows'}
+                            {liveRoom ? 'via data.records:read — large tables stream in chunks; computed/linked stay derived, attachments become a text summary' : 'open a live workspace to import rows'}
                           </span>
                         </label>
                       </div>
