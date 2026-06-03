@@ -13,6 +13,8 @@
  *
  *   tables: [{
  *     name,                         // table name (used as the entity set)
+ *     id,                           // Airtable table id (tbl…) when known —
+ *                                   //   lets the PAT widget fetch its records
  *     primary,                      // name of the primary field (or undefined)
  *     fields: [ { name, type, options?, formula?, rollup?, linkedTable? } ],
  *     counts: { total, computed },  // field tallies for the preview
@@ -235,6 +237,7 @@
       const computed = fields.filter(x => isComputed(x.type)).length;
       tables.push({
         name: t.name,
+        id: t.id || undefined,
         primary: t.primaryFieldId ? fieldIdToName.get(t.primaryFieldId) : undefined,
         fields,
         counts: { total: fields.length, computed },

@@ -1166,6 +1166,7 @@ function App() {
       {airtableImport && window.AirtableSchemaModal && (
         <window.AirtableSchemaModal
           schemaImport={airtableImport}
+          roomId={currentRoomId}
           state={state}
           onEmit={onEmit}
           onClose={() => setAirtableImport(null)}

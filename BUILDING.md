@@ -122,19 +122,35 @@ equality, and the published function set (`SUM`/`IF`/`SWITCH`/`CONCATENATE`/
 across `CON` edges of a named relation. Function coverage is pinned to
 Airtable's own reference in `test/formula.test.cjs`.
 
-### Importing an Airtable base schema
+### Importing an Airtable base
 
-`public/airtable-schema.js` + the **"⊞ airtable schema"** button (sidebar)
-turn an Airtable Metadata API response
-(`GET /v0/meta/bases/{baseId}/tables`) into this schema **without importing a
-single row**. Airtable's `formula` / `rollup` / `lookup` / `count` /
-`createdTime` columns map to the computed definitions above (formula field-id
-references are rewritten to `{Field Name}`); selects carry their choices;
-record links become `_schema.links` + a `linked` field. Then import real rows
-with the normal CSV/JSON importer — the importer **refuses computed fields as
-data targets**, so Airtable's exported pre-computed values are dropped and the
-formulas recompute live against your data. Pure transform, headlessly tested
-in `test/airtable-schema.test.cjs` + `test/formula.test.cjs` (`npm test`).
+The **"⊞ airtable"** button (sidebar) opens a widget that **connects to
+Airtable with a personal-access token (PAT)**. You paste a scoped, read-only
+token (`schema.bases:read`, plus `data.records:read` to pull rows — create one
+at [airtable.com/create/tokens](https://airtable.com/create/tokens)), the
+widget lists your bases, you pick one, and `public/airtable-import.jsx`'s small
+`window.AirtableAPI` client fetches the base schema straight from the Metadata
+API (`GET /v0/meta/bases/{baseId}/tables`) — no copy-paste. The token stays in
+the browser tab: it is sent only to `api.airtable.com`, never to this workspace
+or its homeserver, and never persisted. A no-token fallback remains — paste the
+Metadata response yourself for a schema-only import.
+
+`public/airtable-schema.js` then turns that response into this schema. Airtable's
+`formula` / `rollup` / `lookup` / `count` / `createdTime` columns map to the
+computed definitions above (formula field-id references are rewritten to
+`{Field Name}`); selects carry their choices; record links become
+`_schema.links` + a `linked` field. This step imports **no rows** — it is a
+pure transform, headlessly tested in `test/airtable-schema.test.cjs` +
+`test/formula.test.cjs` (`npm test`).
+
+Tick **"also import each table's records"** (live workspaces only) and the
+widget additionally pulls every table's rows via the data API and feeds them
+through the same lazy importer the CSV/JSON path uses (`ML.importFile`,
+`materialize: false`): each table is stored once as a JSON blob in the media
+store and materialized on demand — no per-row events. Only data fields get an
+extraction plan; **computed and linked fields are never written as data**, so
+Airtable's pre-computed values are dropped and the formulas recompute live
+against your rows (links become `CON` edges you draw after import).
 
 ---
 
