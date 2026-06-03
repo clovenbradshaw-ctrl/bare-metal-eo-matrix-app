@@ -116,9 +116,11 @@ The **expression lives in the schema log; the value is never stored.**
 value stored under its key — replay the log to any cursor and the computed
 column re-derives for that moment. So you never `DEF` a computed value; you
 `DEF` the formula once and the fold does the rest. The dialect is
-Airtable-flavoured (`{Field}` refs, `&` concat, `SUM`/`IF`/`CONCATENATE`/
-`REGEX_*`/`DATETIME_*`, …); rollups aggregate a field across `CON` edges of a
-named relation.
+Airtable-flavoured and case-insensitive — `{Field}` refs, `&` concat, `=`
+equality, and the published function set (`SUM`/`IF`/`SWITCH`/`CONCATENATE`/
+`ARRAYJOIN`/`REGEX_*`/`DATETIME_*`/`WORKDAY*`, …); rollups aggregate a field
+across `CON` edges of a named relation. Function coverage is pinned to
+Airtable's own reference in `test/formula.test.cjs`.
 
 ### Importing an Airtable base schema
 
@@ -132,7 +134,7 @@ record links become `_schema.links` + a `linked` field. Then import real rows
 with the normal CSV/JSON importer — the importer **refuses computed fields as
 data targets**, so Airtable's exported pre-computed values are dropped and the
 formulas recompute live against your data. Pure transform, headlessly tested
-in `test/airtable-schema.test.cjs` (`node test/airtable-schema.test.cjs`).
+in `test/airtable-schema.test.cjs` + `test/formula.test.cjs` (`npm test`).
 
 ---
 
