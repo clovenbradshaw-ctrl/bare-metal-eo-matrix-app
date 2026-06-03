@@ -16,10 +16,12 @@
  * Formula dialect — Airtable-flavoured:
  *   {Field}                        bracketed field reference
  *   + - * / % ()                   arithmetic
- *   == != < <= > >= && || !        comparison + logic
+ *   = == != < <= > >= && || !      comparison + logic (Airtable uses single =)
  *   "string" 'string' 123 0.5      literals
  *   a & b                          string concat (Airtable's &)
- *   SUM(...) IF(c,a,b) etc.        curated function library (case-insensitive)
+ *   SUM(...) IF(c,a,b) etc.        curated function library (case-insensitive;
+ *                                  names resolve case-insensitively at eval time
+ *                                  so field names like {Value}/{Count} are safe)
  *
  * Rollups:
  *   { via: '<relation>', field: '<name>'?, fn: 'sum'|'count'|'avg'|'min'|'max'|'list'|'concat'|'and'|'or' }
@@ -54,12 +56,15 @@ const FUNCS = {
   ROUNDUP:   (n, d = 0) => { const p = Math.pow(10, num(d)); return Math.ceil(num(n) * p) / p; },
   ROUNDDOWN: (n, d = 0) => { const p = Math.pow(10, num(d)); return Math.trunc(num(n) * p) / p; },
   ABS:    n => Math.abs(num(n)),
-  FLOOR:  n => Math.floor(num(n)),
+  // CEILING/FLOOR take an optional significance (default 1): the nearest
+  // multiple of it at or beyond the value. CEIL is the bare-integer alias.
+  FLOOR:  (n, sig) => snap(Math.floor, num(n), sig),
   CEIL:   n => Math.ceil(num(n)),
-  CEILING:n => Math.ceil(num(n)),
+  CEILING:(n, sig) => snap(Math.ceil, num(n), sig),
   INT:    n => Math.trunc(num(n)),
-  EVEN:   n => { const x = num(n); return x % 2 === 0 ? x : x + (x >= 0 ? 1 : -1); },
-  ODD:    n => { const x = num(n); return Math.abs(x) % 2 === 1 ? x : x + (x >= 0 ? 1 : -1); },
+  // EVEN/ODD round AWAY from zero to the nearest even/odd integer (Airtable).
+  EVEN:   n => { const x = num(n); const e = 2 * Math.ceil(Math.abs(x) / 2); return x < 0 ? -e : e; },
+  ODD:    n => { const x = num(n); const o = 2 * Math.ceil((Math.abs(x) - 1) / 2) + 1; return x < 0 ? -o : o; },
   POW:    (a, b) => Math.pow(num(a), num(b)),
   POWER:  (a, b) => Math.pow(num(a), num(b)),
   SQRT:   n => Math.sqrt(num(n)),
@@ -78,6 +83,8 @@ const FUNCS = {
   OR:     (...a) => a.some(truthy),
   XOR:    (...a) => a.reduce((x, y) => x !== truthy(y), false),
   NOT:    a => !truthy(a),
+  TRUE:   () => true,
+  FALSE:  () => false,
   BLANK:  v => v === undefined || v === null || v === '',
   ERROR:  (msg = 'error') => { throw new Error(stringify(msg)); },
   ISERROR:(v) => v && typeof v === 'object' && v.__isErr === true,
@@ -122,9 +129,16 @@ const FUNCS = {
     }
     return out;
   },
-  REPLACE: (s, find, rep) => stringify(s).split(stringify(find)).join(stringify(rep)),
+  // Airtable REPLACE is positional: replace `count` chars starting at the
+  // 1-indexed `start` with `rep`. (Find-and-replace is SUBSTITUTE, above.)
+  REPLACE: (s, start, count, rep) => {
+    const str = stringify(s);
+    const i = Math.max(0, num(start) - 1);
+    return str.slice(0, i) + stringify(rep) + str.slice(i + Math.max(0, num(count)));
+  },
   REPT:   (s, n) => stringify(s).repeat(Math.max(0, num(n))),
   T:      v => typeof v === 'string' ? v : '',
+  EXACT:  (a, b) => stringify(a) === stringify(b),
   ENCODE_URL_COMPONENT: v => encodeURIComponent(stringify(v)),
 
   // regex
@@ -132,7 +146,10 @@ const FUNCS = {
   REGEX_EXTRACT: (s, pattern) => { try { const m = stringify(s).match(new RegExp(stringify(pattern))); return m ? m[0] : ''; } catch (e) { return ''; } },
   REGEX_REPLACE: (s, pattern, rep) => { try { return stringify(s).replace(new RegExp(stringify(pattern), 'g'), stringify(rep)); } catch (e) { return stringify(s); } },
 
-  // arrays
+  // arrays — ARRAYJOIN takes (array, separator); the rest are variadic.
+  // Airtable hands rollups/lookups/multi-selects across as arrays, so these
+  // are exactly what an imported formula reaches for.
+  ARRAYJOIN:    (arr, sep = ',') => flatten([arr]).filter(v => v !== undefined && v !== null && v !== '').map(stringify).join(stringify(sep)),
   ARRAYCOMPACT: (...a) => flatten(a).filter(v => v !== undefined && v !== null && v !== ''),
   ARRAYFLATTEN: (...a) => flatten(a),
   ARRAYUNIQUE:  (...a) => Array.from(new Set(flatten(a))),
@@ -191,13 +208,61 @@ const FUNCS = {
   },
   FROMNOW: d => relTime(new Date(d), new Date(), false),
   TONOW:   d => relTime(new Date(d), new Date(), false),
+  // Week-of-year: week 1 contains Jan 1, weeks counted from Sunday. UTC-based
+  // so the number doesn't drift with the viewer's timezone.
+  WEEKNUM: (d) => {
+    const date = new Date(d);
+    if (isNaN(date.getTime())) return 0;
+    const jan1 = Date.UTC(date.getUTCFullYear(), 0, 1);
+    const today = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+    const days = Math.floor((today - jan1) / 86400000);
+    return Math.floor((days + new Date(jan1).getUTCDay()) / 7) + 1;
+  },
+  // Business-day math, skipping Sat/Sun and any holidays (comma-separated
+  // string or array of dates). WORKDAY returns the Nth working day from a
+  // start; WORKDAY_DIFF counts the working days in (start, end].
+  WORKDAY: (d, n, holidays) => {
+    const date = new Date(d);
+    if (isNaN(date.getTime())) return '';
+    const hol = new Set(dateList(holidays));
+    const step = num(n) < 0 ? -1 : 1;
+    let remaining = Math.abs(Math.trunc(num(n)));
+    while (remaining > 0) {
+      date.setDate(date.getDate() + step);
+      if (isWorkday(date, hol)) remaining--;
+    }
+    return date.toISOString();
+  },
+  WORKDAY_DIFF: (a, b, holidays) => {
+    let start = new Date(a), end = new Date(b);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) return 0;
+    let sign = 1;
+    if (start.getTime() > end.getTime()) { const t = start; start = end; end = t; sign = -1; }
+    const hol = new Set(dateList(holidays));
+    // Count working days in (start, end] — the inverse of WORKDAY(start, n),
+    // so WORKDAY_DIFF(d, WORKDAY(d, n)) === n. Same working day → 0.
+    const cur = new Date(start);
+    let count = 0;
+    cur.setDate(cur.getDate() + 1);
+    while (cur.getTime() <= end.getTime()) {
+      if (isWorkday(cur, hol)) count++;
+      cur.setDate(cur.getDate() + 1);
+    }
+    return sign * count;
+  },
+  // Display modifiers. With no embedded tz/locale database we pass the instant
+  // through unchanged so DATETIME_FORMAT still renders it — the formula
+  // evaluates instead of erroring; the value just isn't shifted.
+  SET_TIMEZONE: (d) => d,
+  SET_LOCALE:   (d) => d,
 };
 
-// Constants exposed alongside functions
-const CONSTS = { TRUE: true, FALSE: false, VOID: null, PI: Math.PI, E: Math.E };
+// Constants exposed alongside functions. TRUE/FALSE are functions (above) so
+// Airtable's TRUE()/FALSE() call form works; the bare-identifier form resolves
+// through the same zero-arg-callable path in evalNode.
+const CONSTS = { VOID: null, PI: Math.PI, E: Math.E };
 
 const FUNC_NAMES = Object.keys(FUNCS);
-const FUNC_RE = new RegExp('\\b(' + FUNC_NAMES.join('|') + '|TRUE|FALSE|VOID|PI|E)\\b', 'gi');
 
 // ─────────────────────────────────────────────────────────────────────────
 // Evaluator (per-row)
@@ -208,11 +273,12 @@ function evaluate(expr, ctx) {
   const record = ctx?.record || {};
   let transformed;
   try {
-    // 1. {field} → __f("field")
+    // {field} → __f("field"). Function/constant names are matched
+    // case-insensitively at resolve time (evalNode), NOT by uppercasing the
+    // string here — uppercasing would also corrupt a field name that happens
+    // to match a function (e.g. {Value}, {Count}, {Day}) now that it lives
+    // inside __f("…"). The "&" concat operator is handled by the evaluator.
     transformed = String(expr).replace(/\{([^}]+)\}/g, (_, name) => '__f(' + JSON.stringify(name.trim()) + ')');
-    // 2. Normalize known identifiers (functions + constants) to uppercase.
-    transformed = transformed.replace(FUNC_RE, (m) => m.toUpperCase());
-    // (Airtable "&" concat is handled natively by the evaluator below.)
   } catch (e) {
     return { ok: false, value: null, error: 'parse: ' + (e?.message || String(e)) };
   }
@@ -292,8 +358,10 @@ function tokenize(src) {
     if (two === '==' || two === '!=' || two === '<=' || two === '>=' || two === '&&' || two === '||') {
       toks.push({ t: 'op', v: two }); i += 2; continue;
     }
-    // single-char operators / punctuation
-    if ('+-*/%<>!&(),'.includes(c)) { toks.push({ t: 'op', v: c }); i++; continue; }
+    // single-char operators / punctuation. `=` is Airtable's equality operator
+    // (two-char ==, !=, <=, >= are already consumed above, so this lone `=`
+    // is only ever equality).
+    if ('+-*/%<>!&(),='.includes(c)) { toks.push({ t: 'op', v: c }); i++; continue; }
     throw new Error('unexpected character: ' + JSON.stringify(c));
   }
   toks.push({ t: 'eof' });
@@ -315,7 +383,7 @@ function parseFormula(src) {
   const BIN = [
     ['||'],
     ['&&'],
-    ['==', '!=', '<', '<=', '>', '>='],
+    ['==', '=', '!=', '<', '<=', '>', '>='],
     ['+', '-', '&'],
     ['*', '/', '%'],
   ];
@@ -374,15 +442,27 @@ function parseFormula(src) {
   return ast;
 }
 
+// Resolve an identifier against the curated env, case-insensitively (Airtable
+// function names are case-insensitive). Returns the matching OWN-property key
+// or null — the hasOwnProperty guard keeps this an allowlist: inherited names
+// like "constructor"/"__proto__" never resolve, so there's no prototype escape.
+function resolveKey(env, name) {
+  if (Object.prototype.hasOwnProperty.call(env, name)) return name;
+  const up = name.toUpperCase();
+  if (up !== name && Object.prototype.hasOwnProperty.call(env, up)) return up;
+  return null;
+}
+
 function evalNode(node, env) {
   switch (node.k) {
     case 'num': return node.v;
     case 'str': return node.v;
     case 'id': {
       // Identifiers resolve ONLY against the curated env (own properties).
-      if (Object.prototype.hasOwnProperty.call(env, node.name)) {
-        const v = env[node.name];
-        return typeof v === 'function' ? v() : v; // zero-arg callables (RECORD_ID, etc.)
+      const key = resolveKey(env, node.name);
+      if (key !== null) {
+        const v = env[key];
+        return typeof v === 'function' ? v() : v; // zero-arg callables (RECORD_ID, TRUE, etc.)
       }
       throw new Error('unknown identifier: ' + node.name);
     }
@@ -405,7 +485,7 @@ function evalNode(node, env) {
         case '*': return num(l) * num(r);
         case '/': return num(l) / num(r);
         case '%': return num(l) % num(r);
-        case '==': return l === r;
+        case '==': case '=': return l === r;
         case '!=': return l !== r;
         case '<':  return num(l) <  num(r);
         case '<=': return num(l) <= num(r);
@@ -415,14 +495,27 @@ function evalNode(node, env) {
       throw new Error('bad operator: ' + op);
     }
     case 'call': {
-      const fn = Object.prototype.hasOwnProperty.call(env, node.name) ? env[node.name] : undefined;
+      const key = resolveKey(env, node.name);
+      const fn = key !== null ? env[key] : undefined;
       if (typeof fn !== 'function') throw new Error('unknown function: ' + node.name);
       // IF needs lazy branches so the untaken side can't error; the rest are eager.
-      if (node.name === 'IF') {
+      if (key === 'IF') {
         const c = node.args.length > 0 ? evalNode(node.args[0], env) : undefined;
         return truthy(c)
           ? (node.args[1] !== undefined ? evalNode(node.args[1], env) : null)
           : (node.args[2] !== undefined ? evalNode(node.args[2], env) : null);
+      }
+      // ISERROR/IFERROR must CATCH an error in their first argument (a thrown
+      // error like ERROR(), or a non-finite number like 2/0) rather than let
+      // it propagate — that's the whole point of the functions.
+      if (key === 'ISERROR' || key === 'IFERROR') {
+        let errored = false, v;
+        try {
+          v = node.args.length > 0 ? evalNode(node.args[0], env) : undefined;
+          if ((typeof v === 'number' && !isFinite(v)) || (v && typeof v === 'object' && v.__isErr)) errored = true;
+        } catch (_) { errored = true; }
+        if (key === 'ISERROR') return errored;
+        return errored ? (node.args[1] !== undefined ? evalNode(node.args[1], env) : null) : v;
       }
       const args = node.args.map(a => evalNode(a, env));
       return fn(...args);
@@ -508,6 +601,29 @@ function stringify(v) {
   if (v === undefined || v === null) return '';
   if (typeof v === 'object') return JSON.stringify(v);
   return String(v);
+}
+
+// Normalize a holidays argument (comma-separated string OR array of dates) to a
+// set-ready list of YYYY-MM-DD keys; unparseable entries are dropped.
+function dateList(v) {
+  if (v === undefined || v === null || v === '') return [];
+  const arr = Array.isArray(v) ? v : stringify(v).split(',');
+  return arr
+    .map(s => { const t = Date.parse(String(s).trim()); return isNaN(t) ? null : new Date(t).toISOString().slice(0, 10); })
+    .filter(Boolean);
+}
+// A working day: not Sat/Sun and not in the holiday set (keyed YYYY-MM-DD).
+function isWorkday(date, holidaySet) {
+  const day = date.getDay();
+  return day !== 0 && day !== 6 && !holidaySet.has(date.toISOString().slice(0, 10));
+}
+// Round `value` to a multiple of `sig` (default 1) using `round` (Math.floor/
+// ceil), snapping off the float error the divide/multiply reintroduces
+// (e.g. 19 * 0.1 -> 1.9000000000000001).
+function snap(round, value, sig) {
+  const s = sig === undefined ? 1 : num(sig);
+  if (s === 0) return 0;
+  return parseFloat((round(value / s) * s).toPrecision(15));
 }
 
 // Minimal DATETIME_FORMAT — supports common tokens; not full moment grammar.

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node test/airtable-schema.test.cjs && node test/formula.test.cjs"
   },
   "dependencies": {
     "@babel/standalone": "^7.29.0",
