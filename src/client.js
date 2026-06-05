@@ -355,27 +355,46 @@ async function ensureSecureBackup(password, userId) {
     // pulls them out of SSSS into the local store (via getSecretStorageKey).
     // If they don't, it creates and uploads them; UIA below replays the
     // Matrix password we already have.
-    await crypto.bootstrapCrossSigning({
-      authUploadDeviceSigningKeys: async (makeRequest) => {
-        const user = userId.startsWith('@') ? userId.slice(1).split(':')[0] : userId;
-        await makeRequest({
-          type: 'm.login.password',
-          identifier: { type: 'm.id.user', user },
-          password,
-          // Some homeservers require user/password at the top level too.
-          user,
-        });
-      },
-    });
+    //
+    // CRITICAL: this is isolated in its own try/catch. Some homeservers
+    // (e.g. hyphae.social) gate /keys/device_signing/upload behind an
+    // interactive-auth flow we can't always satisfy, and importing
+    // cross-signing keys on a fresh device can warn "No public identity
+    // found" until the self device-list has synced. None of that must
+    // abort the key-backup restore below — historical messages decrypt
+    // from the server backup via the cached decryption key, which is
+    // independent of cross-signing trust. Previously a throw here skipped
+    // restore + enable entirely, leaving every old event undecryptable
+    // with "key backup is not working" (HISTORICAL_MESSAGE_BACKUP_UNCONFIGURED).
+    try {
+      await crypto.bootstrapCrossSigning({
+        authUploadDeviceSigningKeys: async (makeRequest) => {
+          const user = userId.startsWith('@') ? userId.slice(1).split(':')[0] : userId;
+          await makeRequest({
+            type: 'm.login.password',
+            identifier: { type: 'm.id.user', user },
+            password,
+            // Some homeservers require user/password at the top level too.
+            user,
+          });
+        },
+      });
+    } catch (e) {
+      progress(`Cross-signing setup skipped (continuing to key backup): ${e.message}`);
+    }
 
     let generatedKey = null;
-    await crypto.bootstrapSecretStorage({
-      setupNewKeyBackup: !ssssOnServer,
-      createSecretStorageKey: ssssOnServer ? undefined : async () => {
-        generatedKey = await crypto.createRecoveryKeyFromPassphrase(password);
-        return generatedKey;
-      },
-    });
+    try {
+      await crypto.bootstrapSecretStorage({
+        setupNewKeyBackup: !ssssOnServer,
+        createSecretStorageKey: ssssOnServer ? undefined : async () => {
+          generatedKey = await crypto.createRecoveryKeyFromPassphrase(password);
+          return generatedKey;
+        },
+      });
+    } catch (e) {
+      progress(`Secret storage setup skipped (continuing to key backup): ${e.message}`);
+    }
 
     if (generatedKey?.encodedPrivateKey) {
       // Stash the key in the local vault so users can view it later from
@@ -394,8 +413,27 @@ async function ensureSecureBackup(password, userId) {
       }
     }
 
-    // Make sure the locally-stored SSSS key is up to date when the server
-    // already had one (post-wipe path).
+    // ── Key backup: the actual wipe-resilience path ──
+    //
+    // This block is what makes a browser wipe non-destructive, so it runs
+    // independently of whether cross-signing succeeded above. The steps
+    // must happen in order:
+    //
+    //   1. Load the backup decryption key from SSSS into the crypto store.
+    //      This makes the server backup "trusted by key" (matchesDecryptionKey)
+    //      even when cross-signing trust isn't established, and it's a
+    //      prerequisite for both the bulk restore and the per-session
+    //      on-demand key downloader.
+    //   2. checkKeyBackupAndEnable() — enable the backup engine. This sets
+    //      the active backup version, which CONFIGURES the per-session key
+    //      downloader. Without this, individual undecryptable events can't
+    //      pull their key on demand and surface as "key backup is not working".
+    //   3. restoreKeyBackup() — bulk-pull historical Megolm keys so the whole
+    //      visible history decrypts at once rather than trickling in per event.
+
+    // Step 1: cache the backup decryption key. On first login the key was
+    // just created and cached by bootstrapSecretStorage; on the post-wipe
+    // path we load it back out of SSSS (the password derived the SSSS key).
     if (ssssOnServer) {
       try {
         await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
@@ -404,26 +442,43 @@ async function ensureSecureBackup(password, userId) {
       }
     }
 
-    // Pull historical Megolm keys down from the server backup so old
-    // encrypted rooms decrypt. Cheap if the backup is empty; potentially
-    // long if the user has years of history. Don't fail login if it
-    // stumbles partway through.
-    const backupInfo = await crypto.getKeyBackupInfo();
-    if (backupInfo) {
+    // Step 2: enable the backup engine BEFORE restoring. checkKeyBackupAndEnable
+    // forces a fresh trust re-check (now that the decryption key is cached) and,
+    // when the backup is usable, starts the engine and configures the
+    // per-session downloader. Verify it actually came up.
+    let activeBackupVersion = null;
+    try {
+      await crypto.checkKeyBackupAndEnable();
+      activeBackupVersion = await crypto.getActiveSessionBackupVersion();
+    } catch (e) {
+      progress(`Enabling key backup: ${e.message}`);
+    }
+
+    // Step 3: bulk-restore historical Megolm keys so old encrypted rooms
+    // decrypt. Cheap if the backup is empty; potentially long if the user
+    // has years of history. Don't fail login if it stumbles partway through.
+    if (activeBackupVersion) {
       try {
         await crypto.restoreKeyBackup();
         progress('Historical message keys restored');
       } catch (e) {
         progress(`Key backup restore: ${e.message}`);
       }
+    } else {
+      // No active backup after setup. Either the server has no backup, or
+      // the decryption key couldn't be loaded — surface it so a wipe that
+      // *should* have recovered but didn't is visible rather than silent.
+      const backupInfo = await crypto.getKeyBackupInfo().catch(() => null);
+      if (backupInfo?.version) {
+        progress('Key backup present on server but could not be enabled — historical messages may stay locked. Re-enter your recovery key from settings to restore.');
+      } else {
+        progress('No key backup on server yet — history from before this device will not be recoverable.');
+      }
     }
 
-    // Start the engine so future-received Megolm keys flow up to the
-    // server backup automatically.
-    try { await crypto.checkKeyBackupAndEnable(); } catch {}
-
     // Sign this device with the master cross-signing key so other devices
-    // trust it. Idempotent if the device is already signed.
+    // trust it. Idempotent if the device is already signed. Best effort —
+    // failure here doesn't affect local decryption.
     try {
       const deviceId = client.getDeviceId();
       if (deviceId) await crypto.crossSignDevice(deviceId);
