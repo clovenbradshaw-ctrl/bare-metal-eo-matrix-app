@@ -328,6 +328,26 @@
     );
     const includedNames = useMemo(() => new Set(includedTables.map(t => t.name)), [includedTables]);
 
+    // Bulk-select helpers operate over every parsed table at once so a big base
+    // doesn't mean clicking dozens of boxes. "all"/"none" force the state; "invert"
+    // flips each table's current choice.
+    function selectAll(on) {
+      if (!parsed?.ok) return;
+      setInclude(() => {
+        const next = {};
+        for (const t of parsed.tables) next[t.name] = on;
+        return next;
+      });
+    }
+    function invertSelection() {
+      if (!parsed?.ok) return;
+      setInclude(prev => {
+        const next = { ...prev };
+        for (const t of parsed.tables) next[t.name] = !prev[t.name];
+        return next;
+      });
+    }
+
     async function connect() {
       const t = token.trim();
       if (!t) return;
@@ -595,11 +615,18 @@
                     <div className="csv-section">
                       <div className="csv-section-head">
                         <span className="csv-section-label">
-                          {parsed.tables.length} table{parsed.tables.length === 1 ? '' : 's'} · select what to create
+                          {includedTables.length}/{parsed.tables.length} table{parsed.tables.length === 1 ? '' : 's'} selected
                         </span>
-                        {source === 'pat' && (
-                          <button className="csv-map-skip" onClick={() => { setError(''); setSchemaText(''); setBase(null); setPhase('bases'); }}>← change base</button>
-                        )}
+                        <span style={{ display: 'flex', gap: 8, marginLeft: 'auto', alignItems: 'center' }}>
+                          <button className="csv-map-skip" onClick={() => selectAll(true)}
+                            disabled={includedTables.length === parsed.tables.length}>all</button>
+                          <button className="csv-map-skip" onClick={() => selectAll(false)}
+                            disabled={includedTables.length === 0}>none</button>
+                          <button className="csv-map-skip" onClick={invertSelection}>invert</button>
+                          {source === 'pat' && (
+                            <button className="csv-map-skip" onClick={() => { setError(''); setSchemaText(''); setBase(null); setPhase('bases'); }}>← change base</button>
+                          )}
+                        </span>
                       </div>
                       {parsed.tables.map(t => {
                         const collides = existingTables.has(t.name);
@@ -657,24 +684,37 @@
                       </div>
                     )}
 
-                    {/* records toggle — only when a live workspace can store the blob */}
-                    {source === 'pat' && (
-                      <div className="csv-section">
-                        <label style={{
-                          display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px',
-                          background: 'var(--bg-soft, #f6f6f6)', border: '1px solid var(--border, #e3e3e3)',
-                          cursor: liveRoom ? 'pointer' : 'default', opacity: liveRoom ? 1 : 0.6,
-                          fontFamily: 'var(--mono)', fontSize: 12,
-                        }}>
-                          <input type="checkbox" checked={withData && liveRoom} disabled={!liveRoom}
-                            onChange={e => setWithData(e.target.checked)} />
-                          <span style={{ color: 'var(--text-bright)' }}>also import each table's records</span>
-                          <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
-                            {liveRoom ? 'via data.records:read — large tables stream in chunks; computed/linked stay derived, attachments become a text summary' : 'open a live workspace to import rows'}
-                          </span>
-                        </label>
-                      </div>
-                    )}
+                    {/* schema-or-data choice — records need a live workspace to store the blob */}
+                    {source === 'pat' && (() => {
+                      const seg = (active, dim) => ({
+                        flex: 1, display: 'flex', flexDirection: 'column', gap: 4, textAlign: 'left',
+                        padding: '10px 12px', cursor: dim ? 'default' : 'pointer',
+                        fontFamily: 'var(--mono)', fontSize: 12,
+                        background: active ? 'var(--bg-soft, #f6f6f6)' : 'var(--bg-elev, #fff)',
+                        border: `1px solid ${active ? 'var(--accent, #b45)' : 'var(--border, #e3e3e3)'}`,
+                        opacity: dim ? 0.6 : 1,
+                      });
+                      return (
+                        <div className="csv-section">
+                          <div className="csv-section-head">
+                            <span className="csv-section-label">what to import</span>
+                          </div>
+                          <div style={{ display: 'flex', gap: 8 }}>
+                            <button onClick={() => setWithData(false)} style={seg(!(withData && liveRoom))}>
+                              <span style={{ color: 'var(--text-bright)', fontWeight: 700 }}>schema only</span>
+                              <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>tables, fields & computed-field definitions — no rows</span>
+                            </button>
+                            <button disabled={!liveRoom} onClick={() => liveRoom && setWithData(true)}
+                              style={seg(withData && liveRoom, !liveRoom)}>
+                              <span style={{ color: 'var(--text-bright)', fontWeight: 700 }}>schema + data</span>
+                              <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
+                                {liveRoom ? 'also stream each table’s records via data.records:read — large tables chunk; computed/linked stay derived, attachments become a text summary' : 'open a live workspace to import rows'}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </>
                 )}
               </>
