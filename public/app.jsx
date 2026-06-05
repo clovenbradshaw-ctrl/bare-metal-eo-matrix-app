@@ -650,9 +650,20 @@ function App() {
   const retryRef      = useRef({});        // import anchor -> retry attempts
   const [importRowsVersion, setImportRowsVersion] = useState(0);
 
-  const importEntities = useMemo(() => Object.values(state.entities || {}).filter(
-    e => e?._type === 'import' && e.derived_set && Array.isArray(e.field_plan)
-  ), [state]);
+  // Only the newest generation of each re-synced source materializes: a
+  // re-import of the same Airtable base+table supersedes its prior rows rather
+  // than duplicating them (see CsvImport.activeImports).
+  const importEntities = useMemo(() => {
+    const all = Object.values(state.entities || {}).filter(
+      e => e?._type === 'import' && e.derived_set && Array.isArray(e.field_plan)
+    );
+    return window.CsvImport?.activeImports ? window.CsvImport.activeImports(all) : all;
+  }, [state]);
+
+  const activeImportAnchors = useMemo(
+    () => new Set(importEntities.map(e => e._anchor)),
+    [importEntities]
+  );
 
   // The table the user is looking at — its import chunks materialize first.
   const activeSet = selection?.tableId || null;
@@ -727,15 +738,17 @@ function App() {
   // events) takes precedence over the reconstructed copy.
   const renderState = useMemo(() => {
     const byAnchor = importRowsRef.current;
-    // Only inject rows whose import entity exists at the current cursor, so
-    // time-travelling before an import doesn't conjure its rows.
-    const anchors = Object.keys(byAnchor).filter(a => state.entities?.[a]);
+    // Only inject rows whose import entity exists at the current cursor AND is
+    // the active (newest) generation of its source. The first guard stops
+    // time-travel before an import from conjuring its rows; the second stops a
+    // superseded re-sync's cached rows from duplicating the current one.
+    const anchors = Object.keys(byAnchor).filter(a => state.entities?.[a] && activeImportAnchors.has(a));
     if (!anchors.length) return state;
     const entities = {};
     for (const a of anchors) for (const row of byAnchor[a]) entities[row._anchor] = row;
     Object.assign(entities, state.entities);
     return { ...state, entities };
-  }, [state, importRowsVersion]);
+  }, [state, importRowsVersion, activeImportAnchors]);
 
   // Gate the app on auth (or demo session) — every hook is above this line.
   // While the bridge is still trying to resume a session from the

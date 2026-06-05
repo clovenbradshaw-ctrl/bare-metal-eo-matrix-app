@@ -110,6 +110,18 @@
 
   function isComputed(type) { return type === 'formula' || type === 'rollup'; }
 
+  // Stable id for an Airtable source so re-syncs of the same base+table line up.
+  function importGroupFor(baseId, table) { return `at:${baseId}:${table.id || table.name}`; }
+
+  // Has this base+table already been synced into the room? Lets the dialog treat
+  // a re-open as a re-sync (default it on, label it honestly) rather than a
+  // name collision with some unrelated hand-built table.
+  function hasPriorAirtableSync(state, baseId, table) {
+    if (!baseId) return false;
+    const group = importGroupFor(baseId, table);
+    return Object.values(state?.entities || {}).some(e => e?._type === 'import' && e.import_group === group);
+  }
+
   // Strip preview-only keys; emit exactly what buildTable + formula.js read.
   function cleanField(f) {
     const out = { name: f.name, type: f.type };
@@ -150,15 +162,33 @@
   // each decrypt+parse a quick, non-janky unit of work.
   const CHUNK_ROWS = 10000;
 
+  // The newest generation number already imported for this base+table, or -1 if
+  // it was never synced. Each sync writes `import_seq = previous + 1` so the
+  // materializer can keep only the latest generation and drop the rest — that's
+  // what makes a re-sync replace prior rows instead of duplicating them.
+  function lastImportSeq(state, group) {
+    let max = -1;
+    for (const e of Object.values(state?.entities || {})) {
+      if (e?._type === 'import' && e.import_group === group && typeof e.import_seq === 'number' && e.import_seq > max) {
+        max = e.import_seq;
+      }
+    }
+    return max;
+  }
+
   // Pull a table's records (streamed) and import them through the lazy
   // media-blob path as one or more ordered chunks — each its own `import`
   // entity sharing `derived_set`, which the existing materializer concatenates
-  // by row anchor. No per-row events. Returns { rows, chunks }.
-  async function importTableChunked({ token, baseId, table, roomId, onProgress }) {
+  // by row anchor. Every chunk also carries a STABLE `import_group`
+  // (base+table) and a per-sync `import_seq` so re-syncing the same table
+  // supersedes the previous rows rather than stacking duplicates. No per-row
+  // events. Returns { rows, chunks }.
+  async function importTableChunked({ token, baseId, table, roomId, state, onProgress }) {
     const ML = window.MatrixLive;
     if (!ML?.importFile) throw new Error('a live workspace is required to import records');
     const plan = dataFieldPlan(table.fields);
-    const group = `at:${baseId}:${table.id || table.name}:${Date.now()}`;
+    const group = importGroupFor(baseId, table);
+    const seq = lastImportSeq(state, group) + 1;
     let buffer = [];
     let chunkIndex = 0;
     let total = 0;
@@ -183,6 +213,7 @@
           airtable_base: baseId,
           airtable_table: table.id || undefined,
           import_group: group,
+          import_seq: seq,
           chunk_index: idx,
         },
       });
@@ -272,18 +303,24 @@
       return window.AirtableSchema ? window.AirtableSchema.parse(schemaText) : { ok: false, error: 'airtable-schema.js not loaded' };
     }, [schemaText]);
 
-    // Default every NON-colliding table to "include"; colliding ones off
-    // (re-importing them would replace an existing field schema).
+    // Default which tables are checked. A table we've synced from this base
+    // before is a RE-SYNC — default it on so re-opening the dialog refreshes its
+    // schema (computed-field definitions included) and re-pulls its rows without
+    // duplicating them. A name that merely collides with a hand-built table
+    // stays off, so we don't silently replace someone's authored schema. Fresh
+    // tables default on.
     useEffect(() => {
       if (!parsed || !parsed.ok) return;
       setInclude(prev => {
         const next = { ...prev };
         for (const t of parsed.tables) {
-          if (!(t.name in next)) next[t.name] = !existingTables.has(t.name);
+          if (t.name in next) continue;
+          const resync = hasPriorAirtableSync(state, base?.id, t);
+          next[t.name] = resync || !existingTables.has(t.name);
         }
         return next;
       });
-    }, [parsed, existingTables]);
+    }, [parsed, existingTables, state, base]);
 
     const includedTables = useMemo(
       () => (parsed?.ok ? parsed.tables.filter(t => include[t.name]) : []),
@@ -374,7 +411,7 @@
         for (const t of includedTables) {
           setProgress({ table: t.name, fetched: 0, doneTables, totalTables: tablesCreated });
           const res = await importTableChunked({
-            token: token.trim(), baseId: base.id, table: t, roomId,
+            token: token.trim(), baseId: base.id, table: t, roomId, state,
             onProgress: (n) => setProgress({ table: t.name, fetched: n, doneTables, totalTables: tablesCreated }),
           });
           rows += res.rows;
@@ -566,6 +603,7 @@
                       </div>
                       {parsed.tables.map(t => {
                         const collides = existingTables.has(t.name);
+                        const resync = hasPriorAirtableSync(state, base?.id, t);
                         const on = !!include[t.name];
                         return (
                           <div key={t.name} style={{ border: '1px solid var(--border, #e3e3e3)', marginBottom: 10, opacity: on ? 1 : 0.5 }}>
@@ -580,7 +618,9 @@
                                 {t.counts.total} field{t.counts.total === 1 ? '' : 's'}
                                 {t.counts.computed > 0 && <> · <b style={{ color: 'var(--accent,#b45)' }}>{t.counts.computed} computed</b></>}
                               </span>
-                              {collides && <span className="csv-warn" style={{ marginLeft: 'auto' }}>exists — will replace its schema</span>}
+                              {resync
+                                ? <span className="csv-warn" style={{ marginLeft: 'auto' }}>re-sync — replaces previous rows, no duplicates</span>
+                                : collides && <span className="csv-warn" style={{ marginLeft: 'auto' }}>exists — will replace its schema</span>}
                             </label>
                             {on && (
                               <div style={{ padding: '6px 10px' }}>
