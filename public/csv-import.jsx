@@ -705,17 +705,38 @@
     return rows;
   }
 
-  // Find import entities whose derived set matches `entityType`.
+  // Collapse re-syncs to their newest generation. A repeated import of the
+  // same source (e.g. an Airtable base+table) carries a STABLE `import_group`
+  // and a monotonic `import_seq` that bumps on every sync. Among entities that
+  // share a group we keep only the highest `import_seq`, so re-syncing replaces
+  // the prior rows instead of stacking duplicates on top of them. Imports with
+  // no group (a one-off CSV/JSON drop) have no peers and always pass through.
+  // The older generations are left in the log untouched — non-destructive — but
+  // simply not materialized, which also means time-travel shows whichever
+  // generation was newest at the cursor.
+  function activeImports(imports) {
+    const maxSeq = new Map();
+    for (const e of imports) {
+      if (!e?.import_group) continue;
+      const seq = e.import_seq || 0;
+      if (!maxSeq.has(e.import_group) || seq > maxSeq.get(e.import_group)) maxSeq.set(e.import_group, seq);
+    }
+    return imports.filter(e => !e?.import_group || (e.import_seq || 0) === maxSeq.get(e.import_group));
+  }
+
+  // Find import entities whose derived set matches `entityType` (newest
+  // generation per source — see activeImports).
   function importsForSet(state, entityType) {
     if (!state?.entities || !entityType) return [];
-    return Object.values(state.entities).filter(
+    const all = Object.values(state.entities).filter(
       e => e?._type === 'import' && e.derived_set === entityType && Array.isArray(e.field_plan)
     );
+    return activeImports(all);
   }
 
   window.CsvImportModal = CsvImportModal;
   window.CsvImport = {
     parseCSV, inferType, coerce, FIELD_TYPES,
-    materializeImportRows, importsForSet,
+    materializeImportRows, importsForSet, activeImports,
   };
 })();

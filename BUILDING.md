@@ -156,6 +156,17 @@ a small concurrency pool) so the table you're looking at streams in before the
 rest of the base — instead of every table's blob downloading up front in
 arbitrary order against a cold media cache.
 
+**Re-syncing is idempotent.** Every chunk also carries a stable `import_group`
+(`at:<baseId>:<tableId>`) and a per-sync `import_seq` generation. Re-opening the
+dialog on a base you've synced before defaults its tables back **on** and labels
+them *re-sync*; the new rows land as a higher `import_seq`, and
+`CsvImport.activeImports` keeps only the newest generation per group when
+materializing — so a re-sync **replaces** the prior rows (and re-emits the
+schema, computed-field definitions included) instead of stacking duplicates. The
+superseded generations stay in the append-only log untouched; they're simply not
+materialized, which also means time-travel shows whichever generation was newest
+at the cursor.
+
 Only data fields get an extraction plan; **computed and linked fields are never
 written as data**, so Airtable's pre-computed values are dropped and the
 formulas recompute live against your rows (links become `CON` edges you draw
