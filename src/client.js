@@ -499,6 +499,110 @@ export async function getStashedRecoveryKey(userId) {
   return loadSecret(userId, VAULT_SECRET_RECOVERY_KEY);
 }
 
+/**
+ * Inspect every link in the wipe-recovery chain and return a plain
+ * object describing it. Run from the console as
+ * `await window.MatrixLive.diagnoseBackup()` when historical messages
+ * won't decrypt after a wipe.
+ *
+ * The decisive field is `serverBackupCount`: if it is 0 (or null) the
+ * server-side backup is empty, so the keys for old messages were never
+ * uploaded by a previous device and the history is genuinely
+ * unrecoverable — no client-side fix can bring it back. A non-zero count
+ * with `activeBackupVersion: null` instead points at a local
+ * trust/enable problem, which `restoreFromRecoveryKey()` can repair.
+ */
+export async function diagnoseBackup() {
+  const out = { ok: false };
+  if (!client) { out.error = 'No Matrix client (not logged in)'; return out; }
+  const crypto = client.getCrypto?.();
+  if (!crypto) { out.error = 'Crypto not initialized'; return out; }
+  try {
+    out.userId = client.getUserId();
+    out.deviceId = client.getDeviceId();
+    out.ssssOnServer = await client.secretStorage.hasKey();
+    out.hasStashedSsssKey = !!(out.userId && await loadSecret(out.userId, VAULT_SECRET_SSSS_KEY));
+
+    let info = null;
+    try { info = await crypto.getKeyBackupInfo(); }
+    catch (e) { out.getKeyBackupInfoError = e.message; }
+    out.serverBackupVersion = info?.version || null;
+    out.serverBackupAlgorithm = info?.algorithm || null;
+    out.serverBackupCount = typeof info?.count === 'number' ? info.count : null;
+
+    out.activeBackupVersion = await crypto.getActiveSessionBackupVersion();
+
+    if (info) {
+      try {
+        const trust = await crypto.isKeyBackupTrusted(info);
+        out.backupTrusted = trust.trusted;
+        out.backupMatchesDecryptionKey = trust.matchesDecryptionKey;
+      } catch (e) { out.trustError = e.message; }
+    }
+
+    try { out.crossSigningReady = await crypto.isCrossSigningReady(); }
+    catch (e) { out.crossSigningError = e.message; }
+
+    out.ok = !!(out.activeBackupVersion
+      && (out.backupMatchesDecryptionKey || out.backupTrusted));
+
+    if (!out.serverBackupVersion) {
+      out.diagnosis = 'No key backup on the server — history from before this device is unrecoverable.';
+    } else if (!out.serverBackupCount) {
+      out.diagnosis = 'Backup exists but contains 0 keys — previous devices never uploaded them; history is unrecoverable.';
+    } else if (out.ok) {
+      out.diagnosis = 'Backup is active and trusted; historical keys should be restorable.';
+    } else {
+      out.diagnosis = 'Backup has keys but is not enabled locally — try restoreFromRecoveryKey(<your recovery key>).';
+    }
+  } catch (e) {
+    out.error = e.message;
+  }
+  progress(`Backup diagnosis: ${out.diagnosis || out.error}`);
+  return out;
+}
+
+/**
+ * Manually restore the Megolm key backup using the user's encoded
+ * recovery key (the "EsT…"/base58 string the app generated at first
+ * login). This is the escape hatch when the automatic, password-derived
+ * recovery doesn't kick in.
+ *
+ * The app's recovery key IS the secret-storage (4S) key, so we stash it
+ * as the SSSS key, pull the backup decryption key out of secret storage,
+ * enable the backup engine, and bulk-restore. Returns the SDK's
+ * KeyBackupRestoreResult ({ total, imported }).
+ */
+export async function restoreFromRecoveryKey(encodedRecoveryKey) {
+  if (!client) throw new Error('No Matrix client (not logged in)');
+  const crypto = client.getCrypto?.();
+  if (!crypto) throw new Error('Crypto not initialized');
+  if (!encodedRecoveryKey || !encodedRecoveryKey.trim()) {
+    throw new Error('A recovery key is required');
+  }
+
+  const info = await crypto.getKeyBackupInfo();
+  if (!info?.version) throw new Error('No key backup on the server to restore from');
+
+  // Decode the recovery key to the raw SSSS private key and stash it so
+  // getSecretStorageKey serves it without a prompt.
+  const ssssKey = decodeRecoveryKey(encodedRecoveryKey.trim());
+  const uid = vault.getUserId() || client.getUserId();
+  if (uid) {
+    try { await storeSecret(uid, VAULT_SECRET_SSSS_KEY, bytesToB64(ssssKey)); }
+    catch { /* non-fatal; the load below will fall back to the live key */ }
+  }
+
+  // Pull the Megolm backup decryption key out of secret storage, enable
+  // the backup engine (configures the per-session downloader), then
+  // bulk-restore. Throws DecryptionKeyDoesNotMatchError if the key is wrong.
+  await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
+  await crypto.checkKeyBackupAndEnable();
+  const result = await crypto.restoreKeyBackup();
+  progress(`Restored ${result?.imported ?? '?'}/${result?.total ?? '?'} keys from backup`);
+  return result;
+}
+
 // ── Vault-encrypted session storage ──
 
 async function persistSession(userId, session) {

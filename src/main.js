@@ -19,6 +19,7 @@
 import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
          tryAutoUnlock, wipeLocalData,
+         diagnoseBackup, restoreFromRecoveryKey, getStashedRecoveryKey,
          setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
@@ -1112,6 +1113,10 @@ window.MatrixLive = {
   subscribe: (fn) => { subscribers.add(fn); return () => subscribers.delete(fn); },
   // Progress log
   getProgressLog: () => progressLog.slice(),
+  // Secure backup / wipe recovery
+  diagnoseBackup,
+  restoreFromRecoveryKey,
+  getRecoveryKey: () => getStashedRecoveryKey(),
 };
 
 // ── Service worker (PWA shell) ──
