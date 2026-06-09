@@ -27,10 +27,25 @@ export async function createRoom(name, roomType, meta = {}) {
   const client = getClient();
   if (!client) throw new Error('Not connected');
 
+  const ns = getNamespace();
   const resp = await client.createRoom({
     name,
     visibility: 'private',
     preset: 'private_chat',
+    // Every member (PL 0) may publish the envelope-encryption state events:
+    // their identity public key, their wrapped workspace key, and their
+    // media-store block-chain head. All three are sender-scoped
+    // (state_key = own mxid, enforced by Matrix auth rules), so opening
+    // them up grants nothing beyond each member's own slots. Without this
+    // override state_default (50) would silently exclude invitees from the
+    // durable block chain.
+    power_level_content_override: {
+      events: {
+        [`${ns}.member_key`]: 0,
+        [`${ns}.wkey`]: 0,
+        [`${ns}.blocks`]: 0,
+      },
+    },
     initial_state: [
       // E2EE on by default. Matrix is the transport; without this the
       // operator events go to the homeserver in cleartext.
@@ -43,7 +58,7 @@ export async function createRoom(name, roomType, meta = {}) {
         type: META_TYPE(),
         state_key: '',
         content: {
-          app: getNamespace(),
+          app: ns,
           room_type: roomType,
           created_at: new Date().toISOString(),
           ...meta,

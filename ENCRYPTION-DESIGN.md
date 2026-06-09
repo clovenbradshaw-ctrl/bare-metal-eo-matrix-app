@@ -1,6 +1,22 @@
 # Design: stable-key envelope encryption ("database E2EE")
 
-Status: **proposal, for review.** No code yet.
+Status: **partially implemented.**
+
+- **Phase 1 — crypto core** (`src/crypto/envelope.js`): merged, unit-tested
+  (`test/crypto-envelope.test.mjs`).
+- **Identity + workspace key + durable storage**: implemented as the
+  **media-store block chain** (`src/crypto/identity.js`,
+  `src/crypto/workspaceKey.js`, `src/crypto/blockcodec.js`, `src/blocks.js`,
+  wired in `src/main.js`; tested in `test/blocks.test.mjs`). Every committed
+  op-event is batched into hash-linked, WCK-encrypted blocks in the
+  homeserver media store, with chain heads in room **state** (state events
+  are never megolm-encrypted). Post-wipe recovery is exactly §3's chain:
+  password → identity (account_data) → WCK (room state) → blocks. This makes
+  the database — including imported datasets, whose row-blob pointers + keys
+  ride inside op-events — durable independent of megolm/key backup.
+- **Phases 3–4 — the `.enc` wire format replacing megolm for live sends**:
+  not yet. Rooms remain megolm for transport; the block chain is the
+  durability layer beneath them. §6 epoch rotation: not yet (single epoch 0).
 
 ## Why this exists
 

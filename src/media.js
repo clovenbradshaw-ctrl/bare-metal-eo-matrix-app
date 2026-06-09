@@ -373,6 +373,33 @@ function mediaDownloadAttempts(client, mxc) {
 }
 
 /**
+ * Download the raw bytes behind an mxc URI from the homeserver media
+ * store — no cache, no decryption. Used by callers that do their own
+ * envelope handling (e.g. the WCK-encrypted block chain in blocks.js).
+ * Returns null when offline or every endpoint attempt failed.
+ */
+export async function fetchMxcBytes(mxc) {
+  const client = getClient();
+  if (!client || !mxc) return null;
+
+  const attempts = mediaDownloadAttempts(client, mxc);
+  for (const { url, init } of attempts) {
+    try {
+      const resp = await fetch(url, init);
+      if (!resp.ok) {
+        console.warn(`[media] download ${resp.status} for ${mxc} via ${url}`);
+        continue;
+      }
+      return new Uint8Array(await resp.arrayBuffer());
+    } catch (e) {
+      console.warn('[media] download failed:', e?.message || e);
+      // Try the next endpoint before giving up.
+    }
+  }
+  return null;
+}
+
+/**
  * Fetch the plaintext bytes referenced by a `__media` envelope.
  * Tries the local mirror first; falls back to the homeserver media
  * store (authenticated endpoint first, then legacy), decrypting if the
@@ -387,35 +414,23 @@ export async function getMediaBytes(ref) {
   const cached = await getCachedMediaBytes(ref.mxc);
   if (cached) return cached;
 
-  const client = getClient();
-  if (!client) return null;
+  const downloaded = await fetchMxcBytes(ref.mxc);
+  if (!downloaded) return null;
 
-  const attempts = mediaDownloadAttempts(client, ref.mxc);
-  if (!attempts.length) return null;
-
-  for (const { url, init } of attempts) {
-    try {
-      const resp = await fetch(url, init);
-      if (!resp.ok) {
-        console.warn(`[media] download ${resp.status} for ${ref.mxc} via ${url}`);
-        continue;
-      }
-      const downloaded = new Uint8Array(await resp.arrayBuffer());
-      let plaintext;
-      if (ref.__media === 2 && ref.file) {
-        plaintext = await decryptAttachment(downloaded, ref.file);
-      } else {
-        // Legacy plaintext upload.
-        plaintext = downloaded;
-      }
-      await cacheMediaBytes(ref.mxc, plaintext);
-      return plaintext;
-    } catch (e) {
-      console.warn('[media] download failed:', e?.message || e);
-      // Try the next endpoint before giving up.
+  try {
+    let plaintext;
+    if (ref.__media === 2 && ref.file) {
+      plaintext = await decryptAttachment(downloaded, ref.file);
+    } else {
+      // Legacy plaintext upload.
+      plaintext = downloaded;
     }
+    await cacheMediaBytes(ref.mxc, plaintext);
+    return plaintext;
+  } catch (e) {
+    console.warn('[media] decrypt failed:', e?.message || e);
+    return null;
   }
-  return null;
 }
 
 /**

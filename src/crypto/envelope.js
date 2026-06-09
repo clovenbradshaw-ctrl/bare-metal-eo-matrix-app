@@ -127,6 +127,19 @@ export async function unwrapIdentityPrivateKey(accountKey, wrappedB64) {
   return subtle.importKey('pkcs8', pkcs8, ECDH_PARAMS, true, ['deriveBits']);
 }
 
+/**
+ * Export / import the private half as base64 PKCS8 — for the local vault
+ * cache only (the vault encrypts it at rest). The server-side copy is
+ * always the Account-Key-wrapped form above.
+ */
+export async function exportIdentityPrivateKey(privateKey) {
+  return b64(new Uint8Array(await subtle.exportKey('pkcs8', privateKey)));
+}
+
+export async function importIdentityPrivateKey(pkcs8B64) {
+  return subtle.importKey('pkcs8', unb64(pkcs8B64), ECDH_PARAMS, true, ['deriveBits']);
+}
+
 // ── Workspace Content Key: 32 random bytes, distributed via ECIES ──
 
 /** Mint a new Workspace Content Key (raw bytes). */
@@ -206,4 +219,22 @@ export async function decryptPayload(wckBytes, envelope) {
   const plain = await aesDecrypt(key, blob);
   const { t, c } = JSON.parse(decoder.decode(plain));
   return { op: t, content: c };
+}
+
+// ── Bulk bytes: AES-GCM under the Workspace Content Key ──
+//
+// Used by the media-store block chain (src/blocks.js), where the unit of
+// encryption is a packed batch of events rather than a single payload.
+// Layout matches everything else in this file: [iv(12)][ciphertext+tag].
+
+/** Encrypt raw bytes with the WCK. Returns a single [iv][ct] Uint8Array. */
+export async function encryptBytesWithKey(wckBytes, bytes) {
+  const key = await importAesKey(wckBytes);
+  return aesEncrypt(key, bytes);
+}
+
+/** Decrypt an [iv][ct] blob produced by encryptBytesWithKey. */
+export async function decryptBytesWithKey(wckBytes, blob) {
+  const key = await importAesKey(wckBytes);
+  return aesDecrypt(key, blob);
 }
