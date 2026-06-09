@@ -38,6 +38,10 @@ import { onNetworkChange, getNetworkState } from './network.js';
 import { uploadFile as mediaUploadFile, getMediaBytes } from './media.js';
 import { loadManifest, saveManifest } from './roomManifest.js';
 import * as memory from './memory.js';
+import { ensureIdentity, loadIdentityFromVault, getIdentity, clearIdentity } from './crypto/identity.js';
+import { ensureWorkspaceKey, publishMemberKey, grantWorkspaceKey,
+         adoptGrantedKey, clearWorkspaceKeys } from './crypto/workspaceKey.js';
+import { appendBlock, loadChains, readOwnHead } from './blocks.js';
 
 const NAMESPACE = 'io.matrix-events';
 const ROOM_TYPE = 'eo.workspace';
@@ -74,6 +78,12 @@ const roomUnsubs = new Map();           // roomId → cleanup fns
 const openOrder = [];                   // roomIds, least→most recently touched (LRU)
 const pendingByLocalId = new Map();     // localId → { roomId, event }
 const sentEventToLocalId = new Map();
+const roomBlockSync = new Map();        // roomId → block-chain sync ctx (see initBlockSync)
+
+// Settles when the envelope-encryption identity for the current session is
+// loaded (or determined to be unavailable). Block sync awaits this so a
+// fresh login's first room open doesn't race the identity bootstrap.
+let identityReady = Promise.resolve(null);
 
 let outboxFlusher = null;
 let unsubRoomChanges = null;
@@ -170,6 +180,29 @@ netState = getNetworkState();
 // ── Outbox surface ──
 onOutboxChange(() => notify('outbox'));
 
+// ── Envelope identity bootstrap ──
+//
+// With the password in scope (login / unlock / reconnect) this loads or
+// creates the user's identity keypair from account_data per
+// ENCRYPTION-DESIGN.md §1/§3 — the root of post-wipe recovery for the
+// media-store block chain. Without a password (cold-boot auto-restore)
+// it falls back to the vault-cached copy. Never throws; a missing
+// identity just leaves the block chain dormant for the session.
+function startIdentity(userId, password) {
+  identityReady = (async () => {
+    const client = getClient();
+    if (client && password) {
+      const id = await ensureIdentity(client, NAMESPACE, userId, password);
+      if (id) return id;
+    }
+    return loadIdentityFromVault(userId);
+  })().catch(e => {
+    console.warn('[bridge] identity init failed:', e?.message || e);
+    return null;
+  });
+  return identityReady;
+}
+
 // ── Auth ──
 async function loginWithMatrix({ homeserver, username, password, keepSignedIn = false }) {
   // When set, the vault key is stashed in localStorage so the session
@@ -198,6 +231,7 @@ async function loginWithMatrix({ homeserver, username, password, keepSignedIn = 
       vaultUnlockedForUser = vault.isUnlocked() && vault.getUserId() === user;
       if (!needsLogin) {
         logProgress(online ? 'Unlocked (online)' : 'Unlocked (offline)');
+        startIdentity(user, password);
         return await afterAuth(user, hs);
       }
       logProgress('Saved session expired — refreshing credentials…');
@@ -208,6 +242,7 @@ async function loginWithMatrix({ homeserver, username, password, keepSignedIn = 
 
   try {
     const { userId } = await mxLogin(hs, user, password, { persist });
+    startIdentity(userId, password);
     return await afterAuth(userId, hs);
   } catch (e) {
     // Couldn't reach the homeserver (or it refused). If the vault is
@@ -216,6 +251,7 @@ async function loginWithMatrix({ homeserver, username, password, keepSignedIn = 
     // disk and queue edits until the homeserver is reachable.
     if (vaultUnlockedForUser) {
       logProgress(`Couldn't reach homeserver (${e.message}); continuing in local-only mode`);
+      startIdentity(user, null);
       return await afterAuthStale(user, hs);
     }
     throw e;
@@ -534,6 +570,7 @@ async function reconnect(password) {
   logProgress('Reconnecting…');
   // Keep whatever persistence the user chose at sign-in.
   const { userId: refreshedId } = await mxLogin(hs, userId, password, { persist: vault.isPersistent() });
+  startIdentity(refreshedId, password);
   return await afterAuth(refreshedId, hs);
 }
 
@@ -544,6 +581,11 @@ async function tearDownLiveState() {
   if (unregisterRoomEvictor) { unregisterRoomEvictor(); unregisterRoomEvictor = null; }
   memory.stop();
   stopSdkMaintenance();
+  for (const [, ctx] of roomBlockSync) { if (ctx.timer) clearTimeout(ctx.timer); }
+  roomBlockSync.clear();
+  clearWorkspaceKeys();
+  clearIdentity();
+  identityReady = Promise.resolve(null);
   for (const [, fns] of roomUnsubs) fns.forEach(fn => { try { fn(); } catch {} });
   roomUnsubs.clear();
   roomStores.clear();
@@ -649,6 +691,7 @@ function activeRoomId() {
  * re-derived from OPFS on reopen, so nothing is lost — only re-read.
  */
 function closeRoom(roomId) {
+  teardownBlockSync(roomId);
   const fns = roomUnsubs.get(roomId);
   if (fns) { fns.forEach(fn => { try { fn(); } catch {} }); roomUnsubs.delete(roomId); }
   roomStores.delete(roomId);
@@ -721,6 +764,7 @@ async function openRoom(roomId) {
         const plain = added.map(toPlain).filter(isOpEvent);
         const cur = roomEvents.get(roomId) || [];
         roomEvents.set(roomId, cur.concat(plain));
+        queueBlockEvents(roomId, plain);
         notify('events');
       }
       // A first-time seed paginates the room's entire history into the SDK
@@ -747,6 +791,7 @@ async function openRoom(roomId) {
           const plain = added.map(toPlain).filter(isOpEvent);
           const cur = roomEvents.get(roomId) || [];
           roomEvents.set(roomId, cur.concat(plain));
+          queueBlockEvents(roomId, plain);
           notify('events');
         }
       }));
@@ -757,6 +802,7 @@ async function openRoom(roomId) {
           const plain = added.map(toPlain).filter(isOpEvent);
           const cur = roomEvents.get(roomId) || [];
           roomEvents.set(roomId, cur.concat(plain));
+          queueBlockEvents(roomId, plain);
           notify('events');
         }
       }));
@@ -767,6 +813,7 @@ async function openRoom(roomId) {
             const plain = added.map(toPlain).filter(isOpEvent);
             const cur = roomEvents.get(roomId) || [];
             roomEvents.set(roomId, cur.concat(plain));
+            queueBlockEvents(roomId, plain);
           }
           reconcilePendingByTxn(event);
           notify('events');
@@ -779,6 +826,211 @@ async function openRoom(roomId) {
   }
   roomUnsubs.set(roomId, fns);
   enforceRoomCap();
+
+  // Durable system of record: reconcile this room with its media-store
+  // block chain (recover anything the megolm timeline lost, back-fill
+  // anything the chain doesn't have yet). Fire-and-forget — the room is
+  // fully usable while this runs, and a failure only means the recovery
+  // layer is dormant.
+  initBlockSync(roomId, store).catch(e =>
+    console.warn('[bridge] block sync init failed:', e?.message || e));
+}
+
+// ── Media-store block chain (durable storage) ──
+//
+// The megolm timeline is the live transport, OPFS the local cache — but
+// both are losable (browser wipe + the key-backup stack failing). The
+// block chain in the homeserver media store is the copy that always
+// comes back: every committed op-event this user sends is batched into
+// hash-linked, WCK-encrypted blocks (src/blocks.js) whose head pointer
+// lives in room state. Recovery needs only the login password (see
+// ENCRYPTION-DESIGN.md): password → identity (account_data) → workspace
+// key (room state) → chain head (room state) → blocks (media store).
+//
+// Imported datasets are the headline beneficiary: their row blobs sit in
+// the media store, but the only pointer + decryption key for them rides
+// inside op-events — exactly what the chain now preserves.
+
+const BLOCK_FLUSH_DELAY_MS = 4_000;     // coalesce a burst of edits into one block
+const BLOCK_MAX_EVENTS = 2_000;         // per-block event cap (~0.5 MB typical)
+const BLOCK_MAX_FAILURES = 5;           // give up for the session after this many
+
+async function initBlockSync(roomId, store) {
+  if (roomBlockSync.has(roomId)) return;
+  const ctx = {
+    wck: null,
+    head: null,            // { mxc, sha256, idx } of our own chain
+    chained: new Set(),    // event_ids known to be in ANY member's chain
+    queue: [],             // committed self events awaiting upload
+    timer: null,
+    busy: false,
+    disabled: false,
+    failures: 0,
+    recovered: 0,
+  };
+  roomBlockSync.set(roomId, ctx);
+
+  await identityReady;
+  const client = getClient();
+  if (!client || !vault.isUnlocked()) { ctx.disabled = true; return; }
+  if (!getIdentity()) {
+    ctx.disabled = true;
+    logProgress('Block chain dormant — no envelope identity (sign in with your password once to enable)');
+    return;
+  }
+
+  // Obtain the workspace key: cache → room state → a grant another member
+  // left for us → mint fresh (creator path). Publish our member_key and
+  // grant any keyless members while we're here.
+  let wck = await ensureWorkspaceKey(client, NAMESPACE, roomId);
+  if (!wck) wck = await adoptGrantedKey(client, NAMESPACE, roomId);
+  if (!wck) {
+    ctx.disabled = true;
+    logProgress('Block chain dormant — no workspace key yet (waiting for a member to grant one)');
+    return;
+  }
+  ctx.wck = wck;
+  publishMemberKey(client, NAMESPACE, roomId).catch(() => {});
+  grantWorkspaceKey(client, NAMESPACE, roomId, wck).catch(() => {});
+
+  // DOWN: pull every member's chain and replay whatever the local store
+  // is missing. store.append dedups by event_id, so events that also
+  // survived in the megolm timeline / OPFS cost nothing.
+  try {
+    const { events, chainedIds, ownHead, partial } = await loadChains(NAMESPACE, roomId, wck);
+    ctx.chained = chainedIds;
+    ctx.head = ownHead;
+    if (events.length) {
+      const added = await store.append(events);
+      if (added.length > 0) {
+        const plain = added.map(toPlain).filter(isOpEvent);
+        const cur = roomEvents.get(roomId) || [];
+        roomEvents.set(roomId, cur.concat(plain));
+        ctx.recovered = plain.length;
+        logProgress(`Recovered ${plain.length} event${plain.length === 1 ? '' : 's'} from the block chain`);
+        notify('events');
+      }
+    }
+    if (partial) logProgress('Block chain partially unreadable — recovery may be incomplete');
+  } catch (e) {
+    logProgress(`Block chain read failed: ${e?.message || e}`);
+  }
+
+  // UP: back-fill our own committed history the chain doesn't have yet.
+  // First run on an existing workspace chains its entire history once;
+  // afterwards this only catches edits made while the chain was failing.
+  queueBlockEvents(roomId, roomEvents.get(roomId) || []);
+}
+
+// Queue committed self-sent op-events for the next block. Safe to call
+// with any event mix — everything that doesn't belong in our chain
+// (others' events, pending optimistic echoes, already-chained ids) is
+// filtered here, so call sites stay one-liners.
+function queueBlockEvents(roomId, plainEvents) {
+  const ctx = roomBlockSync.get(roomId);
+  if (!ctx || ctx.disabled || !ctx.wck) return;
+  const me = activeSession?.mxid;
+  if (!me) return;
+  let queued = 0;
+  for (const e of plainEvents) {
+    if (!e || e._pending || e.sender !== me) continue;
+    if (!e.event_id || e.event_id.startsWith('~') || !e.event_id.startsWith('$')) continue;
+    if (!isOpEvent(e)) continue;
+    if (ctx.chained.has(e.event_id)) continue;
+    ctx.chained.add(e.event_id);   // queued counts as chained; failures requeue
+    ctx.queue.push(e);
+    queued++;
+  }
+  if (queued > 0) scheduleBlockFlush(roomId);
+}
+
+function scheduleBlockFlush(roomId, delay = BLOCK_FLUSH_DELAY_MS) {
+  const ctx = roomBlockSync.get(roomId);
+  if (!ctx || ctx.disabled || ctx.timer) return;
+  ctx.timer = setTimeout(() => {
+    ctx.timer = null;
+    flushBlockQueue(roomId).catch(e => console.warn('[bridge] block flush failed:', e));
+  }, delay);
+}
+
+async function flushBlockQueue(roomId) {
+  const ctx = roomBlockSync.get(roomId);
+  if (!ctx || ctx.disabled || ctx.busy || ctx.queue.length === 0) return;
+  if (!getClient() || netState === 'offline') { scheduleBlockFlush(roomId, 15_000); return; }
+
+  ctx.busy = true;
+  const batch = ctx.queue.splice(0, BLOCK_MAX_EVENTS);
+  try {
+    // Another device of ours may have advanced the chain since we read
+    // it — extend its head rather than forking. Anything it already
+    // chained that we re-chain dedups on read.
+    const remote = await readOwnHead(NAMESPACE, roomId, activeSession?.mxid);
+    if (remote?.head?.mxc && (!ctx.head || (remote.idx || 0) > ctx.head.idx)) {
+      ctx.head = { ...remote.head, idx: remote.idx || 0 };
+    }
+
+    ctx.head = await appendBlock(NAMESPACE, roomId, ctx.wck, batch, ctx.head);
+    ctx.failures = 0;
+  } catch (e) {
+    ctx.queue.unshift(...batch);
+    ctx.failures++;
+    logProgress(`Block append failed (${ctx.failures}/${BLOCK_MAX_FAILURES}): ${e?.message || e}`);
+    if (ctx.failures >= BLOCK_MAX_FAILURES) {
+      ctx.disabled = true;
+      logProgress('Block chain paused for this room — will retry next open');
+    }
+  } finally {
+    ctx.busy = false;
+  }
+  if (ctx.queue.length > 0 && !ctx.disabled) {
+    scheduleBlockFlush(roomId, ctx.failures > 0 ? 15_000 : 1_000);
+  }
+}
+
+// On room close, push any queued events out (best-effort) and drop the
+// ctx — its chained-id set scales with room history, the same class of
+// memory the LRU exists to bound. Unflushed events are never lost: the
+// next open's back-fill re-queues them from the committed log.
+function teardownBlockSync(roomId) {
+  const ctx = roomBlockSync.get(roomId);
+  if (!ctx) return;
+  if (ctx.timer) { clearTimeout(ctx.timer); ctx.timer = null; }
+  const finish = () => roomBlockSync.delete(roomId);
+  if (ctx.queue.length > 0 && !ctx.disabled && !ctx.busy && getClient()) {
+    flushBlockQueue(roomId).then(finish, finish);
+  } else {
+    finish();
+  }
+}
+
+// Diagnostics for the console: window.MatrixLive.getBlockStats().
+function getBlockStats(roomId) {
+  const describe = (ctx) => ({
+    enabled: !ctx.disabled && !!ctx.wck,
+    headIdx: ctx.head ? ctx.head.idx : null,
+    chainedEvents: ctx.chained.size,
+    queued: ctx.queue.length,
+    recovered: ctx.recovered,
+    failures: ctx.failures,
+  });
+  if (roomId) {
+    const ctx = roomBlockSync.get(roomId);
+    return ctx ? describe(ctx) : null;
+  }
+  const out = {};
+  for (const [id, ctx] of roomBlockSync) out[id] = describe(ctx);
+  return out;
+}
+
+// Force a full chain re-sync for a room (e.g. after fixing power levels).
+async function forceBlockSync(roomId) {
+  const ctx = roomBlockSync.get(roomId);
+  if (ctx?.timer) clearTimeout(ctx.timer);
+  roomBlockSync.delete(roomId);
+  const store = roomStores.get(roomId);
+  if (!store) throw new Error('Room is not open');
+  await initBlockSync(roomId, store);
+  return getBlockStats(roomId);
 }
 
 // Committed (server-acked) events only. This list is strictly append-only
@@ -1093,6 +1345,10 @@ window.MatrixLive = {
   // File import / media
   importFile: importFileToRoom,
   readMedia,
+  // Media-store block chain (durable storage / wipe recovery)
+  getBlockStats,
+  forceBlockSync,
+  hasEnvelopeIdentity: () => !!getIdentity(),
   // Memory governor
   getMemoryStats: () => memory.getStats(),
   getSdkStats,
@@ -1139,6 +1395,9 @@ if ('serviceWorker' in navigator) {
     if (result) {
       const c = getClient();
       const hs = c?.getHomeserverUrl?.() || '';
+      // No password in scope on auto-restore — the identity loads from
+      // its vault cache (written on the last password login).
+      startIdentity(result.userId, null);
       // Having a client at all is enough to call afterAuth — that
       // matches how loginWithMatrix routes the unlock path. If the
       // sync state is still RECONNECTING we'll show as online with

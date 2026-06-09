@@ -174,6 +174,51 @@ after import). **Attachment fields** become a short text summary (filename +
 count) — their files are not re-hosted and Airtable's URLs expire, so the raw
 links are deliberately dropped.
 
+### Imported data is permanent: the media-store block chain
+
+Where imported rows actually live, and why they survive anything short of
+the homeserver losing its disk:
+
+1. **Row bytes** — encrypted chunk blobs in the homeserver **media store**
+   (the `ML.importFile` path above). Each blob has its own AES key.
+2. **The pointer + key to every blob** — inside the import entity's
+   op-events (`INS` + `DEF file`). Op-events ride the megolm timeline, and
+   megolm is device-scoped: a browser wipe plus a failed key backup used to
+   take the events — and with them the only copy of the blob keys — leaving
+   the rows unreachable forever. That was the "imports don't persist" bug.
+3. **The fix** — every committed op-event is *also* batched into a
+   **hash-linked chain of encrypted blocks in the media store**
+   (`src/blocks.js`). Each block is AES-GCM encrypted with the room's stable
+   **Workspace Content Key** (ENCRYPTION-DESIGN.md), links the previous
+   block's `{ mxc, sha256 }` git-style, and the chain head sits in room
+   **state** (`<ns>.blocks`, one chain per member) — state events are never
+   megolm-encrypted, so they always come back with the room.
+
+Recovery after a total browser wipe needs only the login password:
+`password → identity key (account_data "<ns>.identity") → workspace key
+(room state "<ns>.wkey") → chain heads (room state "<ns>.blocks") → blocks
+(media store) → replay`. No device identity, megolm session, cross-signing,
+or key backup is involved. On every room open the bridge reconciles both
+directions: events found in the chain but missing locally are replayed into
+the store (this is what brings imports back), and committed events missing
+from the chain are batched up (existing workspaces back-fill their full
+history the first time they open after this feature).
+
+The homeserver stays blind: it sees opaque blobs, opaque chain heads, and
+wrapped keys it cannot open. Console diagnostics:
+
+```js
+window.MatrixLive.getBlockStats()          // per-room: headIdx, chainedEvents, queued, recovered
+window.MatrixLive.forceBlockSync(roomId)   // tear down + re-run chain reconciliation
+window.MatrixLive.hasEnvelopeIdentity()    // false ⇒ sign in with password once to mint it
+```
+
+Two operational notes. (a) The identity is created the first time you log
+in **with a password** after this feature lands; cold-boot session restores
+load it from the local vault cache. (b) In rooms created before this
+feature, members below the state power level can't publish their chain
+head; new rooms grant PL 0 for the three `<ns>.*` state types at creation.
+
 ---
 
 ## 4. Building a new app — the minimum viable path
