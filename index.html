@@ -1053,6 +1053,26 @@ table.dbgrid tbody tr:hover .sel-caret,.sel-td.sel-open .sel-caret{opacity:1}
 .wh-tagline{font-size:14px;color:var(--text-dim);line-height:1.55}
 .wh-stale-hint{margin-top:12px;padding:8px 12px;background:#fffcec;border:1px solid var(--signal);color:var(--text);font-size:12px;display:inline-block}
 .wh-loading{font-size:13px;color:var(--text-dim);padding:40px 0;font-family:var(--mono)}
+
+/* ── Sync indicator (durable-storage cold sync) ────────────────────────── */
+.sync-indicator{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11.5px;color:var(--text);white-space:nowrap;flex-shrink:0}
+.sync-indicator .sync-dot{width:8px;height:8px;border-radius:50%;background:var(--text-dim);flex-shrink:0}
+.sync-indicator.is-syncing .sync-dot{background:var(--triad-structure);animation:sync-pulse 1s ease-in-out infinite}
+.sync-indicator.is-done .sync-dot{background:var(--triad-structure)}
+.sync-indicator.is-error .sync-dot{background:var(--triad-significance)}
+.sync-indicator .sync-sub{color:var(--text-dim);font-size:11px}
+.sync-indicator .sync-resync{margin-left:2px;padding:2px 8px;font-family:var(--mono);font-size:10.5px;font-weight:600;text-transform:lowercase;letter-spacing:.3px;color:var(--text-dim);background:#fff;border:1px solid var(--border-strong);cursor:pointer}
+.sync-indicator .sync-resync:hover{border-color:#000;color:var(--text-bright)}
+/* Wide launchpad form: a full-width strip above the grid. */
+.sync-indicator.sync-banner{display:flex;width:100%;max-width:920px;margin:0 0 14px;padding:9px 13px;background:var(--surface-2,#f6f6f4);border:1px solid var(--border-strong)}
+.sync-indicator.sync-banner.is-syncing{border-color:var(--triad-structure)}
+.sync-indicator.sync-banner.is-error{background:#fff4f4;border-color:var(--triad-significance)}
+.sync-indicator.sync-banner .sync-label{font-weight:600;color:var(--text-bright)}
+.sync-indicator.sync-banner .sync-sub{margin-left:auto}
+/* Slim topbar form: just the dot + label, sits inline with the controls. */
+.sync-indicator.sync-pill{padding:4px 9px;min-height:28px;border:1px solid var(--border-strong);background:#fff;max-width:240px;overflow:hidden}
+.sync-indicator.sync-pill .sync-label{overflow:hidden;text-overflow:ellipsis}
+@keyframes sync-pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .wh-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;width:100%;max-width:920px}
 .wh-card{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:18px 18px 16px;background:#fff;border:1px solid var(--border-strong);cursor:pointer;text-align:left;font-family:var(--mono);min-height:140px;transition:transform .08s ease, box-shadow .08s ease;position:relative}
 .wh-card:hover{border-color:#000;box-shadow:4px 4px 0 var(--surface-3);transform:translate(-1px,-1px)}
