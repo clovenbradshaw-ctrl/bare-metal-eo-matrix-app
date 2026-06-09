@@ -92,13 +92,87 @@ function useDemoTitleOverrides() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Cold-start sync status — the bridge proactively pulls every workspace
+// back from its durable media-store chain on a fresh load. This hook
+// mirrors that progress; SyncIndicator renders it.
+// ─────────────────────────────────────────────────────────────────────────
+
+function useSyncStatus(isLive) {
+  const ML = typeof window !== 'undefined' ? window.MatrixLive : null;
+  const [status, setStatus] = useState(() => (isLive && ML?.getSyncStatus?.()) || null);
+
+  useEffect(() => {
+    if (!isLive || !ML?.subscribe) { setStatus(null); return; }
+    setStatus(ML.getSyncStatus?.() || null);
+    return ML.subscribe((reason) => {
+      if (reason === 'sync' || reason === 'session') {
+        setStatus(ML.getSyncStatus?.() || null);
+      }
+    });
+  }, [isLive, ML]);
+
+  return status;
+}
+
+// Compact, self-dismissing banner describing the durable-storage sync.
+// `variant` "banner" is the wide launchpad form; "pill" is the slim topbar
+// form. Renders nothing when there's nothing worth saying.
+function SyncIndicator({ status, variant = 'banner', onResync }) {
+  const [dismissed, setDismissed] = useState(false);
+  const phase = status?.phase;
+
+  // Auto-clear the "done" state a few seconds after it lands so the banner
+  // doesn't linger once everything is in.
+  useEffect(() => {
+    setDismissed(false);
+    if (phase === 'done') {
+      const t = setTimeout(() => setDismissed(true), 4000);
+      return () => clearTimeout(t);
+    }
+  }, [phase, status?.finishedAt]);
+
+  if (!status || phase === 'idle') return null;
+  if (phase === 'done' && (status.recovered === 0 || dismissed)) return null;
+
+  const total = status.roomsTotal || 0;
+  const done = status.roomsDone || 0;
+  const syncing = phase === 'syncing';
+  const errored = phase === 'error' || (status.errors && status.errors.length > 0);
+
+  const label = syncing
+    ? `Syncing from durable storage… ${total ? `${done}/${total}` : ''}`.trim()
+    : errored
+      ? `Synced with issues — ${status.recovered} event${status.recovered === 1 ? '' : 's'} recovered`
+      : `Synced · ${status.recovered} event${status.recovered === 1 ? '' : 's'} restored from durable storage`;
+
+  const sub = syncing && status.currentRoomName
+    ? `restoring ${status.currentRoomName}…`
+    : null;
+
+  const cls = `sync-indicator sync-${variant} ${syncing ? 'is-syncing' : ''} ${errored ? 'is-error' : ''} ${phase === 'done' ? 'is-done' : ''}`;
+
+  return (
+    <div className={cls} role="status" aria-live="polite" title={label}>
+      <span className="sync-dot" aria-hidden="true" />
+      <span className="sync-label">{label}</span>
+      {sub && variant === 'banner' && <span className="sync-sub">{sub}</span>}
+      {!syncing && onResync && (
+        <button className="sync-resync" onClick={onResync} title="re-sync from durable storage">
+          re-sync
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Workspaces home — what you see right after signing in. Lists every
 // space as a card; you pick one to enter, or create a new one. No data
 // editing happens here, by design: this is the launchpad.
 // ─────────────────────────────────────────────────────────────────────────
 
 function WorkspacesHome({
-  session, rooms, isLive, syncReady,
+  session, rooms, isLive, syncReady, syncStatus, onResync,
   onEnter, onCreate, onSignOut, onAcceptInvite,
 }) {
   const [newName, setNewName] = useState('');
@@ -141,6 +215,7 @@ function WorkspacesHome({
       </div>
 
       <div className="wh-body">
+        {isLive && <SyncIndicator status={syncStatus} variant="banner" onResync={onResync} />}
         <div className="wh-hero">
           <div className="wh-greeting">
             welcome{myLocal ? `, ${myLocal}` : ''}
@@ -545,6 +620,10 @@ function App() {
   const isLive = !!session && !session.demo;
   const [currentRoomId, setCurrentRoomId] = useState(null);
   const liveStore = useLiveStore(isLive, currentRoomId);
+
+  // Cold-start durable-storage sync progress (drives the sync indicator).
+  const syncStatus = useSyncStatus(isLive);
+  const onResync = () => { window.MatrixLive?.resync?.(); };
 
   // Pick the active source and pin the engine namespace synchronously, so
   // every fold below sees the right NS prefix.
@@ -953,6 +1032,8 @@ function App() {
         rooms={rooms}
         isLive={isLive}
         syncReady={syncReady}
+        syncStatus={syncStatus}
+        onResync={onResync}
         onEnter={(id) => setCurrentRoomId(id)}
         onCreate={onCreateRoom}
         onSignOut={handleSignOut}
@@ -1005,6 +1086,7 @@ function App() {
           );
         })()}
         <span className="spacer" />
+        {isLive && <SyncIndicator status={syncStatus} variant="pill" onResync={onResync} />}
         <button
           className={`topbar-timetravel ${scrubberOpen ? 'on' : ''} ${!live ? 'scrubbed' : ''}`}
           onClick={() => setScrubberOpen(o => !o)}

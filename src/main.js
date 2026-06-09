@@ -102,6 +102,50 @@ let roomManifest = [];
 let roomManifestKey = '';
 let manifestSaveTimer = null;
 
+// Persisted per-room event counts. The single-room LRU drops a room's
+// in-memory event array the moment you leave it, so `roomEvents` only
+// knows about the room you're in. This cache remembers the last known
+// committed-event count per room (from OPFS on open, from the durable
+// chain after recovery, and at close) so the launchpad can show real
+// counts for every workspace — not "empty" for everything you're not
+// currently inside. Cleared on logout/teardown.
+const roomCountCache = new Map();       // roomId → committed event count
+
+function recordRoomCount(roomId, count) {
+  if (typeof count === 'number' && count >= 0) roomCountCache.set(roomId, count);
+}
+
+// ── Cold-start sync status ──
+//
+// On a fresh load we proactively reconcile every workspace with its
+// durable media-store block chain (see syncAllRooms). This model is the
+// progress surface for that pass so the UI can show what's happening
+// instead of leaving the user staring at a workspace that looks empty
+// until they happen to click into a room.
+function freshSyncStatus() {
+  return {
+    phase: 'idle',          // 'idle' | 'syncing' | 'done' | 'error'
+    startedAt: 0,
+    finishedAt: 0,
+    roomsTotal: 0,
+    roomsDone: 0,
+    currentRoomId: null,
+    currentRoomName: null,
+    recovered: 0,           // events pulled back from the durable chain this pass
+    errors: [],             // [{ roomId, name, message }]
+  };
+}
+let syncStatus = freshSyncStatus();
+let coldSyncStarted = false;            // guards the once-per-session auto kick
+
+function setSyncStatus(patch) {
+  syncStatus = { ...syncStatus, ...patch };
+  notify('sync');
+}
+function getSyncStatus() {
+  return { ...syncStatus, errors: syncStatus.errors.slice() };
+}
+
 function logProgress(msg) {
   progressLog.push({ ts: Date.now(), msg });
   if (progressLog.length > 60) progressLog.shift();
@@ -466,6 +510,13 @@ async function afterAuth(userId, homeserver) {
 
   await hydratePendingFromOutbox();
   notify('session');
+
+  // Fresh load: proactively pull every workspace back from its durable
+  // media-store chain into OPFS, with a visible status indicator. Runs
+  // once per session, in the background — the UI is fully usable while it
+  // works and shows progress via getSyncStatus().
+  kickColdSync();
+
   return activeSession;
 }
 
@@ -498,6 +549,12 @@ async function afterAuthStale(userId, homeserver) {
 
   await hydratePendingFromOutbox();
   notify('session');
+
+  // Offline / local-only: still record OPFS counts for the launchpad and
+  // surface the sync state. Chain recovery no-ops without a client, but the
+  // pass leaves every cached room counted instead of showing "empty".
+  kickColdSync();
+
   return activeSession;
 }
 
@@ -590,11 +647,14 @@ async function tearDownLiveState() {
   roomUnsubs.clear();
   roomStores.clear();
   roomEvents.clear();
+  roomCountCache.clear();
   openOrder.length = 0;
   pendingByLocalId.clear();
   sentEventToLocalId.clear();
   roomManifest = [];
   roomManifestKey = '';
+  coldSyncStarted = false;
+  syncStatus = freshSyncStatus();
 }
 
 async function logout() {
@@ -621,6 +681,15 @@ async function clearLocalData() {
 // the manifest is refreshed from them. When the SDK is empty (cold
 // offline boot, stale token), the manifest fills in so the user can
 // still see the rooms they had before.
+// Best event count we can show for a room without it being open: the live
+// in-memory array when we're inside it, otherwise the last count we cached
+// (from OPFS / durable recovery). Falls back to 0 for never-seen rooms.
+function roomEventCount(roomId) {
+  const live = roomEvents.get(roomId);
+  if (live) return live.length;
+  return roomCountCache.get(roomId) || 0;
+}
+
 function listRooms() {
   const live = discoverRooms(ROOM_TYPE);
   if (live.length > 0) {
@@ -628,7 +697,7 @@ function listRooms() {
     return live.map(r => ({
       id: r.roomId,
       name: r.name,
-      eventCount: roomEvents.get(r.roomId)?.length || 0,
+      eventCount: roomEventCount(r.roomId),
       namespace: NAMESPACE,
       title: r.name,
       membership: r.membership,
@@ -640,7 +709,7 @@ function listRooms() {
   return roomManifest.map(r => ({
     id: r.roomId,
     name: r.name,
-    eventCount: roomEvents.get(r.roomId)?.length || 0,
+    eventCount: roomEventCount(r.roomId),
     namespace: NAMESPACE,
     title: r.name,
     membership: r.membership || 'join',
@@ -691,6 +760,10 @@ function activeRoomId() {
  * re-derived from OPFS on reopen, so nothing is lost — only re-read.
  */
 function closeRoom(roomId) {
+  // Remember the count before we drop the store, so the launchpad keeps
+  // showing this room's size after we leave it.
+  const store = roomStores.get(roomId);
+  if (store) recordRoomCount(roomId, store.getCount());
   teardownBlockSync(roomId);
   const fns = roomUnsubs.get(roomId);
   if (fns) { fns.forEach(fn => { try { fn(); } catch {} }); roomUnsubs.delete(roomId); }
@@ -744,6 +817,7 @@ async function openRoom(roomId) {
   roomStores.set(roomId, store);
 
   const stored = store.getCount();
+  recordRoomCount(roomId, stored);
   let events = [];
   if (stored > 0) {
     const all = await store.getAll();
@@ -764,6 +838,7 @@ async function openRoom(roomId) {
         const plain = added.map(toPlain).filter(isOpEvent);
         const cur = roomEvents.get(roomId) || [];
         roomEvents.set(roomId, cur.concat(plain));
+        recordRoomCount(roomId, store.getCount());
         queueBlockEvents(roomId, plain);
         notify('events');
       }
@@ -1031,6 +1106,156 @@ async function forceBlockSync(roomId) {
   if (!store) throw new Error('Room is not open');
   await initBlockSync(roomId, store);
   return getBlockStats(roomId);
+}
+
+// ── Cold-start full sync ──
+//
+// The megolm timeline is the live transport and OPFS the local cache, but
+// the copy that always comes back is the media-store block chain. On a
+// fresh load we proactively pull every workspace's chain back into OPFS so
+// the data is local again — instead of waiting for the user to click into
+// each room and discover it looks empty. This is the read (recovery) half
+// of initBlockSync, run room-by-room with a visible status surface.
+//
+// Design notes:
+//   - We sync rooms SEQUENTIALLY. The app holds exactly one room's working
+//     set in memory (MAX_OPEN_ROOMS); a parallel sweep would blow that.
+//   - For a room the user already has open we do nothing here — its live
+//     initBlockSync already owns recovery, and a second EventStore on the
+//     same OPFS file would race the first. We only recover CLOSED rooms,
+//     through a short-lived store that writes to OPFS and is then dropped,
+//     leaving the live LRU, its listeners, and openOrder untouched.
+//   - Recovery is idempotent: store.append dedups by event_id, so events
+//     already in OPFS / the megolm timeline cost nothing.
+
+// Pull a single closed room's durable chain into OPFS. Returns the number
+// of events recovered (newly written). Read-only with respect to the chain
+// — publishing member keys / back-filling our own history stays in the live
+// initBlockSync path, which runs when the room is actually opened.
+async function recoverRoomFromChain(roomId) {
+  // Never touch a live room's OPFS file from a second store.
+  if (roomStores.has(roomId)) {
+    const s = roomStores.get(roomId);
+    if (s) recordRoomCount(roomId, s.getCount());
+    return 0;
+  }
+
+  const store = new EventStore(roomId, NAMESPACE);
+  await store.open();
+  recordRoomCount(roomId, store.getCount());
+
+  await identityReady;
+  const client = getClient();
+  // Offline or no envelope identity → the OPFS cache we just opened is all
+  // we have. That's fine: the count is recorded, the launchpad shows it.
+  if (!client || !vault.isUnlocked() || !getIdentity()) return 0;
+
+  let wck = await ensureWorkspaceKey(client, NAMESPACE, roomId);
+  if (!wck) wck = await adoptGrantedKey(client, NAMESPACE, roomId);
+  if (!wck) return 0;
+
+  const { events, partial } = await loadChains(NAMESPACE, roomId, wck);
+  // The user may have opened this room while we were fetching its chain.
+  // If so, its live store now owns the OPFS file — bail rather than write
+  // through a second handle, and let the live initBlockSync do recovery.
+  if (roomStores.has(roomId)) return 0;
+  let recovered = 0;
+  if (events.length) {
+    const added = await store.append(events);   // dedups + persists to OPFS
+    recovered = added.length;
+  }
+  recordRoomCount(roomId, store.getCount());
+  if (partial) logProgress(`${roomId}: block chain partially unreadable — recovery may be incomplete`);
+  return recovered;
+}
+
+// Wait until the SDK has done its initial sync (so room state — workspace
+// keys and chain head pointers — is readable), or give up after `timeoutMs`.
+// Resolves immediately when there's no client (offline / stale): cold sync
+// then just records OPFS counts.
+function waitForPrepared(timeoutMs = 12_000) {
+  const client = getClient();
+  if (!client || typeof client.getSyncState !== 'function') return Promise.resolve();
+  const ready = () => ['PREPARED', 'SYNCING'].includes(client.getSyncState());
+  if (ready()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (ready() || Date.now() - t0 > timeoutMs) { clearInterval(iv); resolve(); }
+    }, 250);
+  });
+}
+
+// Reconcile every joined workspace with its durable chain, in order, driving
+// the sync-status surface as it goes. Safe to call again (manual "resync");
+// no-ops while a pass is already running.
+async function syncAllRooms() {
+  if (syncStatus.phase === 'syncing') return getSyncStatus();
+
+  const seen = new Set();
+  const targets = [];
+  for (const r of listRooms()) {
+    if (r.membership && r.membership !== 'join') continue;   // skip invites
+    if (!r.id || seen.has(r.id)) continue;
+    seen.add(r.id);
+    targets.push({ id: r.id, name: r.title || r.name || null });
+  }
+
+  if (targets.length === 0) {
+    setSyncStatus({ ...freshSyncStatus(), phase: 'done', finishedAt: Date.now() });
+    return getSyncStatus();
+  }
+
+  setSyncStatus({
+    ...freshSyncStatus(),
+    phase: 'syncing',
+    startedAt: Date.now(),
+    roomsTotal: targets.length,
+  });
+  logProgress(`Syncing ${targets.length} workspace${targets.length === 1 ? '' : 's'} from durable storage…`);
+
+  let recovered = 0;
+  for (const t of targets) {
+    setSyncStatus({ currentRoomId: t.id, currentRoomName: t.name });
+    try {
+      const got = await recoverRoomFromChain(t.id);
+      recovered += got;
+      if (got > 0) {
+        logProgress(`Recovered ${got} event${got === 1 ? '' : 's'} for ${t.name || t.id}`);
+        notify('rooms');   // refresh launchpad counts
+      }
+    } catch (e) {
+      const message = e?.message || String(e);
+      setSyncStatus({ errors: [...syncStatus.errors, { roomId: t.id, name: t.name, message }] });
+      logProgress(`Sync ${t.name || t.id} failed: ${message}`);
+    }
+    setSyncStatus({ recovered, roomsDone: syncStatus.roomsDone + 1 });
+  }
+
+  setSyncStatus({
+    phase: syncStatus.errors.length ? 'error' : 'done',
+    finishedAt: Date.now(),
+    currentRoomId: null,
+    currentRoomName: null,
+  });
+  logProgress(`Sync complete · ${recovered} event${recovered === 1 ? '' : 's'} recovered from durable storage`);
+  notify('rooms');
+  return getSyncStatus();
+}
+
+// Kick the once-per-session cold sync. Waits for the initial SDK sync (so
+// chain heads are readable) then runs the full pass in the background, so
+// the UI mounts immediately and shows progress as rooms come back.
+function kickColdSync() {
+  if (coldSyncStarted) return;
+  coldSyncStarted = true;
+  (async () => {
+    await waitForPrepared();
+    await syncAllRooms();
+  })().catch(e => {
+    console.warn('[bridge] cold sync failed:', e?.message || e);
+    setSyncStatus({ phase: 'error', finishedAt: Date.now() });
+  });
 }
 
 // Committed (server-acked) events only. This list is strictly append-only
@@ -1349,6 +1574,9 @@ window.MatrixLive = {
   getBlockStats,
   forceBlockSync,
   hasEnvelopeIdentity: () => !!getIdentity(),
+  // Cold-start full sync (durable chain → OPFS) + its progress surface
+  getSyncStatus,
+  resync: syncAllRooms,
   // Memory governor
   getMemoryStats: () => memory.getStats(),
   getSdkStats,
