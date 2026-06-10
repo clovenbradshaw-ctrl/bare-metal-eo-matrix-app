@@ -30,7 +30,7 @@ import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          setMemberPowerLevel, onMembersChange, acceptInvite, onRoomChanges,
          onDecrypted, onLocalEchoUpdated, EventStatus,
          setName as mxSetRoomName, getDisplayName as mxGetDisplayName } from './rooms.js';
-import { EventStore, requestPersistentStorage } from './store.js';
+import { EventStore, requestPersistentStorage, getOpfsBreakdown } from './store.js';
 import { vault, getLastUser } from './vault.js';
 import { OutboxFlusher, listAll as outboxListAll, pendingCount,
          onChange as onOutboxChange, remove as outboxRemove } from './outbox.js';
@@ -1565,6 +1565,50 @@ function getSdkStats() {
   };
 }
 
+// Where the local copy of every workspace physically lives, and whether the
+// browser has promised to keep it across tab closes. The sync page reads this
+// to tell the user, concretely: how much is downloaded, and whether a refresh
+// can lose it. `persisted` true means the origin is exempt from automatic
+// eviction; false means the browser may reclaim OPFS/IndexedDB under pressure
+// (the durable block chain still brings the data back, but a re-download).
+async function getStorageStatus() {
+  const status = {
+    persisted: false,
+    persistSupported: !!(navigator.storage?.persist),
+    usage: null,
+    quota: null,
+    opfs: null,
+  };
+  try {
+    if (navigator.storage?.persisted) status.persisted = await navigator.storage.persisted();
+  } catch {}
+  try {
+    if (navigator.storage?.estimate) {
+      const est = await navigator.storage.estimate();
+      status.usage = est.usage ?? null;
+      status.quota = est.quota ?? null;
+    }
+  } catch {}
+  try { status.opfs = await getOpfsBreakdown(); } catch {}
+  return status;
+}
+
+// Ask the browser to pin local storage against eviction (sync page button).
+// Re-records the once-per-session guard so a later auto-ask doesn't override
+// a fresh grant. Returns { supported, persisted }.
+async function makeStorageDurable() {
+  durableStorageRequested = true;
+  return await requestPersistentStorage();
+}
+
+// Best local event count we can report for ANY room without opening it:
+// the live in-memory array when we're inside it, else the cached count from
+// the last OPFS scan / durable recovery. Drives the per-room rows on the
+// sync page (the active room also surfaces committed/pending separately).
+function roomStoreCount(roomId) {
+  return roomEventCount(roomId);
+}
+
 async function renameRoom(roomId, name) {
   const clean = String(name || '').trim();
   if (!clean) throw new Error('Name required');
@@ -1638,6 +1682,11 @@ window.MatrixLive = {
   // Cold-start full sync (durable chain → OPFS) + its progress surface
   getSyncStatus,
   resync: syncAllRooms,
+  // Local-storage transparency (sync page): where the cache lives + whether
+  // a refresh can lose it, and the control to pin it against eviction.
+  getStorageStatus,
+  requestPersistentStorage: makeStorageDurable,
+  roomStoreCount,
   // Memory governor
   getMemoryStats: () => memory.getStats(),
   getSdkStats,

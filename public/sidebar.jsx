@@ -338,6 +338,7 @@ function Sidebar({
   room, state, selection, setSelection, onCreateTable,
   onCreateView, onRenameView, onDuplicateView, onDeleteView,
   eventsTotal, ephemeralsCount, onRenameRoom, lastEventTs, onAirtableSchema,
+  syncOutOfDate,
 }) {
   const { sets, meta, raw } = useMemo(() => buildSets(state), [state]);
   const allSets = [...sets, ...meta];
@@ -556,6 +557,15 @@ function Sidebar({
           <span className="sb-slice-icon">∅</span>
           <span className="sb-slice-name">ephemeral</span>
           <span className="sb-slice-meta">{ephemeralsCount}</span>
+        </button>
+        <button
+          className={`sb-slice ${selection.kind === 'sync' ? 'active' : ''} kind-sync`}
+          onClick={() => setSelection({ kind: 'sync' })}
+          title="how many records each table should have, what's downloaded to this device, and whether it survives a refresh"
+        >
+          <span className="sb-slice-icon">⟲</span>
+          <span className="sb-slice-name">sync &amp; storage</span>
+          {syncOutOfDate && <span className="sb-slice-meta" title="records still downloading or edits unsent">●</span>}
         </button>
       </div>
 
