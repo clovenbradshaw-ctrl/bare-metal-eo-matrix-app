@@ -123,6 +123,91 @@ for (const name of ['ARRAYJOIN', 'EXACT', 'TRUE', 'FALSE', 'WEEKNUM', 'WORKDAY',
   check(`FUNCTIONS advertises ${name}`, FNS.includes(name));
 }
 
+// ── Rollups & lookups — aggregate across CON edges (the Airtable link flow) ──
+// Imported Airtable record-links resolve into typed connections (relation =
+// the link field's name). A rollup/lookup on a row follows those edges and
+// aggregates the linked rows' field values. This is the path that makes
+// Airtable links flow through to rollups/lookups, so pin it down end-to-end.
+//
+// Shape: one Project linked to three Tasks via the "Tasks" relation; the edges
+// are written in BOTH source/target directions to prove traversal is
+// undirected. Tasks carry an Hours number and a Status select; one Task has no
+// Hours so blanks are exercised.
+const proj = { _anchor: 'p1', _type: 'Projects', Name: 'Apollo' };
+const taskA = { _anchor: 't1', _type: 'Tasks', Name: 'Design',  Hours: 5, Status: 'Done',  Done: true };
+const taskB = { _anchor: 't2', _type: 'Tasks', Name: 'Build',   Hours: 8, Status: 'Doing', Done: true };
+const taskC = { _anchor: 't3', _type: 'Tasks', Name: 'Ship',              Status: 'Todo',  Done: false };
+const ROLLUP_STATE = {
+  entities: { p1: proj, t1: taskA, t2: taskB, t3: taskC },
+  connections: [
+    // Project → Task (the direction an import of Projects produces)…
+    { source: 'p1', target: 't1', type: 'Tasks' },
+    { source: 'p1', target: 't2', type: 'Tasks' },
+    // …and Task → Project (the reciprocal direction) — traversal is undirected.
+    { source: 't3', target: 'p1', type: 'Tasks' },
+    // An edge of a DIFFERENT relation must never leak into a "Tasks" rollup.
+    { source: 'p1', target: 't1', type: 'Blocks' },
+  ],
+};
+function roll(cfg) {
+  const r = Formula.evaluateRollup(cfg, { record: proj, state: ROLLUP_STATE });
+  return r.ok ? r.value : ('ERR:' + r.error);
+}
+
+eq('rollup count follows the relation (both directions)', roll({ via: 'Tasks', fn: 'count' }), 3);
+eq('rollup count ignores other relations', roll({ via: 'Blocks', fn: 'count' }), 1);
+eq('rollup sum over a linked field', roll({ via: 'Tasks', field: 'Hours', fn: 'sum' }), 13);
+eq('rollup avg skips the blank Hours', roll({ via: 'Tasks', field: 'Hours', fn: 'avg' }), 6.5);
+eq('rollup min over linked field', roll({ via: 'Tasks', field: 'Hours', fn: 'min' }), 5);
+eq('rollup max over linked field', roll({ via: 'Tasks', field: 'Hours', fn: 'max' }), 8);
+
+// LOOKUP (multipleLookupValues → fn:'list' WITH a field): surfaces THAT field's
+// value from each linked record — the regression this change fixes (it used to
+// return each record's label, ignoring `field`).
+eq('lookup of a field lists that field, not the label', roll({ via: 'Tasks', field: 'Status', fn: 'list' }), 'Done, Doing, Todo');
+eq('lookup of a numeric field skips blanks', roll({ via: 'Tasks', field: 'Hours', fn: 'list' }), '5, 8');
+// A bare list with no field falls back to the linked records' labels.
+eq('list with no field falls back to labels', roll({ via: 'Tasks', fn: 'list' }), 'Design, Build, Ship');
+// concat / and / or aggregations
+eq('rollup concat of a field', roll({ via: 'Tasks', field: 'Name', fn: 'concat' }), 'Design, Build, Ship');
+eq('rollup and over a boolean field', roll({ via: 'Tasks', field: 'Done', fn: 'and' }), false);
+eq('rollup or over a boolean field', roll({ via: 'Tasks', field: 'Done', fn: 'or' }), true);
+
+// A lookup that pulls a multi-value field flattens its members rather than
+// emitting a JSON blob.
+const MULTI_STATE = {
+  entities: {
+    p1: proj,
+    t1: { _anchor: 't1', _type: 'Tasks', Tags: ['urgent', 'backend'] },
+    t2: { _anchor: 't2', _type: 'Tasks', Tags: ['frontend'] },
+  },
+  connections: [
+    { source: 'p1', target: 't1', type: 'Tasks' },
+    { source: 'p1', target: 't2', type: 'Tasks' },
+  ],
+};
+eq('lookup flattens a multi-value field',
+  Formula.evaluateRollup({ via: 'Tasks', field: 'Tags', fn: 'list' }, { record: proj, state: MULTI_STATE }).value,
+  'urgent, backend, frontend');
+
+// Guard rails: a rollup needs a relation, and a removed linked row drops out.
+check('rollup without `via` errors', Formula.evaluateRollup({ fn: 'count' }, { record: proj, state: ROLLUP_STATE }).ok === false);
+const REMOVED_STATE = {
+  entities: { p1: proj, t1: { ...taskA, _removed: true }, t2: taskB },
+  connections: [
+    { source: 'p1', target: 't1', type: 'Tasks' },
+    { source: 'p1', target: 't2', type: 'Tasks' },
+  ],
+};
+eq('rollup excludes _removed linked rows',
+  Formula.evaluateRollup({ via: 'Tasks', fn: 'count' }, { record: proj, state: REMOVED_STATE }).value, 1);
+
+// ROLLUP_FNS advertises every aggregation the UI offers.
+const RFNS = Formula.ROLLUP_FNS || [];
+for (const fn of ['sum', 'count', 'avg', 'min', 'max', 'list', 'concat', 'and', 'or']) {
+  check(`ROLLUP_FNS advertises ${fn}`, RFNS.includes(fn));
+}
+
 console.log('');
 if (failures) { console.log(`${failures} FAILED`); process.exit(1); }
 console.log('all formula checks passed');

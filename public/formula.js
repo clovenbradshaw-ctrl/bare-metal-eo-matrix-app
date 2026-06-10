@@ -549,9 +549,22 @@ function evaluateRollup(cfg, ctx) {
   }
 
   if (fn === 'count') return { ok: true, value: linked.length, error: null };
-  if (fn === 'list')  return { ok: true, value: linked.map(labelOf).join(', '), error: null };
 
   const field = cfg.field;
+
+  // `list` is what Airtable lookups (multipleLookupValues) and ARRAYUNIQUE/
+  // ARRAYCOMPACT rollups map to. WITH a target `field` it surfaces THAT field's
+  // value from each linked record — the actual looked-up column, not the
+  // record's label. WITHOUT a field it lists each linked record's label, which
+  // is what a bare link listing wants. Values are flattened so a looked-up
+  // multi-value field (multi-select, nested lookup) lists its members rather
+  // than rendering a JSON blob.
+  if (fn === 'list') {
+    const vals = field ? flatten(linked.map(e => e[field])) : linked.map(labelOf);
+    const out = vals.filter(v => v !== undefined && v !== null && v !== '').map(stringify).join(', ');
+    return { ok: true, value: out, error: null };
+  }
+
   if (!field) return { ok: false, value: null, error: 'rollup needs `field` for fn=' + fn };
   const raw = linked.map(e => e[field]).filter(v => v !== undefined && v !== null && v !== '');
 
