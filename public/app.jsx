@@ -92,6 +92,50 @@ function useDemoTitleOverrides() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Last-view memory — a refresh (or session resume) reopens the space and
+// view that were on screen instead of dropping back to the launchpad. The
+// data itself already survives (OPFS + the durable chain in live mode, the
+// demo store in demo mode); this remembers *where* the user was. Keyed by
+// user so one account never resumes into another's workspace.
+// ─────────────────────────────────────────────────────────────────────────
+
+const LAST_VIEW_KEY = 'matrix-events.lastView.v1';
+
+function loadLastView() {
+  try {
+    const raw = localStorage.getItem(LAST_VIEW_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    if (!v || typeof v !== 'object' || !v.user) return null;
+    return v;
+  } catch { return null; }
+}
+
+function saveLastView(user, roomId, selection) {
+  try {
+    if (roomId) {
+      localStorage.setItem(LAST_VIEW_KEY, JSON.stringify({ user, roomId, selection }));
+    } else {
+      // Back on the launchpad — a refresh should land there too. Only clear
+      // an entry that belongs to this user, so signing in and straight back
+      // out doesn't erase another account's resume point.
+      const cur = loadLastView();
+      if (!cur || cur.user === user) localStorage.removeItem(LAST_VIEW_KEY);
+    }
+  } catch {}
+}
+
+// Only resume into selections the view area knows how to render — a stale
+// entry from an older build must fall back to the default view, never to a
+// blank pane.
+function validSavedSelection(sel) {
+  if (!sel || typeof sel !== 'object') return false;
+  if (sel.kind === 'log' || sel.kind === 'sync') return true;
+  if (sel.kind !== 'slice') return false;
+  return ['table', 'schema', 'kanban', 'notebook', 'graph', 'timeline'].includes(sel.sliceKind);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Cold-start sync status — the bridge proactively pulls every workspace
 // back from its durable media-store chain on a fresh load. This hook
 // mirrors that progress; SyncIndicator renders it.
@@ -640,8 +684,9 @@ function App() {
 
   // Drop a stale currentRoomId if the underlying source no longer has
   // that room (e.g. demo data cleared, room deleted on another device).
-  // We deliberately do NOT auto-select a room — landing on the welcome
-  // screen is the desired flow.
+  // We deliberately do NOT auto-select a room for a fresh sign-in — landing
+  // on the welcome screen is the desired flow; resuming the last-open space
+  // after a refresh is handled separately below.
   useEffect(() => {
     if (!session) return;
     if (currentRoomId && !byRoom[currentRoomId]) {
@@ -678,6 +723,54 @@ function App() {
     if (isLive) return; // real Matrix persists on its own (OPFS + server)
     saveDemoStore(demoStore.byRoom, demoTitleOverrides);
   }, [isLive, demoStore.byRoom, demoTitleOverrides]);
+
+  // Resume where you left off: when this user's session lands (page refresh,
+  // vault auto-restore, or re-login after an expired session), reopen the
+  // space + view that were on screen last time. The saved space may not be in
+  // the rooms list on the very first render (the offline manifest / SDK sync
+  // can still be loading), so the attempt re-runs as the list settles — but
+  // only briefly after load, and never over a navigation the user already
+  // made. An explicit sign-out clears the memory (see handleSignOut), so a
+  // deliberate fresh sign-in still starts at the welcome screen.
+  const sessionUserKey = session ? (session.demo ? 'demo' : session.mxid) : null;
+  const restoredUserRef = useRef(null);
+  const mountTsRef = useRef(Date.now());
+  useEffect(() => {
+    if (!sessionUserKey) { restoredUserRef.current = null; return; }
+    if (restoredUserRef.current === sessionUserKey) return;
+    if (currentRoomId) { restoredUserRef.current = sessionUserKey; return; }
+    const saved = loadLastView();
+    if (!saved || saved.user !== sessionUserKey || !saved.roomId) {
+      restoredUserRef.current = sessionUserKey;
+      return;
+    }
+    if (!byRoom[saved.roomId]) {
+      // Rooms are still arriving — leave the attempt armed for the next list
+      // change, but stop teleporting once the user has settled on the
+      // launchpad for a while (a deleted room would otherwise re-arm forever).
+      if (Date.now() - mountTsRef.current > 15000) restoredUserRef.current = sessionUserKey;
+      return;
+    }
+    restoredUserRef.current = sessionUserKey;
+    setCurrentRoomId(saved.roomId);
+    if (validSavedSelection(saved.selection)) setSelection(saved.selection);
+  }, [sessionUserKey, currentRoomId, roomIds.join('|')]);
+
+  // …and remember the open space + view for that resume. Recording the
+  // launchpad (roomId = null) too means a refresh from the launchpad stays
+  // there instead of bouncing back into the last space. The first run per
+  // user is skipped: it fires in the same commit as the restore above, when
+  // currentRoomId still holds its pre-restore null — persisting that would
+  // clobber the very entry being restored.
+  const lastPersistKeyRef = useRef(null);
+  useEffect(() => {
+    if (!sessionUserKey) { lastPersistKeyRef.current = null; return; }
+    if (lastPersistKeyRef.current !== sessionUserKey) {
+      lastPersistKeyRef.current = sessionUserKey;
+      return;
+    }
+    saveLastView(sessionUserKey, currentRoomId, currentRoomId ? selection : null);
+  }, [sessionUserKey, currentRoomId, selection]);
 
   // Derived values needed by hooks below; computed before the auth gate so
   // the hook order is stable across signed-in / signed-out renders.
@@ -989,6 +1082,9 @@ function App() {
     if (isLive && window.MatrixLive) {
       try { await window.MatrixLive.logout(); } catch (e) { console.warn('[app] logout failed:', e); }
     }
+    // Deliberate sign-out: forget the resume point so the next sign-in
+    // starts at the welcome screen rather than inside the last space.
+    if (sessionUserKey) saveLastView(sessionUserKey, null, null);
     // Demo data is kept on disk on sign-out — the user can come back to
     // their spaces later. Use the "Clear all" tweak to nuke it explicitly.
     setSession(null);
