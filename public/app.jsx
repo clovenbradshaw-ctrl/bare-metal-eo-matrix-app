@@ -816,6 +816,33 @@ function App() {
     return () => { cancelled = true; timers.forEach(clearTimeout); };
   }, [importEntities, importRowsVersion, activeSet]);
 
+  // Imported rows don't live in the event log — they're reconstructed from the
+  // encrypted source blob in the media cache (OPFS) on a reload, or pulled from
+  // the homeserver media store on a cold device. Either way the bytes aren't
+  // readable the instant the fold restores: the vault has to unlock before the
+  // OPFS mirror can be decrypted, and a cold device has to sync far enough to
+  // fetch the blob. The materialize effect above re-attempts as `importEntities`
+  // settle, but its retry budget is bounded and the queue can drain *before*
+  // readiness lands — and once it has, nothing re-nudges it. That's the reload
+  // bug where the data is sitting in OPFS yet only appears after a manual
+  // sync-page refresh (which just bumps `importRowsVersion`).
+  //
+  // So: while any active import is still un-materialized, listen for the
+  // client-readiness signals — `session` (vault unlocked / session restored),
+  // `sync` (cold-sync pulling blobs into OPFS, fired per chunk), `rooms` (a
+  // workspace opened) — and re-run materialization on each. This is the manual
+  // refresh, automated; it self-unsubscribes the moment every import is local.
+  const importsPending = importEntities.some(e => !importRowsRef.current[e._anchor]);
+  useEffect(() => {
+    const ML = window.MatrixLive;
+    if (!isLive || !ML?.subscribe || !importsPending) return;
+    return ML.subscribe(reason => {
+      if (reason === 'session' || reason === 'sync' || reason === 'rooms') {
+        setImportRowsVersion(v => v + 1);
+      }
+    });
+  }, [isLive, importsPending]);
+
   // State the data views render from: the folded state plus any rows
   // reconstructed from imported source blobs. Real folded entities win on
   // anchor collisions, so editing a materialized row (which emits real
