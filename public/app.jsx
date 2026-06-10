@@ -834,6 +834,49 @@ function App() {
     return { ...state, entities };
   }, [state, importRowsVersion, activeImportAnchors]);
 
+  // Per-table sync transparency: for each set, how many records it SHOULD hold
+  // vs how many are actually materialized on this device. For imported sets the
+  // "should" is the row count recorded at import time (rows_imported), and the
+  // gap is rows still streaming out of the cached source blob; for native sets
+  // the records ARE the folded entities, so should === local. Drives the sync
+  // page and the sidebar's "out of date" dot.
+  const syncTables = useMemo(() => {
+    const declared = state.schema?.tables || [];
+    const names = Array.from(new Set([
+      ...declared,
+      ...Object.values(state.entities || {}).map(e => e._type),
+    ])).filter(n => n && !n.startsWith('_') && n !== 'import');
+
+    const rowsByType = {};
+    for (const e of Object.values(renderState.entities || {})) {
+      if (e._type) rowsByType[e._type] = (rowsByType[e._type] || 0) + 1;
+    }
+
+    return names.map(name => {
+      const imports = importEntities.filter(e => e.derived_set === name);
+      const isImport = imports.length > 0;
+      const expectedImported = imports.reduce((s, e) => s + (e.rows_imported || 0), 0);
+      const localRows = rowsByType[name] || 0;
+      return {
+        name,
+        localRows,
+        expected: isImport ? Math.max(expectedImported, localRows) : localRows,
+        isImport,
+        chunksTotal: imports.length,
+        chunksReady: imports.filter(e => importRowsRef.current[e._anchor]).length,
+        declared: declared.includes(name),
+      };
+    }).sort((a, b) => (b.expected - a.expected) || a.name.localeCompare(b.name));
+  }, [state, renderState, importEntities, importRowsVersion]);
+
+  // True when something about this workspace isn't fully local/sent yet:
+  // records still downloading, or edits queued in the outbox. Surfaced as a
+  // small dot on the sidebar's sync entry.
+  const syncOutOfDate = isLive && (
+    (window.MatrixLive?.getPendingCount?.() > 0) ||
+    syncTables.some(t => t.expected > t.localRows)
+  );
+
   // Gate the app on auth (or demo session) — every hook is above this line.
   // While the bridge is still trying to resume a session from the
   // sessionStorage vault stash, show a splash instead of flashing the
@@ -1155,6 +1198,7 @@ function App() {
           ephemeralsCount={ephemerals.length}
           onRenameRoom={onRenameCurrentRoom}
           lastEventTs={lastEventTs}
+          syncOutOfDate={syncOutOfDate}
         />
 
         <div className="view-area">
@@ -1176,6 +1220,19 @@ function App() {
               setHighlight={setHighlight}
               tweaks={tweaks}
               scrubber={scrubberEl}
+            />
+          )}
+          {selection.kind === 'sync' && (
+            <window.SyncView
+              room={rooms.find(r => r.id === currentRoomId)}
+              isLive={isLive}
+              session={session}
+              tables={syncTables}
+              committedCount={committedCount}
+              pendingPart={pendingPart.length}
+              eventsTotal={total}
+              scrubber={scrubberEl}
+              onRefreshTables={() => setImportRowsVersion(v => v + 1)}
             />
           )}
           {selection.kind === 'slice' && (selection.sliceKind === 'table') && (

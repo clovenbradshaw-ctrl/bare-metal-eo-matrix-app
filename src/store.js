@@ -473,6 +473,45 @@ export async function getStorageUsage() {
 }
 
 /**
+ * Walk the OPFS root once and bucket every file by what produced it, so the
+ * UI can show where the local copy of a workspace actually lives:
+ *   - room        — per-room append-only event logs (room_*.bin)
+ *   - checkpoint  — folded-state snapshots (room_*_checkpoint.bin)
+ *   - media       — vault-encrypted media mirror (imported dataset blobs,
+ *                   uploaded files) keyed by mxc (media_*)
+ *   - other       — anything else this origin parked in OPFS
+ *
+ * Returns byte + file counts per bucket plus a grand total. Best-effort:
+ * resolves to all-zeros when OPFS is unavailable rather than throwing.
+ */
+export async function getOpfsBreakdown() {
+  const empty = () => ({ files: 0, bytes: 0 });
+  const out = {
+    room: empty(), checkpoint: empty(), media: empty(), other: empty(),
+    totalFiles: 0, totalBytes: 0,
+  };
+  if (!await checkOPFS()) return out;
+  try {
+    const dir = await navigator.storage.getDirectory();
+    for await (const [name, handle] of dir) {
+      let size = 0;
+      try { size = (await handle.getFile()).size; } catch { continue; }
+      let bucket = out.other;
+      if (name.startsWith('room_') && name.endsWith('_checkpoint.bin')) bucket = out.checkpoint;
+      else if (name.startsWith('room_') && name.endsWith('.bin'))        bucket = out.room;
+      else if (name.startsWith('media_'))                                 bucket = out.media;
+      bucket.files++;
+      bucket.bytes += size;
+      out.totalFiles++;
+      out.totalBytes += size;
+    }
+  } catch (e) {
+    console.warn('[store] OPFS breakdown failed:', e?.message || e);
+  }
+  return out;
+}
+
+/**
  * Wipe every room file and checkpoint from OPFS. Called on logout.
  */
 export async function wipeAllRoomData() {
