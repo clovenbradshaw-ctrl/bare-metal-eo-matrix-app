@@ -30,7 +30,7 @@ import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          setMemberPowerLevel, onMembersChange, acceptInvite, onRoomChanges,
          onDecrypted, onLocalEchoUpdated, EventStatus,
          setName as mxSetRoomName, getDisplayName as mxGetDisplayName } from './rooms.js';
-import { EventStore } from './store.js';
+import { EventStore, requestPersistentStorage } from './store.js';
 import { vault, getLastUser } from './vault.js';
 import { OutboxFlusher, listAll as outboxListAll, pendingCount,
          onChange as onOutboxChange, remove as outboxRemove } from './outbox.js';
@@ -131,12 +131,32 @@ function freshSyncStatus() {
     roomsDone: 0,
     currentRoomId: null,
     currentRoomName: null,
+    blocksTotal: 0,         // manifest blocks to fetch for the current room
+    blocksDone: 0,          // manifest blocks fetched so far
     recovered: 0,           // events pulled back from the durable chain this pass
     errors: [],             // [{ roomId, name, message }]
   };
 }
 let syncStatus = freshSyncStatus();
 let coldSyncStarted = false;            // guards the once-per-session auto kick
+let durableStorageRequested = false;    // guards the once-per-session persist() ask
+
+// Pin OPFS/IndexedDB against automatic eviction so the local copy of a
+// workspace survives a tab close. Best-effort and asked once per session.
+async function ensureDurableStorage() {
+  if (durableStorageRequested) return;
+  durableStorageRequested = true;
+  try {
+    const r = await requestPersistentStorage();
+    if (!r.supported) {
+      logProgress('Persistent storage not supported here — local cache may be evicted by the browser');
+    } else if (r.persisted) {
+      logProgress('Local storage is persistent — your data stays on this device across tab closes');
+    } else {
+      logProgress('Browser declined persistent storage — local cache may be evicted; durable copy stays in the block chain');
+    }
+  } catch { /* best-effort */ }
+}
 
 function setSyncStatus(patch) {
   syncStatus = { ...syncStatus, ...patch };
@@ -495,6 +515,7 @@ async function afterAuth(userId, homeserver) {
   outboxFlusher.start();
 
   startMemoryGovernor();
+  ensureDurableStorage();
 
   if (unsubRoomChanges) unsubRoomChanges();
   unsubRoomChanges = onRoomChanges(() => {
@@ -541,6 +562,7 @@ async function afterAuthStale(userId, homeserver) {
   outboxFlusher.start();  // kick() is a no-op until getClient() comes back
 
   startMemoryGovernor();
+  ensureDurableStorage();
 
   if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
 
@@ -654,6 +676,7 @@ async function tearDownLiveState() {
   roomManifest = [];
   roomManifestKey = '';
   coldSyncStarted = false;
+  durableStorageRequested = false;
   syncStatus = freshSyncStatus();
 }
 
@@ -935,6 +958,7 @@ async function initBlockSync(roomId, store) {
   const ctx = {
     wck: null,
     head: null,            // { mxc, sha256, idx } of our own chain
+    manifest: null,        // { manifest, base } carried into the next append
     chained: new Set(),    // event_ids known to be in ANY member's chain
     queue: [],             // committed self events awaiting upload
     timer: null,
@@ -970,11 +994,31 @@ async function initBlockSync(roomId, store) {
 
   // DOWN: pull every member's chain and replay whatever the local store
   // is missing. store.append dedups by event_id, so events that also
-  // survived in the megolm timeline / OPFS cost nothing.
+  // survived in the megolm timeline / OPFS cost nothing. The manifest in
+  // room state lets loadChains fetch all blocks in parallel; we surface its
+  // progress through the same sync indicator the cold-sync drives, so the
+  // user sees a loading notification instead of a silent wait.
+  const drivesStatus = syncStatus.phase !== 'syncing';
+  if (drivesStatus) {
+    const roomName = listRooms().find(r => r.id === roomId)?.title || null;
+    setSyncStatus({
+      ...freshSyncStatus(),
+      phase: 'syncing',
+      startedAt: Date.now(),
+      roomsTotal: 1,
+      currentRoomId: roomId,
+      currentRoomName: roomName,
+    });
+  }
   try {
-    const { events, chainedIds, ownHead, partial } = await loadChains(NAMESPACE, roomId, wck);
+    const onProgress = drivesStatus
+      ? (done, total) => setSyncStatus({ blocksDone: done, blocksTotal: total })
+      : null;
+    const { events, chainedIds, ownHead, ownManifest, partial } =
+      await loadChains(NAMESPACE, roomId, wck, onProgress);
     ctx.chained = chainedIds;
     ctx.head = ownHead;
+    ctx.manifest = ownManifest;
     if (events.length) {
       const added = await store.append(events);
       if (added.length > 0) {
@@ -987,8 +1031,20 @@ async function initBlockSync(roomId, store) {
       }
     }
     if (partial) logProgress('Block chain partially unreadable — recovery may be incomplete');
+    if (drivesStatus) {
+      setSyncStatus({
+        phase: 'done', roomsDone: 1, finishedAt: Date.now(),
+        recovered: ctx.recovered, currentRoomId: null, currentRoomName: null,
+      });
+    }
   } catch (e) {
     logProgress(`Block chain read failed: ${e?.message || e}`);
+    if (drivesStatus) {
+      setSyncStatus({
+        phase: 'error', finishedAt: Date.now(),
+        errors: [...syncStatus.errors, { roomId, name: null, message: e?.message || String(e) }],
+      });
+    }
   }
 
   // UP: back-fill our own committed history the chain doesn't have yet.
@@ -1037,14 +1093,19 @@ async function flushBlockQueue(roomId) {
   const batch = ctx.queue.splice(0, BLOCK_MAX_EVENTS);
   try {
     // Another device of ours may have advanced the chain since we read
-    // it — extend its head rather than forking. Anything it already
-    // chained that we re-chain dedups on read.
+    // it — extend its head and manifest rather than forking. Anything it
+    // already chained that we re-chain dedups on read.
     const remote = await readOwnHead(NAMESPACE, roomId, activeSession?.mxid);
     if (remote?.head?.mxc && (!ctx.head || (remote.idx || 0) > ctx.head.idx)) {
       ctx.head = { ...remote.head, idx: remote.idx || 0 };
+      ctx.manifest = Array.isArray(remote.manifest) && remote.manifest.length
+        ? { manifest: remote.manifest, base: remote.manifestBase | 0 }
+        : null;
     }
 
-    ctx.head = await appendBlock(NAMESPACE, roomId, ctx.wck, batch, ctx.head);
+    const next = await appendBlock(NAMESPACE, roomId, ctx.wck, batch, ctx.head, ctx.manifest);
+    ctx.head = { mxc: next.mxc, sha256: next.sha256, idx: next.idx };
+    ctx.manifest = { manifest: next.manifest, base: next.base };
     ctx.failures = 0;
   } catch (e) {
     ctx.queue.unshift(...batch);

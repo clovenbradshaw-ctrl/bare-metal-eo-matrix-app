@@ -54,6 +54,29 @@ async function checkOPFS() {
   return opfsAvailable;
 }
 
+/**
+ * Ask the browser to make this origin's storage persistent. By default OPFS
+ * and IndexedDB are "best-effort" and the browser may evict them under
+ * storage pressure or when the last tab closes — which for a database app
+ * means the local copy of your data can vanish on tab close. A granted
+ * persist() exempts the origin from that automatic eviction (it can still
+ * be cleared by the user explicitly). Idempotent and best-effort: returns
+ * `{ supported, persisted }`, never throws.
+ */
+export async function requestPersistentStorage() {
+  try {
+    if (!navigator.storage?.persist) return { supported: false, persisted: false };
+    const already = navigator.storage.persisted
+      ? await navigator.storage.persisted()
+      : false;
+    if (already) return { supported: true, persisted: true };
+    const granted = await navigator.storage.persist();
+    return { supported: true, persisted: !!granted };
+  } catch (e) {
+    return { supported: false, persisted: false, error: e?.message || String(e) };
+  }
+}
+
 function roomFileName(roomId) {
   const h = fnv1a32(roomId);
   return `room_${h.toString(16).padStart(8, '0')}.bin`;
