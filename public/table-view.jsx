@@ -813,16 +813,93 @@ function DetailField({ value, type, onCommit }) {
   );
 }
 
+// Default config for the record-detail panel when no saved view is active.
+// A "detail view" is a named, persisted bundle that reshapes how one record's
+// fields are laid out — which show, in what order, and whether the meta
+// sections (partition, links, empty values) render. It lives in the log at
+// _schema.recordViews.<type>, so it syncs to every collaborator like any other
+// schema fact. This is the read-side twin of the grid's saved table views.
+const DEFAULT_DETAIL_CFG = {
+  hidden: [],        // field names hidden from the panel
+  order: [],         // explicit field-name order; unlisted fields keep schema order
+  showEmpty: true,   // render fields whose value is blank
+  showLinks: true,   // render the linked-record sections
+  showPartition: true, // render the _partition (SEG) control
+  twoCol: false,     // dense two-column field layout (most useful in fullscreen)
+};
+
+function normalizeDetailCfg(v) {
+  return {
+    hidden: Array.isArray(v?.hidden) ? v.hidden : [],
+    order: Array.isArray(v?.order) ? v.order : [],
+    showEmpty: v?.showEmpty !== false,
+    showLinks: v?.showLinks !== false,
+    showPartition: v?.showPartition !== false,
+    twoCol: !!v?.twoCol,
+  };
+}
+
+// Apply an explicit field-name order over the schema columns; any column not
+// named in `order` keeps its original position after the ordered ones.
+function orderDetailCols(cols, order) {
+  if (!order || !order.length) return cols;
+  const byName = new Map(cols.map(c => [c.name, c]));
+  const out = [];
+  for (const n of order) { if (byName.has(n)) { out.push(byName.get(n)); byName.delete(n); } }
+  for (const c of cols) if (byName.has(c.name)) out.push(c);
+  return out;
+}
+
 function RecordDetailPanel({
   record, records, entityType, room, cols, partitioned, linkedTypes, state, selectOptions,
   onClose, onCommitCell, onCommitPartition, onAddOption, onJump, onSelectRecord, onViewTimeline,
+  recordViews, activeViewId, onSelectView, onCreateView, onUpdateView, onDeleteView, onRenameView,
+  fullscreen, onToggleFullscreen,
 }) {
-  // Escape closes the panel. Re-registered per record so it stays live.
+  const [customizeOpen, setCustomizeOpen] = useState(false);
+  const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(null); // viewId being renamed, or null
+
+  const activeView = (recordViews || []).find(v => v.id === activeViewId) || null;
+
+  // Local working copy of the active view's config. Edits apply instantly to
+  // the panel; when a saved view is active they're persisted back to the log,
+  // mirroring how the grid's saved views auto-save filter/sort/hide changes.
+  const [cfg, setCfg] = useState(() => normalizeDetailCfg(activeView));
+  const prevViewIdRef = useRef(activeViewId);
+  const skipPersistRef = useRef(true);
   useEffect(() => {
-    function onKey(e) { if (e.key === 'Escape') onClose(); }
+    if (prevViewIdRef.current === activeViewId) return;
+    prevViewIdRef.current = activeViewId;
+    skipPersistRef.current = true;
+    setCfg(normalizeDetailCfg((recordViews || []).find(v => v.id === activeViewId)));
+  }, [activeViewId]);
+  useEffect(() => {
+    if (skipPersistRef.current) { skipPersistRef.current = false; return; }
+    if (activeViewId && onUpdateView) onUpdateView(activeViewId, cfg);
+  }, [cfg]);
+  const patchCfg = (patch) => setCfg(c => ({ ...c, ...patch }));
+
+  // Escape exits fullscreen first (so it's not a surprise close), then closes.
+  // Re-registered per record/state so it always sees the latest props.
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key !== 'Escape') return;
+      if (customizeOpen) { setCustomizeOpen(false); return; }
+      if (fullscreen) { onToggleFullscreen && onToggleFullscreen(false); return; }
+      onClose();
+    }
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, [onClose, fullscreen, customizeOpen, onToggleFullscreen]);
+
+  // Close the view/customize popovers on an outside click.
+  useEffect(() => {
+    if (!viewMenuOpen) return;
+    function onClick(e) { if (!e.target.closest('.rd-view-picker')) setViewMenuOpen(false); }
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, [viewMenuOpen]);
 
   const idx = records.findIndex(r => r._anchor === record._anchor);
   const prev = idx > 0 ? records[idx - 1] : null;
@@ -834,13 +911,118 @@ function RecordDetailPanel({
   const title = (titleVal === undefined || titleVal === null || titleVal === '')
     ? record._anchor : String(titleVal);
 
+  // Resolve the field set the active config actually renders.
+  const orderedCols = orderDetailCols(cols, cfg.order);
+  const orderedNames = orderedCols.map(c => c.name);
+  function isBlankField(c) {
+    const v = record[c.name];
+    return v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0);
+  }
+  const visibleCols = orderedCols.filter(c => !cfg.hidden.includes(c.name));
+  // showEmpty only gates plain data fields; derived (formula/rollup) always show.
+  const shownCols = visibleCols.filter(c =>
+    cfg.showEmpty || c.type === 'formula' || c.type === 'rollup' || !isBlankField(c)
+  );
+
+  function moveField(name, dir) {
+    const arr = [...orderedNames];
+    const i = arr.indexOf(name);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= arr.length) return;
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+    patchCfg({ order: arr });
+  }
+  function toggleFieldHidden(name) {
+    const hidden = new Set(cfg.hidden);
+    if (hidden.has(name)) hidden.delete(name); else hidden.add(name);
+    patchCfg({ hidden: [...hidden] });
+  }
+
+  const viewName = activeView ? activeView.name : 'all fields';
+
   return (
-    <div className="record-detail-backdrop" onClick={onClose}>
-      <aside className="record-detail-panel" role="dialog" aria-label="record details" onClick={e => e.stopPropagation()}>
+    <div className={`record-detail-backdrop ${fullscreen ? 'rd-fs-backdrop' : ''}`} onClick={onClose}>
+      <aside
+        className={`record-detail-panel ${fullscreen ? 'rd-fullscreen' : ''} ${cfg.twoCol && fullscreen ? 'rd-twocol' : ''}`}
+        role="dialog"
+        aria-label="record details"
+        onClick={e => e.stopPropagation()}
+      >
         <header className="rd-head">
           <div className="rd-head-top">
             <span className="rd-eyebrow">{room?.title || 'workspace'} · {entityType}</span>
             <div className="rd-head-nav">
+              <div className="rd-view-picker">
+                <button
+                  className={`rd-tool-btn ${viewMenuOpen ? 'on' : ''}`}
+                  title="switch detail view"
+                  onClick={() => setViewMenuOpen(o => !o)}
+                >
+                  <i className="ph ph-cards-three" aria-hidden="true"></i>
+                  <span className="rd-view-name">{viewName}</span>
+                  <span className="rd-caret">▾</span>
+                </button>
+                {viewMenuOpen && (
+                  <div className="rd-view-menu" role="menu">
+                    <button
+                      className={`rd-view-row ${!activeViewId ? 'on' : ''}`}
+                      onClick={() => { onSelectView(null); setViewMenuOpen(false); }}
+                    >
+                      <i className="ph ph-list" aria-hidden="true"></i>
+                      <span className="rd-view-row-name">all fields</span>
+                      {!activeViewId && <span className="rd-view-check">✓</span>}
+                    </button>
+                    {(recordViews || []).map(v => (
+                      <div className={`rd-view-row ${activeViewId === v.id ? 'on' : ''}`} key={v.id}>
+                        {renaming === v.id ? (
+                          <input
+                            className="rd-view-rename"
+                            autoFocus
+                            defaultValue={v.name}
+                            onClick={e => e.stopPropagation()}
+                            onBlur={e => { onRenameView(v.id, e.target.value); setRenaming(null); }}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter') { onRenameView(v.id, e.target.value); setRenaming(null); }
+                              else if (e.key === 'Escape') setRenaming(null);
+                            }}
+                          />
+                        ) : (
+                          <button
+                            className="rd-view-row-main"
+                            onClick={() => { onSelectView(v.id); setViewMenuOpen(false); }}
+                          >
+                            <i className="ph ph-cards-three" aria-hidden="true"></i>
+                            <span className="rd-view-row-name">{v.name}</span>
+                            {activeViewId === v.id && <span className="rd-view-check">✓</span>}
+                          </button>
+                        )}
+                        <button className="rd-view-mini" title="rename view" onClick={(e) => { e.stopPropagation(); setRenaming(v.id); }}>✎</button>
+                        <button className="rd-view-mini" title="delete view" onClick={(e) => { e.stopPropagation(); onDeleteView(v.id); }}>×</button>
+                      </div>
+                    ))}
+                    <button
+                      className="rd-view-new"
+                      onClick={() => { onCreateView(cfg); setViewMenuOpen(false); }}
+                    >
+                      <i className="ph ph-plus" aria-hidden="true"></i> save current as new view
+                    </button>
+                  </div>
+                )}
+              </div>
+              <button
+                className={`rd-tool-btn rd-icon-btn ${customizeOpen ? 'on' : ''}`}
+                title="customize this view"
+                onClick={() => setCustomizeOpen(o => !o)}
+              >
+                <i className="ph ph-sliders-horizontal" aria-hidden="true"></i>
+              </button>
+              <button
+                className="rd-tool-btn rd-icon-btn"
+                title={fullscreen ? 'collapse to side panel · esc' : 'expand to full screen'}
+                onClick={() => onToggleFullscreen && onToggleFullscreen(!fullscreen)}
+              >
+                <i className={`ph ph-${fullscreen ? 'arrows-in' : 'arrows-out'}`} aria-hidden="true"></i>
+              </button>
               <button className="rd-nav-btn" disabled={!prev} title="previous record" onClick={() => prev && onSelectRecord(prev._anchor)}>‹</button>
               <span className="rd-nav-count">{idx >= 0 ? idx + 1 : '–'} / {records.length}</span>
               <button className="rd-nav-btn" disabled={!next} title="next record" onClick={() => next && onSelectRecord(next._anchor)}>›</button>
@@ -851,8 +1033,49 @@ function RecordDetailPanel({
           <code className="rd-anchor" title="permanent anchor id">{record._anchor}</code>
         </header>
 
+        {customizeOpen && (
+          <div className="rd-customize">
+            <div className="rd-cz-eyebrow">
+              layout
+              {activeViewId && <span className="rd-cz-saved" title="changes save to this view automatically">· auto-saving to “{viewName}”</span>}
+            </div>
+            <div className="rd-cz-toggles">
+              <button className={`rd-cz-toggle ${cfg.showEmpty ? 'on' : ''}`} onClick={() => patchCfg({ showEmpty: !cfg.showEmpty })}>
+                <i className={`ph ph-${cfg.showEmpty ? 'check-square' : 'square'}`} aria-hidden="true"></i> empty fields
+              </button>
+              <button className={`rd-cz-toggle ${cfg.showPartition ? 'on' : ''}`} onClick={() => patchCfg({ showPartition: !cfg.showPartition })}>
+                <i className={`ph ph-${cfg.showPartition ? 'check-square' : 'square'}`} aria-hidden="true"></i> partition
+              </button>
+              <button className={`rd-cz-toggle ${cfg.showLinks ? 'on' : ''}`} onClick={() => patchCfg({ showLinks: !cfg.showLinks })}>
+                <i className={`ph ph-${cfg.showLinks ? 'check-square' : 'square'}`} aria-hidden="true"></i> links
+              </button>
+              <button className={`rd-cz-toggle ${cfg.twoCol ? 'on' : ''}`} onClick={() => patchCfg({ twoCol: !cfg.twoCol })} title="two-column layout (in full screen)">
+                <i className={`ph ph-${cfg.twoCol ? 'check-square' : 'square'}`} aria-hidden="true"></i> two columns
+              </button>
+            </div>
+            <div className="rd-cz-eyebrow">fields · drag-free reorder &amp; hide</div>
+            <div className="rd-cz-fields">
+              {orderedCols.map((c, i) => {
+                const hidden = cfg.hidden.includes(c.name);
+                return (
+                  <div className={`rd-cz-field ${hidden ? 'is-hidden' : ''}`} key={c.name}>
+                    <button className="rd-cz-eye" title={hidden ? 'show field' : 'hide field'} onClick={() => toggleFieldHidden(c.name)}>
+                      <i className={`ph ph-${hidden ? 'eye-slash' : 'eye'}`} aria-hidden="true"></i>
+                    </button>
+                    <span className="rd-cz-name">{c.name}</span>
+                    <span className="rd-cz-type">{c.type}</span>
+                    <button className="rd-cz-move" title="move up" disabled={i === 0} onClick={() => moveField(c.name, -1)}>↑</button>
+                    <button className="rd-cz-move" title="move down" disabled={i === orderedCols.length - 1} onClick={() => moveField(c.name, 1)}>↓</button>
+                  </div>
+                );
+              })}
+              {orderedCols.length === 0 && <div className="rd-cz-empty">no fields yet</div>}
+            </div>
+          </div>
+        )}
+
         <div className="rd-body">
-          {partitioned && (
+          {partitioned && cfg.showPartition && (
             <div className="rd-field">
               <label className="rd-label">_partition <span className="rd-type">SEG</span></label>
               <DetailField
@@ -863,7 +1086,7 @@ function RecordDetailPanel({
             </div>
           )}
 
-          {linkedTypes.map(t => {
+          {cfg.showLinks && linkedTypes.map(t => {
             const links = linksFromAnchor(record._anchor, t, state);
             return (
               <div className="rd-field" key={`link-${t}`}>
@@ -884,7 +1107,7 @@ function RecordDetailPanel({
             );
           })}
 
-          {cols.map(c => {
+          {shownCols.map(c => {
             if (c.type === 'formula') {
               const r = (window.Formula && window.Formula.evaluate)
                 ? window.Formula.evaluate(c.formula, { record, state })
@@ -938,6 +1161,12 @@ function RecordDetailPanel({
 
           {cols.length === 0 && (
             <div className="rd-empty-state">no fields yet · add a field from the grid header</div>
+          )}
+          {cols.length > 0 && shownCols.length === 0 && (
+            <div className="rd-empty-state">
+              every field is hidden or empty in this view ·{' '}
+              <button className="tv-inline-link" onClick={() => setCustomizeOpen(true)}>customize</button>
+            </div>
           )}
         </div>
 
@@ -1297,6 +1526,10 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   const [colMenu, setColMenu] = useState(null);
   // Anchor of the record whose detail side panel is open, or null.
   const [detailAnchor, setDetailAnchor] = useState(null);
+  // Detail-panel view state, lifted here so it survives prev/next navigation
+  // and reopening a record within the same grid session.
+  const [detailViewId, setDetailViewId] = useState(null); // active saved detail view, or null = "all fields"
+  const [detailFullscreen, setDetailFullscreen] = useState(false);
   // View controls. Seeded from the saved view (if this is one) so a view
   // remembers its own filters/sorts/hidden fields — Airtable-style. When this
   // table is rendered as a *saved* view (onUpdateView present), changes are
@@ -1603,6 +1836,35 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   }
   function commitPartition(anchor, partition) {
     onEmit(TV_OP.SEG, { anchor, partition });
+  }
+
+  // ── Detail (record) views ───────────────────────────────────────────────
+  // Persisted per entity type at _schema.recordViews.<type>. Same encrypted
+  // log as the data, so a saved record layout syncs to every collaborator —
+  // the read-side counterpart to the grid's saved table views.
+  const recordViews = state.schema?.recordViews?.[entityType] || [];
+  function writeRecordViews(next) {
+    onEmit(TV_OP.DEF, { anchor: null, path: `_schema.recordViews.${entityType}`, value: next });
+  }
+  function createRecordView(cfg) {
+    const id = 'rv' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
+    const n = recordViews.length + 2; // built-in "all fields" is #1
+    const view = { id, name: `Detail ${n}`, ...normalizeDetailCfg(cfg) };
+    writeRecordViews([...recordViews, view]);
+    setDetailViewId(id);
+    return view;
+  }
+  function updateRecordView(id, patch) {
+    writeRecordViews(recordViews.map(v => v.id === id ? { ...v, ...patch } : v));
+  }
+  function renameRecordView(id, name) {
+    const n = (name || '').trim();
+    if (!n) return;
+    updateRecordView(id, { name: n });
+  }
+  function deleteRecordView(id) {
+    writeRecordViews(recordViews.filter(v => v.id !== id));
+    if (detailViewId === id) setDetailViewId(null);
   }
 
   // Effective options for each select/multiselect column: declared options
@@ -2058,6 +2320,15 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             linkedTypes={linkedTypes}
             state={state}
             selectOptions={selectOptions}
+            recordViews={recordViews}
+            activeViewId={detailViewId}
+            onSelectView={setDetailViewId}
+            onCreateView={createRecordView}
+            onUpdateView={updateRecordView}
+            onDeleteView={deleteRecordView}
+            onRenameView={renameRecordView}
+            fullscreen={detailFullscreen}
+            onToggleFullscreen={setDetailFullscreen}
             onClose={() => setDetailAnchor(null)}
             onCommitCell={commitCell}
             onCommitPartition={commitPartition}
