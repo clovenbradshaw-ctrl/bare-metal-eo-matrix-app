@@ -174,7 +174,7 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .proj-modal-create:disabled{background:var(--text-faint);border-color:var(--text-faint);cursor:not-allowed}
 
 /* ── Inline +column header (airtable) ────────────────────────────────── */
-.dbgrid th.add-col{width:48px;padding:0;background:var(--surface-3);border-left:1px dashed var(--border);position:relative;overflow:visible}
+.dbgrid th.add-col{width:48px;padding:0;background:var(--surface-3);border-left:1px dashed var(--border);position:sticky;top:0;z-index:3;overflow:visible}
 .dbgrid .add-col-btn{width:100%;height:100%;min-height:30px;background:transparent;border:none;cursor:pointer;color:var(--text-dim);font-size:16px;font-weight:700;font-family:var(--mono)}
 .dbgrid .add-col-btn:hover{background:#fff;color:#000}
 .dbgrid th.renaming{background:#fff}
@@ -421,6 +421,19 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 
 .dbtable-scroll{overflow-x:auto;max-width:100%}
 
+/* Frozen header: when an entity grid is the body's content, let the grid fill
+   the body and own its own scrolling. The table head, view toolbar, and the
+   column-header row then stay pinned at the top while only the rows scroll —
+   the way Airtable freezes its header. Vertical scroll has to live on the same
+   box the sticky <thead> sticks to (.dbtable-scroll), so the body itself must
+   not scroll here, or the header would ride away with it. */
+.tv-body.tv-body-grid{overflow:hidden}
+.tv-body.tv-body-grid .dbtable{flex:1;min-height:0;display:flex;flex-direction:column}
+.tv-body.tv-body-grid .dbtable > .ddl,
+.tv-body.tv-body-grid .dbtable-head,
+.tv-body.tv-body-grid .tv-toolbar{flex-shrink:0}
+.tv-body.tv-body-grid .dbtable-scroll{flex:1;min-height:0;overflow:auto}
+
 /* ── View controls toolbar (sort / filter / hide) ────────────────────────
    Projection-local: reshapes the grid without emitting any events. */
 .tv-toolbar{position:relative;display:flex;align-items:center;gap:6px;padding:6px 12px;border-bottom:1px solid var(--border);background:var(--surface-2);flex-wrap:wrap}
@@ -524,7 +537,7 @@ table.dbgrid:not(.schema-grid) th,table.dbgrid:not(.schema-grid) td{min-width:va
 table.dbgrid th.add-col,table.dbgrid td.add-col-spacer,table.dbgrid td.row-expand{min-width:0}
 table.dbgrid th.add-col{overflow:visible}
 table.dbgrid th:last-child,table.dbgrid td:last-child{border-right:none}
-table.dbgrid thead th{background:var(--surface-3);color:var(--text);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:1.3px;position:sticky;top:0;border-bottom:2px solid var(--border-strong)}
+table.dbgrid thead th{background:var(--surface-3);color:var(--text);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:1.3px;position:sticky;top:0;z-index:3;border-bottom:2px solid var(--border-strong);box-shadow:inset 0 -2px 0 var(--border-strong)}
 table.dbgrid thead th .ty{font-size:10.5px;color:var(--triad-structure);text-transform:none;letter-spacing:.2px;margin-left:6px;font-weight:600;display:inline-flex;align-items:center;vertical-align:middle}
 table.dbgrid thead th .ty i.ph{font-size:13px;line-height:1;color:var(--triad-structure)}
 table.dbgrid thead th.pk .ty i.ph,
