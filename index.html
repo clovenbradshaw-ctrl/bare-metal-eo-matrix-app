@@ -83,7 +83,10 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .sb-caret{display:inline-block;width:10px;font-size:9px;color:var(--text-dim);transition:transform .12s ease}
 .sb-caret.open{transform:rotate(90deg)}
 .sb-table-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sb-table-count{font-size:10.5px;color:var(--text-dim);padding:0 6px;border:1px solid var(--border);background:#fff;font-weight:500}
+.sb-table-count{font-size:10.5px;color:var(--text-dim);padding:0 6px;border:1px solid var(--border);background:#fff;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
+.sb-table-count.syncing{display:inline-flex;align-items:center;gap:4px;color:var(--triad-structure);border-color:var(--triad-structure)}
+.sb-table-count.syncing .sb-count-sep{opacity:.5;margin:0 1px}
+.sb-sync-dot{width:6px;height:6px;border-radius:50%;background:var(--triad-structure);flex-shrink:0;animation:sync-pulse 1s ease-in-out infinite}
 .sb-unschematized{color:var(--signal);font-weight:700}
 .sb-slices{display:flex;flex-direction:column;padding-bottom:4px}
 .sb-slice{display:flex;align-items:center;gap:8px;padding:5px 14px 5px 30px;background:transparent;border:none;border-left:3px solid transparent;color:var(--text);cursor:pointer;font-family:var(--mono);font-size:12px;text-align:left;font-weight:500}

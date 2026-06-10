@@ -338,7 +338,7 @@ function Sidebar({
   room, state, selection, setSelection, onCreateTable,
   onCreateView, onRenameView, onDuplicateView, onDeleteView,
   eventsTotal, ephemeralsCount, onRenameRoom, lastEventTs, onAirtableSchema,
-  syncOutOfDate,
+  syncOutOfDate, syncByTable,
 }) {
   const { sets, meta, raw } = useMemo(() => buildSets(state), [state]);
   const allSets = [...sets, ...meta];
@@ -391,6 +391,28 @@ function Sidebar({
     setCollapsed(s => ({ ...s, [t.id]: false }));
   }
 
+  // The count badge on a set. For imported sets we know up-front how many rows
+  // there *should* be (the import op-event carries it), so we show that target
+  // instantly — `materialized / expected` with a sync dot — while the rows
+  // stream in from the source blob. Once complete (or for native sets) it's
+  // just the row count.
+  function renderSetCount(t) {
+    const info = syncByTable?.[t.id];
+    if (info && info.isImport && info.expected > info.localRows) {
+      const title = `${info.localRows} of ${info.expected} records downloaded`
+        + (info.chunksTotal > 1 ? ` · ${info.chunksReady}/${info.chunksTotal} chunks` : '')
+        + ' — the rest stream in automatically';
+      return (
+        <span className="sb-table-count syncing" title={title}>
+          <span className="sb-sync-dot" aria-hidden="true" />
+          {info.localRows}<span className="sb-count-sep">/</span>{info.expected}
+        </span>
+      );
+    }
+    const total = info ? info.expected : t.rows;
+    return <span className="sb-table-count" title={`${total} record${total === 1 ? '' : 's'}`}>{total}</span>;
+  }
+
   function renderSet(t) {
     const open = isOpen(t.id);
     const isSchemaActive = selection.kind === 'slice' && selection.tableId === t.id && selection.sliceKind === 'schema';
@@ -413,7 +435,7 @@ function Sidebar({
             {!t.declared && t.kind !== 'meta' && (
               <span className="sb-unschematized" title="not in _schema.tables">?</span>
             )}
-            <span className="sb-table-count">{t.rows}</span>
+            {renderSetCount(t)}
           </button>
           {t.kind !== 'meta' && (
             <button

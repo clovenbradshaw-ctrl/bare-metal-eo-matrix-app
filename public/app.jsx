@@ -959,6 +959,15 @@ function App() {
     }).sort((a, b) => (b.expected - a.expected) || a.name.localeCompare(b.name));
   }, [state, renderState, importEntities, importRowsVersion]);
 
+  // Lookup by set name so the sidebar can show each table's "should have N /
+  // syncing" state instantly — the expected count comes from the import
+  // op-event (folds immediately), independent of the slow row download.
+  const syncByTable = useMemo(() => {
+    const m = {};
+    for (const t of syncTables) m[t.name] = t;
+    return m;
+  }, [syncTables]);
+
   // True when something about this workspace isn't fully local/sent yet:
   // records still downloading, or edits queued in the outbox. Surfaced as a
   // small dot on the sidebar's sync entry.
@@ -1289,6 +1298,7 @@ function App() {
           onRenameRoom={onRenameCurrentRoom}
           lastEventTs={lastEventTs}
           syncOutOfDate={syncOutOfDate}
+          syncByTable={syncByTable}
         />
 
         <div className="view-area">
