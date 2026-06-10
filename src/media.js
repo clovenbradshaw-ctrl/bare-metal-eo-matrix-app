@@ -399,6 +399,15 @@ export async function fetchMxcBytes(mxc) {
   return null;
 }
 
+// In-flight downloads keyed by mxc. Imported tables materialize many chunks
+// at once, and a single blob can be referenced by more than one caller; this
+// coalesces concurrent reads of the same mxc onto one network round-trip +
+// decrypt instead of N. It also closes the small race opened by the
+// write-behind cache below (the OPFS mirror isn't populated synchronously, so
+// without this a second reader arriving mid-download would miss the cache and
+// re-fetch). Entries are cleared as soon as the bytes resolve.
+const inFlightMedia = new Map();           // mxc -> Promise<Uint8Array|null>
+
 /**
  * Fetch the plaintext bytes referenced by a `__media` envelope.
  * Tries the local mirror first; falls back to the homeserver media
@@ -414,10 +423,13 @@ export async function getMediaBytes(ref) {
   const cached = await getCachedMediaBytes(ref.mxc);
   if (cached) return cached;
 
-  const downloaded = await fetchMxcBytes(ref.mxc);
-  if (!downloaded) return null;
+  const existing = inFlightMedia.get(ref.mxc);
+  if (existing) return existing;
 
-  try {
+  const job = (async () => {
+    const downloaded = await fetchMxcBytes(ref.mxc);
+    if (!downloaded) return null;
+
     let plaintext;
     if (ref.__media === 2 && ref.file) {
       plaintext = await decryptAttachment(downloaded, ref.file);
@@ -425,12 +437,24 @@ export async function getMediaBytes(ref) {
       // Legacy plaintext upload.
       plaintext = downloaded;
     }
-    await cacheMediaBytes(ref.mxc, plaintext);
+    // Write-behind the OPFS mirror. Caching means a second AES pass (vault
+    // re-encrypt) plus a disk write over the whole blob; awaiting it here
+    // would stall the caller — the import materializer waiting on these
+    // bytes to parse rows — behind that work for every chunk. The plaintext
+    // is already in hand, so hand it back immediately and let the mirror
+    // populate in the background. Worst case (tab closes mid-write) the blob
+    // simply re-downloads next session, exactly as if it were never cached.
+    cacheMediaBytes(ref.mxc, plaintext).catch(() => {});
     return plaintext;
-  } catch (e) {
+  })().catch(e => {
     console.warn('[media] decrypt failed:', e?.message || e);
     return null;
-  }
+  }).finally(() => {
+    inFlightMedia.delete(ref.mxc);
+  });
+
+  inFlightMedia.set(ref.mxc, job);
+  return job;
 }
 
 /**
