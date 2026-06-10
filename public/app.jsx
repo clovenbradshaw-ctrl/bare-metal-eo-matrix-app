@@ -831,7 +831,46 @@ function App() {
     const entities = {};
     for (const a of anchors) for (const row of byAnchor[a]) entities[row._anchor] = row;
     Object.assign(entities, state.entities);
-    return { ...state, entities };
+
+    // Resolve Airtable record-link fields into live connections. Each imported
+    // row carries a hidden `_recordId` (its own Airtable id) and `_linkRefs`
+    // (per link-field arrays of TARGET record ids). With a record-id → anchor
+    // index across every materialized table, those become the same CON edges a
+    // hand-drawn link produces — so link columns populate without per-row
+    // events. Falls back to the folded connections when there's nothing to add.
+    let connections = state.connections;
+    const idIndex = new Map();
+    let hasLinkRefs = false;
+    for (const a of anchors) {
+      for (const row of byAnchor[a]) {
+        if (row._recordId) idIndex.set(row._recordId, row._anchor);
+        if (row._linkRefs) hasLinkRefs = true;
+      }
+    }
+    if (hasLinkRefs && idIndex.size) {
+      const derived = [];
+      const seen = new Set();
+      for (const a of anchors) {
+        for (const row of byAnchor[a]) {
+          const refs = row._linkRefs;
+          if (!refs) continue;
+          for (const field of Object.keys(refs)) {
+            const { rel, ids } = refs[field];
+            for (const id of ids) {
+              const target = idIndex.get(id);
+              if (!target || target === row._anchor) continue;
+              const key = row._anchor + '|' + target + '|' + (rel || field);
+              if (seen.has(key)) continue;
+              seen.add(key);
+              derived.push({ source: row._anchor, target, type: rel || field, _derived: 'airtable' });
+            }
+          }
+        }
+      }
+      if (derived.length) connections = [...state.connections, ...derived];
+    }
+
+    return { ...state, entities, connections };
   }, [state, importRowsVersion, activeImportAnchors]);
 
   // Per-table sync transparency: for each set, how many records it SHOULD hold

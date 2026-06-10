@@ -131,13 +131,29 @@
     return out;
   }
 
-  // Plan for materializing imported records: only the fields that carry DATA.
-  // Computed columns derive at render time and linked columns are CON edges, so
-  // both are excluded — exactly the fields the CSV/JSON importer would refuse.
+  // Plan for materializing imported records.
+  //
+  //  - DATA fields (text/number/…) materialize as normal cell values.
+  //  - COMPUTED columns (formula/rollup) derive at render time → excluded.
+  //  - LINKED columns hold arrays of Airtable record ids. They don't render as
+  //    cells; instead they materialize into a hidden `_linkRefs` map (tagged
+  //    with `link`) that the app resolves into live CON edges once every
+  //    table's record ids are indexed — that's what makes link columns
+  //    actually populate after an import.
+  //  - The source record's own Airtable id is always captured into a hidden
+  //    `_recordId` field (jsonKey `__id`) so links can point AT this row even
+  //    though that id is never shown as a column.
   function dataFieldPlan(fields) {
-    return fields
+    const plan = fields
       .filter(f => f.type !== 'formula' && f.type !== 'rollup' && f.type !== 'linked')
       .map(f => ({ name: f.name, type: f.type, jsonKey: f.name }));
+    plan.push({ name: '_recordId', type: 'text', jsonKey: '__id' });
+    for (const f of fields) {
+      if (f.type === 'linked' && f.linkedTable) {
+        plan.push({ name: f.name, type: 'linked', jsonKey: f.name, link: { to: f.linkedTable, rel: f.name } });
+      }
+    }
+    return plan;
   }
 
   // Airtable attachment fields come back as arrays of { url, filename, … }
@@ -225,6 +241,10 @@
           const f = (r && r.fields) || {};
           const row = {};
           for (const k of Object.keys(f)) row[k] = summarizeAttachments(f[k]);
+          // Preserve the record id under a reserved key (set last so it wins
+          // over any same-named field). Link fields keep their raw record-id
+          // arrays in the blob — the materializer reads both back via the plan.
+          if (r && r.id) row.__id = r.id;
           buffer.push(row);
           total++;
         }

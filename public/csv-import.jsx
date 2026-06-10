@@ -693,6 +693,17 @@
         _materialized: importEntity._anchor,
       };
       for (const f of fieldPlan) {
+        // Linked fields don't become a cell — they hold arrays of foreign
+        // record ids that resolve into CON edges once every table is indexed.
+        // Stash them in a hidden _linkRefs map keyed by field name.
+        if (f.link) {
+          const ids = raw?.[f.jsonKey];
+          if (Array.isArray(ids) && ids.length) {
+            if (!out._linkRefs) out._linkRefs = {};
+            out._linkRefs[f.name] = { to: f.link.to, rel: f.link.rel || f.name, ids: ids.map(String) };
+          }
+          continue;
+        }
         const v = isJson
           ? coerceJsonValue(raw?.[f.jsonKey], f.type)
           : coerce(raw[f.csvIdx], f.type);
