@@ -377,10 +377,56 @@ function Notebook({ state }) {
 // Create-board flow — schema-driven, writes DEF events into the log.
 // ─────────────────────────────────────────────────────────────────────────
 
+// Field types offered when defining a new board's entity type. Mirrors the
+// table schema editor's picker, minus the computed types (formula/rollup) —
+// those need extra params this quick form can't capture, and are better added
+// later from the set's schema view. Kept local so app-view needs no import.
+const BOARD_FIELD_TYPES = [
+  { value: 'text',        label: 'text'          },
+  { value: 'longtext',    label: 'long text'     },
+  { value: 'number',      label: 'number'        },
+  { value: 'boolean',     label: 'checkbox'      },
+  { value: 'select',      label: 'single-select' },
+  { value: 'multiselect', label: 'multi-select'  },
+  { value: 'date',        label: 'date'          },
+  { value: 'url',         label: 'url'           },
+  { value: 'email',       label: 'email'         },
+  { value: 'json',        label: 'json'          },
+];
+
 function CreateBoardForm({ state, onEmit, onCancel }) {
   const [typeName, setTypeName] = React.useState('task');
   const [partitions, setPartitions] = React.useState('todo, doing, done');
+  // The field(s) each card is created with. Defaults to a single text field
+  // named "title" — the shape the board used to hardcode — so an untouched form
+  // behaves exactly as before, but now every part of it is editable.
+  const [fields, setFields] = React.useState([{ name: 'title', type: 'text' }]);
   const existingTables = state.schema?.tables || [];
+
+  function updateField(i, patch) {
+    setFields(fs => fs.map((f, idx) => (idx === i ? { ...f, ...patch } : f)));
+  }
+  function addField() {
+    setFields(fs => [...fs, { name: '', type: 'text' }]);
+  }
+  function removeField(i) {
+    setFields(fs => (fs.length === 1 ? fs : fs.filter((_, idx) => idx !== i)));
+  }
+
+  // Trim names, drop blanks, de-dupe — then guarantee at least one field so a
+  // card always has something to title it.
+  function cleanFields() {
+    const seen = new Set();
+    const out = [];
+    for (const f of fields) {
+      const name = (f.name || '').trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, type: f.type || 'text' });
+    }
+    if (out.length === 0) out.push({ name: 'title', type: 'text' });
+    return out;
+  }
 
   function commit() {
     const name = typeName.trim();
@@ -390,11 +436,18 @@ function CreateBoardForm({ state, onEmit, onCancel }) {
     const newTables = existingTables.includes(name) ? existingTables : [...existingTables, name];
     // 1. declare table
     onEmit(AV_OP.DEF, { anchor: null, path: '_schema.tables', value: newTables });
-    // 2. fields — title is the minimum
-    if (!state.schema?.fields?.[name]) {
-      onEmit(AV_OP.DEF, { anchor: null, path: `_schema.fields.${name}`, value: [
-        { name: 'title', type: 'text' },
-      ]});
+    // 2. fields — whatever the user asked for. Never clobber an existing type's
+    //    columns; only append the ones it doesn't already have.
+    const desired = cleanFields();
+    const existing = state.schema?.fields?.[name] || [];
+    if (existing.length === 0) {
+      onEmit(AV_OP.DEF, { anchor: null, path: `_schema.fields.${name}`, value: desired });
+    } else {
+      const have = new Set(existing.map(f => f.name));
+      const additions = desired.filter(f => !have.has(f.name));
+      if (additions.length) {
+        onEmit(AV_OP.DEF, { anchor: null, path: `_schema.fields.${name}`, value: [...existing, ...additions] });
+      }
     }
     // 3. partitions — required for kanban
     onEmit(AV_OP.DEF, { anchor: null, path: `_schema.partitions.${name}`, value: parts });
@@ -421,6 +474,46 @@ function CreateBoardForm({ state, onEmit, onCancel }) {
         <div style={{display:'flex',gap:8,alignItems:'center'}}>
           <label style={{fontSize:10,textTransform:'uppercase',letterSpacing:1.1,color:'var(--text-dim)',minWidth:100}}>partitions</label>
           <input value={partitions} onChange={e => setPartitions(e.target.value)} placeholder="todo, doing, done" style={{flex:1}} />
+        </div>
+        <div style={{display:'flex',gap:8,alignItems:'flex-start'}}>
+          <label style={{fontSize:10,textTransform:'uppercase',letterSpacing:1.1,color:'var(--text-dim)',minWidth:100,paddingTop:6}}>fields</label>
+          <div style={{flex:1,display:'flex',flexDirection:'column',gap:6}}>
+            {fields.map((f, i) => (
+              <div key={i} style={{display:'flex',gap:6,alignItems:'center'}}>
+                <input
+                  value={f.name}
+                  onChange={e => updateField(i, { name: e.target.value })}
+                  onKeyDown={e => { if (e.key === 'Enter') commit(); }}
+                  placeholder={i === 0 ? 'title' : 'field name'}
+                  style={{flex:1}}
+                />
+                <select
+                  value={f.type}
+                  onChange={e => updateField(i, { type: e.target.value })}
+                  style={{fontSize:11.5,padding:'4px 6px',border:'1px solid var(--border)',background:'#fff',color:'var(--text)',cursor:'pointer'}}
+                >
+                  {BOARD_FIELD_TYPES.map(t => (
+                    <option key={t.value} value={t.value}>{t.label}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => removeField(i)}
+                  disabled={fields.length === 1}
+                  title={fields.length === 1 ? 'a board needs at least one field' : 'remove this field'}
+                  style={{width:26,padding:'4px 0',background:'#fff',color:'var(--text-dim)',border:'1px solid var(--border)',fontSize:13,lineHeight:1,cursor:fields.length === 1 ? 'default' : 'pointer',opacity:fields.length === 1 ? 0.4 : 1}}
+                >×</button>
+              </div>
+            ))}
+            <button
+              type="button"
+              onClick={addField}
+              style={{alignSelf:'flex-start',padding:'3px 10px',background:'#fff',color:'var(--text)',border:'1px dashed var(--border)',fontSize:11,cursor:'pointer'}}
+            >+ add field</button>
+            <div style={{fontSize:10.5,color:'var(--text-faint)',lineHeight:1.5}}>
+              the first <b>text</b> field titles each card.
+            </div>
+          </div>
         </div>
         <div style={{display:'flex',gap:6,marginTop:8}}>
           <button onClick={commit} style={{padding:'5px 14px',background:'#000',color:'#fff',border:'1px solid #000',fontSize:11.5,cursor:'pointer'}}>create board</button>
