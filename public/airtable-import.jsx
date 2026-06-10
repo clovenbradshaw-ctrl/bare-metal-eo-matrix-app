@@ -256,7 +256,9 @@
     return { rows: total, chunks: chunkIndex };
   }
 
-  function FieldRow({ f }) {
+  // `sync` (existing-table imports only): 'synced' — this field's type is being
+  // pulled from Airtable onto a matching local field; 'new' — Airtable adds it.
+  function FieldRow({ f, sync }) {
     const computed = isComputed(f.type);
     const detail = f.type === 'formula'
       ? (f.formula || '(empty formula)')
@@ -285,7 +287,11 @@
           )}
         </span>
         <span style={{ color: 'var(--text-faint)', fontSize: '10px', textTransform: 'uppercase' }}>
-          {computed ? 'runtime' : 'data'}
+          {sync === 'new'
+            ? <span style={{ color: 'var(--accent, #b45)', fontWeight: 700 }}>new</span>
+            : sync === 'synced'
+              ? <span style={{ color: 'var(--text)' }}>synced</span>
+              : (computed ? 'runtime' : 'data')}
         </span>
       </div>
     );
@@ -317,6 +323,9 @@
     const canImportData = liveRoom && source === 'pat' && !!token.trim();
 
     const existingTables = useMemo(() => new Set(state?.schema?.tables || []), [state]);
+    // Fields already declared for a table in this workspace, or undefined. Used
+    // to preview the field-type sync for tables that already exist.
+    function existingFieldsFor(name) { return state?.schema?.fields?.[name]; }
 
     const parsed = useMemo(() => {
       if (!schemaText.trim()) return null;
@@ -409,6 +418,12 @@
 
     // Emit the schema (tables + fields + links). Same contract as before:
     // computed-field DEFINITIONS land here; values derive later at render time.
+    //
+    // For a table that ALREADY has fields in this workspace we don't replace the
+    // column list wholesale — that would drop fields you added locally. Instead
+    // Airtable is the exclusive source of truth for the TYPE of each field it
+    // still names: reconcileFields matches by name, overlays the field-type DEF,
+    // preserves your other fields, and appends any new Airtable ones.
     function emitSchema() {
       const ME = window.MatrixEngine;
       const existing = state?.schema?.tables || [];
@@ -417,7 +432,12 @@
         onEmit(ME.OP.DEF, { anchor: null, path: '_schema.tables', value: merged });
       }
       for (const t of includedTables) {
-        onEmit(ME.OP.DEF, { anchor: null, path: `_schema.fields.${t.name}`, value: t.fields.map(cleanField) });
+        const incoming = t.fields.map(cleanField);
+        const existingFields = state?.schema?.fields?.[t.name];
+        const value = (Array.isArray(existingFields) && existingFields.length && window.AirtableSchema)
+          ? window.AirtableSchema.reconcileFields(existingFields, incoming).fields
+          : incoming;
+        onEmit(ME.OP.DEF, { anchor: null, path: `_schema.fields.${t.name}`, value });
       }
       const links = (parsed.links || []).filter(l => includedNames.has(l.from) && includedNames.has(l.to));
       if (links.length) {
@@ -652,6 +672,12 @@
                         const collides = existingTables.has(t.name);
                         const resync = hasPriorAirtableSync(state, base?.id, t);
                         const on = !!include[t.name];
+                        // For an existing table, preview the field-type sync:
+                        // which columns Airtable updates, which stay, which are
+                        // new. (reconcileFields is the same routine emitSchema runs.)
+                        const recon = (collides && Array.isArray(existingFieldsFor(t.name)) && window.AirtableSchema)
+                          ? window.AirtableSchema.reconcileFields(existingFieldsFor(t.name), t.fields.map(cleanField))
+                          : null;
                         return (
                           <div key={t.name} style={{ border: '1px solid var(--border, #e3e3e3)', marginBottom: 10, opacity: on ? 1 : 0.5 }}>
                             <label style={{
@@ -665,13 +691,27 @@
                                 {t.counts.total} field{t.counts.total === 1 ? '' : 's'}
                                 {t.counts.computed > 0 && <> · <b style={{ color: 'var(--accent,#b45)' }}>{t.counts.computed} computed</b></>}
                               </span>
-                              {resync
-                                ? <span className="csv-warn" style={{ marginLeft: 'auto' }}>re-sync — replaces previous rows, no duplicates</span>
-                                : collides && <span className="csv-warn" style={{ marginLeft: 'auto' }}>exists — will replace its schema</span>}
+                              {recon
+                                ? <span className="csv-warn" style={{ marginLeft: 'auto' }} title="Airtable is the source of truth for these fields' types; your other fields are kept">
+                                    {resync ? 're-sync' : 'exists'} — syncs {recon.updated.length} field type{recon.updated.length === 1 ? '' : 's'} from Airtable
+                                    {recon.added.length > 0 && <> · +{recon.added.length} new</>}
+                                    {recon.preserved.length > 0 && <> · keeps {recon.preserved.length}</>}
+                                    {resync && <> · rows replace previous</>}
+                                  </span>
+                                : resync
+                                  ? <span className="csv-warn" style={{ marginLeft: 'auto' }}>re-sync — replaces previous rows, no duplicates</span>
+                                  : null}
                             </label>
                             {on && (
                               <div style={{ padding: '6px 10px' }}>
-                                {t.fields.map(f => <FieldRow key={f.name} f={f} />)}
+                                {t.fields.map(f => {
+                                  // Flag how each field lands when syncing an existing table.
+                                  const sync = recon
+                                    ? (recon.added.includes(f.name) ? 'new'
+                                      : window.AirtableSchema.findMatchingField(f.name, existingFieldsFor(t.name)) ? 'synced' : null)
+                                    : null;
+                                  return <FieldRow key={f.name} f={f} sync={sync} />;
+                                })}
                               </div>
                             )}
                           </div>
