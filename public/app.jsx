@@ -732,6 +732,8 @@ function App() {
   const importRowsRef = useRef({});        // import anchor -> row entity[]
   const inFlightRef   = useRef(new Set());
   const retryRef      = useRef({});        // import anchor -> retry attempts
+  const noProgressRef = useRef(0);         // consecutive materialize passes with no new chunk
+  const lastPendingRef = useRef(-1);       // un-materialized chunk count at the last pass
   const [importRowsVersion, setImportRowsVersion] = useState(0);
 
   // Only the newest generation of each re-synced source materializes: a
@@ -784,16 +786,15 @@ function App() {
           // re-downloading; only nudge a render while still current.
           importRowsRef.current[a] = rows;
           if (!cancelled) setImportRowsVersion(v => v + 1);
-        } else if (!cancelled) {
+        } else {
           // Couldn't materialize yet — the import entity's `file` ref hasn't
-          // folded in (it DEFs in after the INS), or the media mirror is still
-          // syncing after a reload. Do NOT cache an empty result (that would
-          // hide the rows permanently); retry with backoff instead. New events
-          // re-run this effect; the timer covers the blob becoming readable
-          // with no further events (e.g. the homeserver finishes first sync).
-          const n = (retryRef.current[a] || 0) + 1;
-          retryRef.current[a] = n;
-          if (n <= 8) timers.push(setTimeout(() => setImportRowsVersion(v => v + 1), Math.min(2000, 250 * n)));
+          // folded in (it DEFs in after the INS), or the media blob is still
+          // downloading/decrypting after a cold load. Do NOT cache an empty
+          // result (that would hide the rows permanently); leave it for the
+          // next pass. The pass-level re-kick below keeps retrying on a backoff
+          // until every chunk lands, so the data finishes loading on its own —
+          // no manual refresh needed.
+          retryRef.current[a] = (retryRef.current[a] || 0) + 1;
         }
       } catch (e) {
         console.warn('[app] could not materialize import rows:', e);
@@ -811,7 +812,30 @@ function App() {
     }
     const workers = [];
     for (let i = 0; i < Math.min(CONCURRENCY, queue.length); i++) workers.push(worker());
-    Promise.all(workers).catch(() => {});
+
+    // Self-healing tail: once this pass settles, if any chunk is still
+    // un-materialized, schedule one re-kick on a backoff and keep going until
+    // they all land. Each successful chunk already bumps importRowsVersion
+    // (re-running this effect), so a re-kick is only scheduled from a pass that
+    // made no progress — i.e. the blobs genuinely weren't ready yet. We track
+    // consecutive no-progress passes so a permanently-missing blob eventually
+    // stops retrying instead of polling the network forever. This is what lets
+    // a cold device finish downloading every record without the user poking a
+    // refresh button.
+    Promise.all(workers).then(() => {
+      if (cancelled) return;
+      const pending = queue.filter(imp => !importRowsRef.current[imp._anchor]).length;
+      if (pending === 0) { noProgressRef.current = 0; lastPendingRef.current = -1; return; }
+      // Progress made this pass (fewer pending than last time) resets the
+      // patience counter; a stalled pass spends it.
+      if (lastPendingRef.current < 0 || pending < lastPendingRef.current) noProgressRef.current = 0;
+      else noProgressRef.current += 1;
+      lastPendingRef.current = pending;
+      if (noProgressRef.current <= 40) {
+        const delay = Math.min(15000, 1000 * (noProgressRef.current + 1));
+        timers.push(setTimeout(() => setImportRowsVersion(v => v + 1), delay));
+      }
+    }).catch(() => {});
 
     return () => { cancelled = true; timers.forEach(clearTimeout); };
   }, [importEntities, importRowsVersion, activeSet]);
@@ -1298,7 +1322,13 @@ function App() {
               pendingPart={pendingPart.length}
               eventsTotal={total}
               scrubber={scrubberEl}
-              onRefreshTables={() => setImportRowsVersion(v => v + 1)}
+              onRefreshTables={() => {
+                // Restart the self-healing retry loop from scratch (in case it
+                // exhausted its patience on a slow/cold download).
+                noProgressRef.current = 0;
+                lastPendingRef.current = -1;
+                setImportRowsVersion(v => v + 1);
+              }}
             />
           )}
           {selection.kind === 'slice' && (selection.sliceKind === 'table') && (

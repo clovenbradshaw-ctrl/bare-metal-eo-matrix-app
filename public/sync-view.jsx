@@ -312,9 +312,11 @@ function SyncView({
               <span className="page-section-label">Tables · records on this device</span>
               <span className="page-section-sub">
                 {totalExpected > totalLocal
-                  ? `${fmtNum(totalLocal)} of ${fmtNum(totalExpected)} records downloaded`
+                  ? `${fmtNum(totalLocal)} of ${fmtNum(totalExpected)} records downloaded — the rest stream in automatically`
                   : `${fmtNum(totalLocal)} records`}
-                {onRefreshTables && <button className="sync-link" onClick={onRefreshTables}> · refresh</button>}
+                {onRefreshTables && totalExpected > totalLocal && (
+                  <button className="sync-link" onClick={onRefreshTables} title="restart the download retry loop now"> · retry now</button>
+                )}
               </span>
             </div>
 
