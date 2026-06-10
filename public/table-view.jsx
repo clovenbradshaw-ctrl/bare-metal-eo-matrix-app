@@ -3383,7 +3383,7 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
 
       {scrubber}
 
-      <div className="tv-body single">
+      <div className={`tv-body single${!creating && active?.kind === 'entity' ? ' tv-body-grid' : ''}`}>
         {creating && (
           <CreateTableForm
             state={state}
