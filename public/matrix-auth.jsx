@@ -17,6 +17,48 @@ const LEGACY_SPACES_KEY  = 'matrix-events.spaces.v1';
 try { localStorage.removeItem(LEGACY_SPACES_KEY); } catch {}
 
 // ─────────────────────────────────────────────────────────────────────────
+// Hard reset from source — re-fetch the app CODE, keep the DATA.
+//
+// This app's html/jsx assets ship with un-hashed filenames, so a stale
+// service-worker shell or browser HTTP cache can keep serving an old build
+// after a deploy ("I don't see the new page"). This nukes exactly the code
+// layer — the service worker registration + its shell caches — and reloads
+// from the network. It deliberately does NOT touch OPFS, IndexedDB, or the
+// localStorage/sessionStorage vault stash, so your encrypted workspace cache
+// and saved session survive: only the app shell is re-downloaded.
+// ─────────────────────────────────────────────────────────────────────────
+
+async function hardResetFromSource() {
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister().catch(() => {})));
+    }
+  } catch (e) { console.warn('[reset] SW unregister failed:', e); }
+
+  try {
+    if (window.caches?.keys) {
+      const keys = await caches.keys();
+      // The PWA shell caches are the only thing we manage here; clearing all
+      // Cache Storage is safe because this app keeps no data there (history is
+      // in OPFS, media in OPFS, sessions in IndexedDB/localStorage).
+      await Promise.all(keys.map(k => caches.delete(k).catch(() => {})));
+    }
+  } catch (e) { console.warn('[reset] cache clear failed:', e); }
+
+  // Cache-busted reload so the browser HTTP cache can't re-serve a stale
+  // index.html / *.jsx either. Strip any existing buster first so they don't
+  // accumulate across resets.
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('fresh', Date.now().toString(36));
+    window.location.replace(url.toString());
+  } catch {
+    window.location.reload();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Session
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -115,6 +157,44 @@ function BootSplash() {
         </div>
       </div>
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AppResetLink — "stuck on an old version?" escape hatch for stale PWA shells.
+// Re-fetches the app code from source without touching local data. A small
+// inline confirm guards against accidental taps.
+// ─────────────────────────────────────────────────────────────────────────
+
+function AppResetLink() {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  async function run() {
+    setBusy(true);
+    await hardResetFromSource();   // navigates away; state cleanup is moot
+  }
+
+  if (busy) {
+    return <span className="login-reset busy">reloading latest version…</span>;
+  }
+  if (confirming) {
+    return (
+      <span className="login-reset">
+        reload the app from source? your data &amp; session stay.{' '}
+        <button className="login-reset-go" onClick={run}>reset</button>
+        <button className="login-reset-cancel" onClick={() => setConfirming(false)}>cancel</button>
+      </span>
+    );
+  }
+  return (
+    <button
+      className="login-reset-link"
+      onClick={() => setConfirming(true)}
+      title="re-download the latest app code and clear the offline (PWA) cache. Your encrypted local data and saved session are kept."
+    >
+      stuck on an old version? reset app from source
+    </button>
   );
 }
 
@@ -316,6 +396,7 @@ function LoginScreen({ onSignIn }) {
         <div className="login-foot">
           <span>your session, projection cursor, and rooms are kept locally.</span>
           <span className="muted">no data leaves your browser.</span>
+          <AppResetLink />
         </div>
       </div>
     </div>
@@ -746,6 +827,9 @@ Object.assign(window, {
   IdentityChip,
   MembersDialog,
   ImportButton,
+  // Console escape hatch: window.hardResetFromSource() force-refreshes the app
+  // code (clears the PWA shell cache + service worker) without wiping data.
+  hardResetFromSource,
 });
 
 })();
