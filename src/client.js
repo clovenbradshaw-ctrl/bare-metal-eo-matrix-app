@@ -143,12 +143,66 @@ function clearCryptoStore() {
 }
 
 /**
+ * Safari/WebKit cold-start IndexedDB workaround.
+ *
+ * On a fresh page load WebKit can leave its IndexedDB subsystem asleep: the
+ * *first* `indexedDB.open()` after load sometimes fires neither `onsuccess`
+ * nor `onerror`, hanging forever (long-standing WebKit cold-start bug). The
+ * SDK opens its Rust-crypto store over IndexedDB during initRustCrypto, so the
+ * stall surfaces as "login never resolves on first load, but a refresh logs
+ * straight in" — on the reload IDB is already warm. The same stalled init is
+ * why the session/crypto never become ready and data views show 0 records.
+ *
+ * Poke IDB with a throwaway open before the SDK touches it. If a poke doesn't
+ * answer within a short window, re-issue it — re-opening is what actually
+ * shakes the subsystem awake — up to a bounded budget, then proceed regardless
+ * so bootstrap is never blocked for more than the budget. A no-op on engines
+ * that answer the first poke immediately (Chrome/Firefox).
+ */
+function warmUpIndexedDB({ tries = 12, intervalMs = 250 } = {}) {
+  if (typeof indexedDB === 'undefined') return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    let attempt = 0;
+    let timer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    const poke = () => {
+      if (settled) return;
+      attempt++;
+      let req;
+      try { req = indexedDB.open('__eomx_idb_warmup__'); }
+      catch { finish(); return; }
+      req.onsuccess = () => { try { req.result.close(); } catch {} finish(); };
+      req.onerror = () => finish();
+      req.onblocked = () => finish();
+      // No response within the window — the cold-start stall. Re-poke until
+      // the subsystem wakes or the budget (tries × intervalMs) is spent.
+      timer = setTimeout(() => {
+        if (settled) return;
+        if (attempt >= tries) { finish(); return; }
+        poke();
+      }, intervalMs);
+    };
+    poke();
+  });
+}
+
+/**
  * Pre-empt the "account in the store doesn't match" failure by wiping
  * the crypto store before init when we know it belongs to a different
  * user. Avoids hitting the exception-based retry path inside
  * initCryptoWithRetry, which has worse timing characteristics.
  */
 async function ensureCryptoStoreOwner(userId) {
+  // Wake IndexedDB before any crypto-store access (delete below or the SDK's
+  // own open in initRustCrypto). On Safari the first cold open can hang, which
+  // is what stalls login until a manual refresh — see warmUpIndexedDB.
+  await warmUpIndexedDB();
   const prior = localStorage.getItem(CRYPTO_OWNER_KEY);
   if (prior && prior !== userId) {
     progress(`Crypto store belonged to ${prior}; resetting for ${userId}`);
