@@ -697,9 +697,10 @@ function EditableCell({ value, onCommit, type, heat, freshTs, shouldFocus, onFoc
   const { cls, text } = fmtCell(value, type);
   const heatCls = heat ? heatClass(heat) : '';
   const freshCls = freshClass(freshTs);
-  // Long text is width-capped + ellipsized, so surface the full value on hover.
-  // Otherwise prefer a recency note, then the heat count, then the edit hint.
-  const title = (type === 'longtext' && text)
+  // Every column is width-capped + ellipsized now, so surface the full value on
+  // hover whenever there is one. Otherwise prefer a recency note, then the heat
+  // count, then the edit hint.
+  const title = (text && cls !== 'null')
     ? text
     : freshCls
       ? `edited ${relTime(freshTs)} · click to edit`
