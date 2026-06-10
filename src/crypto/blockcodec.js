@@ -33,6 +33,15 @@ import { encryptBytesWithKey, decryptBytesWithKey, b64 } from './envelope.js';
 
 const BLOCK_VERSION = 1;
 
+// Room state events have a hard size ceiling on most homeservers (Synapse
+// defaults to 65536 bytes for the whole event). The block manifest lives in
+// the "<ns>.blocks" state event, so the serialized pointer list must stay
+// well under that. At ~70 bytes per entry this budget holds ~700 blocks —
+// well over a million events at the per-block cap — and anything older than
+// the budget is dropped from the manifest and recovered by a serial
+// prev-walk from the oldest entry still listed.
+const MANIFEST_MAX_BYTES = 48 * 1024;
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -116,4 +125,33 @@ export function mergeChainEvents(chains) {
   return out;
 }
 
-export { BLOCK_VERSION };
+/**
+ * A manifest entry is the minimal pointer a reader needs to fetch + verify
+ * one block in parallel: `{ m: mxc, h: sha256 }`. The full manifest is the
+ * ordered list of these for blocks `base .. base+len-1`.
+ */
+export function manifestEntry(mxc, sha256) {
+  return { m: mxc, h: sha256 };
+}
+
+/**
+ * Trim the oldest entries off a manifest until it serializes under
+ * `maxBytes`. Returns `{ kept, dropped }` where `kept` is the newest
+ * surviving suffix and `dropped` is how many entries were removed from the
+ * front. The caller adds `dropped` to its absolute base so a reader knows a
+ * `base > 0` chain has an older tail to walk via `prev`.
+ *
+ * Trimming proceeds in proportional chunks so a pathologically long chain
+ * converges in O(log n) JSON.stringify probes rather than O(n).
+ */
+export function capManifest(full, maxBytes = MANIFEST_MAX_BYTES) {
+  let start = 0;
+  while (start < full.length &&
+         JSON.stringify(full.slice(start)).length > maxBytes) {
+    start += Math.max(1, Math.floor((full.length - start) / 8));
+  }
+  if (start > full.length) start = full.length;
+  return { kept: full.slice(start), dropped: start };
+}
+
+export { BLOCK_VERSION, MANIFEST_MAX_BYTES };

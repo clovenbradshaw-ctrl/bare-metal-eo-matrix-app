@@ -139,8 +139,13 @@ function SyncIndicator({ status, variant = 'banner', onResync }) {
   const syncing = phase === 'syncing';
   const errored = phase === 'error' || (status.errors && status.errors.length > 0);
 
+  const blocksTotal = status.blocksTotal || 0;
+  const blocksDone = status.blocksDone || 0;
+  const blockProgress = syncing && blocksTotal
+    ? ` · ${blocksDone}/${blocksTotal} blocks`
+    : '';
   const label = syncing
-    ? `Syncing from durable storage… ${total ? `${done}/${total}` : ''}`.trim()
+    ? `Loading events from durable storage…${total ? ` ${done}/${total}` : ''}${blockProgress}`.trim()
     : errored
       ? `Synced with issues — ${status.recovered} event${status.recovered === 1 ? '' : 's'} recovered`
       : `Synced · ${status.recovered} event${status.recovered === 1 ? '' : 's'} restored from durable storage`;

@@ -11,6 +11,7 @@
 import assert from 'node:assert';
 import {
   encodeBlock, decodeBlock, mergeChainEvents, plainEventForBlock, sha256B64,
+  capManifest, manifestEntry, MANIFEST_MAX_BYTES,
 } from '../src/crypto/blockcodec.js';
 import {
   deriveAccountKey,
@@ -190,6 +191,91 @@ await test('post-wipe recovery: password ⇒ identity ⇒ WCK ⇒ chain ⇒ impo
   eq(fileDef.content.value.file.key.k, 'THE-BLOB-KEY');          // …and decryptable again
   const ins = events.find(e => e.event_id === '$ins');
   eq(ins.content.payload.derived_set, 'Projects');               // …and the table rebuilds
+});
+
+// ── Block manifest: parallel hydration + size-capped room state ──
+
+await test('capManifest keeps a small manifest whole with base 0', () => {
+  const full = Array.from({ length: 50 }, (_, i) => manifestEntry(`mxc://hs/b${i}`, `h${i}`));
+  const { kept, dropped } = capManifest(full);
+  eq(dropped, 0);
+  eq(kept.length, 50);
+  eq(kept, full);
+});
+
+await test('capManifest trims the oldest entries when over the byte budget', () => {
+  // ~90 bytes/entry → far more than the budget can hold, forcing a trim.
+  const full = Array.from({ length: 4000 }, (_, i) =>
+    manifestEntry(`mxc://homeserver.example.org/AbCdEfGhIjKlMnOpQrSt${i}`, `c2hhMjU2aGFzaGJhc2U2NHZhbHVlMTIzNDU2Nzg5MD${i}`));
+  const { kept, dropped } = capManifest(full);
+  assert.ok(dropped > 0, 'something was dropped');
+  eq(kept.length + dropped, full.length);
+  // The newest entries survive (it's a suffix), and it now fits.
+  eq(kept[kept.length - 1], full[full.length - 1]);
+  assert.ok(JSON.stringify(kept).length <= MANIFEST_MAX_BYTES, 'kept manifest fits the budget');
+});
+
+await test('manifest hydration: parallel fetch reconstructs the same events as a serial walk', async () => {
+  const wck = generateWorkspaceKey();
+  const mediaStore = new Map();
+  const manifest = [];
+  let head = null;
+
+  // Build a 5-block chain, recording a manifest entry per block (what
+  // appendBlock now writes into room state).
+  for (let i = 0; i < 5; i++) {
+    const { bytes, sha256 } = await encodeBlock(wck, {
+      idx: i,
+      prev: head ? { mxc: head.mxc, sha256: head.sha256 } : null,
+      events: [ev(`$e${i}`, 'def', { anchor: 'r', path: 'n', value: i }, 100 + i)],
+    });
+    const mxc = `mxc://hs/block${i}`;
+    mediaStore.set(mxc, bytes);
+    manifest.push(manifestEntry(mxc, sha256));
+    head = { mxc, sha256, idx: i };
+  }
+
+  // Fetch every block from the manifest "in parallel" (order-independent),
+  // verifying each against its recorded hash — what loadChainBlocks does.
+  const blocks = await Promise.all(
+    manifest.map(({ m, h }) => decodeBlock(wck, mediaStore.get(m), h)));
+  eq(mergeChainEvents([blocks]).map(e => e.content.value), [0, 1, 2, 3, 4]);
+});
+
+await test('trimmed manifest: tail below base is recovered via prev-walk', async () => {
+  const wck = generateWorkspaceKey();
+  const mediaStore = new Map();
+  let head = null;
+  const allPointers = [];
+  for (let i = 0; i < 5; i++) {
+    const { bytes, sha256 } = await encodeBlock(wck, {
+      idx: i,
+      prev: head ? { mxc: head.mxc, sha256: head.sha256 } : null,
+      events: [ev(`$e${i}`, 'ins', { anchor: `a${i}` }, 100 + i)],
+    });
+    const mxc = `mxc://hs/block${i}`;
+    mediaStore.set(mxc, bytes);
+    allPointers.push(manifestEntry(mxc, sha256));
+    head = { mxc, sha256, idx: i };
+  }
+
+  // Simulate a trimmed manifest: only blocks 3..4 are listed, base = 3.
+  const manifest = allPointers.slice(3);
+  const base = 3;
+
+  const listed = await Promise.all(
+    manifest.map(({ m, h }) => decodeBlock(wck, mediaStore.get(m), h)));
+  let blocks = listed;
+  if (base > 0) {
+    const oldest = listed.reduce((m, b) => (b.idx < m.idx ? b : m), listed[0]);
+    let ptr = oldest.prev;
+    while (ptr) {
+      const b = await decodeBlock(wck, mediaStore.get(ptr.mxc), ptr.sha256);
+      blocks.push(b);
+      ptr = b.prev;
+    }
+  }
+  eq(mergeChainEvents([blocks]).map(e => e.content.anchor), ['a0', 'a1', 'a2', 'a3', 'a4']);
 });
 
 console.log(`\nall ${passed} block-chain checks passed`);
