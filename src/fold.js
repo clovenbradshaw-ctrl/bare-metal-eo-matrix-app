@@ -243,6 +243,9 @@ function dispatch(state, event) {
         setPath(entity, path, value);
         entity._updated = ts;
         entity._updatedBy = sender;
+        // Per-field write time so the grid can tint recently-changed cells.
+        if (!entity._fieldTs) entity._fieldTs = {};
+        entity._fieldTs[path] = ts;
       }
       if (OP.DEF.order > entity._hwm) entity._hwm = OP.DEF.order;
       break;

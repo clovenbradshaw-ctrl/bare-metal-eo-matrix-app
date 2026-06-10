@@ -40,7 +40,41 @@ function fmtCell(value, type, opts) {
     return { cls: 'str', text: value.join(', ') };
   }
   if (type === 'json' && typeof value === 'object') return { cls: 'json', text: JSON.stringify(value) };
+  // Rich text / long text: keep the colour of a normal string cell but tag it
+  // so the grid can cap its width and ellipsize instead of letting one long
+  // paragraph blow the whole column out to the right.
+  if (type === 'longtext') return { cls: 'str longtext', text: String(value) };
   return { cls: 'str', text: String(value) };
+}
+
+// Recency tint: how long ago a cell's field was last written maps to a fading
+// accent so a fresh edit is obvious at a glance and quiets down over a week.
+function freshClass(ts) {
+  if (!ts) return '';
+  const age = Date.now() - ts;
+  if (age < 0) return '';
+  const MIN = 60000, HOUR = 3600000, DAY = 86400000;
+  if (age < 5 * MIN)  return 'fresh-5';
+  if (age < HOUR)     return 'fresh-4';
+  if (age < 6 * HOUR) return 'fresh-3';
+  if (age < DAY)      return 'fresh-2';
+  if (age < 7 * DAY)  return 'fresh-1';
+  return '';
+}
+
+// Short, human relative time for the recency tooltip ("3m ago", "2h ago").
+function relTime(ts) {
+  if (!ts) return '';
+  const age = Date.now() - ts;
+  if (age < 0) return '';
+  const s = Math.floor(age / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -263,7 +297,7 @@ function SelectMenu({ anchorRect, options, colorMap, selected, multi, onPick, on
 
 // Shared trigger + chip display for both single and multi select. Renders a
 // <td> for the grid (wrapTd) or a bare control for the record-detail panel.
-function SelectControl({ value, options, colorMap, multi, onCommit, onAddOption, heat, autoOpen, onAutoOpenConsumed, onNavigate, wrapTd }) {
+function SelectControl({ value, options, colorMap, multi, onCommit, onAddOption, heat, freshTs, autoOpen, onAutoOpenConsumed, onNavigate, wrapTd }) {
   const [open, setOpen] = useState(false);
   const [rect, setRect] = useState(null);
   const ref = useRef(null);
@@ -305,6 +339,7 @@ function SelectControl({ value, options, colorMap, multi, onCommit, onAddOption,
 
   const empty = selected.length === 0;
   const heatCls = heat ? heatClass(heat) : '';
+  const freshCls = freshClass(freshTs);
 
   const inner = (
     <>
@@ -341,7 +376,7 @@ function SelectControl({ value, options, colorMap, multi, onCommit, onAddOption,
   );
 
   if (wrapTd) {
-    return <td className={`cell sel-td ${multi ? 'ms' : 'ss'} ${empty ? 'null' : 'str'} ${open ? 'sel-open' : ''} ${heatCls}`}>{inner}</td>;
+    return <td className={`cell sel-td ${multi ? 'ms' : 'ss'} ${empty ? 'null' : 'str'} ${open ? 'sel-open' : ''} ${heatCls} ${freshCls}`}>{inner}</td>;
   }
   return inner;
 }
@@ -598,7 +633,7 @@ function RollupCell({ rollup, record, state }) {
   );
 }
 
-function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsumed, onNavigate }) {
+function EditableCell({ value, onCommit, type, heat, freshTs, shouldFocus, onFocusConsumed, onNavigate }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const inputRef = useRef(null);
@@ -661,7 +696,17 @@ function EditableCell({ value, onCommit, type, heat, shouldFocus, onFocusConsume
   }
   const { cls, text } = fmtCell(value, type);
   const heatCls = heat ? heatClass(heat) : '';
-  return <td className={`cell ${cls} ${heatCls}`} onClick={startEdit} title={heat ? `${heat} write${heat===1?'':'s'} · click to edit` : 'click to edit · emits DEF'}>{text}</td>;
+  const freshCls = freshClass(freshTs);
+  // Long text is width-capped + ellipsized, so surface the full value on hover.
+  // Otherwise prefer a recency note, then the heat count, then the edit hint.
+  const title = (type === 'longtext' && text)
+    ? text
+    : freshCls
+      ? `edited ${relTime(freshTs)} · click to edit`
+      : heat
+        ? `${heat} write${heat === 1 ? '' : 's'} · click to edit`
+        : 'click to edit · emits DEF';
+  return <td className={`cell ${cls} ${heatCls} ${freshCls}`} onClick={startEdit} title={title}>{text}</td>;
 }
 
 function heatClass(n) {
@@ -1234,7 +1279,13 @@ function HidePanel({ items, hidden, setHidden }) {
 // ─────────────────────────────────────────────────────────────────────────
 
 function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showDDL, setSelection, savedView, onUpdateView, onSaveAsView }) {
-  const { cols, rows, partitioned, partitionFromSchema } = useMemo(() => buildTable(entityType, state), [entityType, state]);
+  const built = useMemo(() => buildTable(entityType, state), [entityType, state]);
+  const { rows, partitioned, partitionFromSchema } = built;
+  // Record-link fields are surfaced as their own derived columns (relation
+  // pills built from CON edges), so drop the raw 'linked' schema fields here —
+  // otherwise every link field ALSO renders as a perpetually-empty editable
+  // column, which is what made link fields look broken in the grid.
+  const cols = useMemo(() => built.cols.filter(c => c.type !== 'linked'), [built]);
   const linkedTypes = useMemo(() => linkedTypesFor(entityType, state), [entityType, state]);
   const declaredInSchema = !!state.schema?.fields?.[entityType] || (state.schema?.tables || []).includes(entityType);
   const [heatOn, setHeatOn] = useState(false);
@@ -1850,6 +1901,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                       options={selectOptions[c.name] || []}
                       colorMap={c.optionColors}
                       heat={heatOn ? (r._writes?.[c.name] || 0) : 0}
+                      freshTs={r._fieldTs?.[c.name]}
                       onCommit={(v) => commitCell(r._anchor, c.name, v)}
                       onAddOption={(v) => addFieldOption(c.name, v)}
                       autoOpen={pendingFocus?.anchor === r._anchor && pendingFocus?.field === c.name}
@@ -1862,6 +1914,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                       value={r[c.name]}
                       type={c.type}
                       heat={heatOn ? (r._writes?.[c.name] || 0) : 0}
+                      freshTs={r._fieldTs?.[c.name]}
                       onCommit={(v) => commitCell(r._anchor, c.name, v)}
                       shouldFocus={pendingFocus?.anchor === r._anchor && pendingFocus?.field === c.name}
                       onFocusConsumed={() => setPendingFocus(null)}
