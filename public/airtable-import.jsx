@@ -728,7 +728,7 @@
                           {parsed.links.map((l, i) => (
                             <div key={i}>{l.from} —[{l.rel}]→ {l.to}</div>
                           ))}
-                          <div style={{ marginTop: 6 }}>links connect rows via CON edges you draw after import; rollups aggregate across them.</div>
+                          <div style={{ marginTop: 6 }}>importing both tables’ records resolves these links into CON edges automatically; rollups &amp; lookups aggregate across them. (schema only? draw the edges yourself.)</div>
                         </div>
                       </div>
                     )}
