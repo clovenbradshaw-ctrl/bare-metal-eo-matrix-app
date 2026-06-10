@@ -11,6 +11,15 @@
  *   window.AirtableSchema.parse(jsonOrString)
  *     -> { ok, tables, links, warnings, error }
  *
+ * For tables that ALREADY exist in the workspace, re-importing syncs field
+ * TYPES from Airtable without clobbering local columns:
+ *
+ *   window.AirtableSchema.reconcileFields(existingFields, airtableFields)
+ *     -> { fields, updated, preserved, added }
+ *
+ * It finds each matching field by name and overlays Airtable's field-type DEF
+ * (type + options/formula/rollup), preserving local-only fields and props.
+ *
  *   tables: [{
  *     name,                         // table name (used as the entity set)
  *     id,                           // Airtable table id (tbl…) when known —
@@ -258,13 +267,108 @@
     return { ok: true, tables, links: uniqueLinks, warnings };
   }
 
+  // ── Sync an EXISTING table's field types from an Airtable schema ──────────
+  // When a table already exists in the workspace, re-importing must NOT blow its
+  // columns away. Instead Airtable becomes the exclusive source of truth for the
+  // TYPE of each field it still names: we find the matching local field and lay
+  // the Airtable type definition over it. Fields you added locally that Airtable
+  // doesn't define are preserved untouched; fields Airtable adds are appended.
+
+  // The "type definition" of a field — its `type` plus the type-specific params
+  // that decide how it computes/renders (options · formula · rollup ·
+  // linkedTable). The field NAME and any local-only presentation props (e.g.
+  // optionColors) are NOT part of the type DEF.
+  function fieldTypeDef(field) {
+    const def = { type: field ? field.type : undefined };
+    if (field && Array.isArray(field.options)) def.options = field.options;
+    if (field && typeof field.formula === 'string') def.formula = field.formula;
+    if (field && field.rollup) def.rollup = field.rollup;
+    if (field && field.linkedTable) def.linkedTable = field.linkedTable;
+    return def;
+  }
+
+  // Find the field in `fields` whose name matches `name`: exact first, then a
+  // single case-insensitive fallback so a hand-built "Status" lines up with
+  // Airtable's "status". Returns the field object, or undefined.
+  function findMatchingField(name, fields) {
+    if (name == null || !Array.isArray(fields)) return undefined;
+    const exact = fields.find(f => f && f.name === name);
+    if (exact) return exact;
+    const lower = String(name).toLowerCase();
+    return fields.find(f => f && typeof f.name === 'string' && f.name.toLowerCase() === lower);
+  }
+
+  // Overlay an incoming field's type DEF onto an existing field. The existing
+  // name and any local-only props are kept; stale type params are cleared first
+  // so a type change (select → text) never strands orphaned options/formula.
+  function applyTypeDef(existing, incoming) {
+    const def = fieldTypeDef(incoming);
+    const merged = { ...existing };
+    delete merged.options; delete merged.formula; delete merged.rollup; delete merged.linkedTable;
+    // optionColors only mean something for select/multiselect — and only for
+    // choices the incoming type still defines.
+    if (merged.optionColors) {
+      const keepsColors = (def.type === 'select' || def.type === 'multiselect') && Array.isArray(def.options);
+      if (keepsColors) {
+        const kept = {};
+        for (const o of def.options) if (merged.optionColors[o] != null) kept[o] = merged.optionColors[o];
+        if (Object.keys(kept).length) merged.optionColors = kept; else delete merged.optionColors;
+      } else {
+        delete merged.optionColors;
+      }
+    }
+    return Object.assign(merged, def);
+  }
+
+  // Reconcile an existing field list with one parsed from Airtable.
+  //
+  //   reconcileFields(existing, incoming)
+  //     -> { fields, updated:[name…], preserved:[name…], added:[name…] }
+  //
+  //   fields    — the merged list, existing order preserved, new fields appended
+  //   updated   — existing fields whose type was synced from Airtable
+  //   preserved — existing fields Airtable didn't define (kept as-is)
+  //   added     — Airtable fields with no local match (appended)
+  function reconcileFields(existingFields, incomingFields) {
+    const existing = (Array.isArray(existingFields) ? existingFields : []).filter(f => f && f.name);
+    // A working copy we splice matches out of, so each incoming field is
+    // consumed at most once (no double-matching on a case-insensitive tie).
+    const remaining = (Array.isArray(incomingFields) ? incomingFields : []).filter(f => f && f.name);
+
+    const fields = [];
+    const updated = [];
+    const preserved = [];
+    const added = [];
+
+    for (const ex of existing) {
+      const inc = findMatchingField(ex.name, remaining);
+      if (inc) {
+        remaining.splice(remaining.indexOf(inc), 1);
+        fields.push(applyTypeDef(ex, inc));
+        updated.push(ex.name);
+      } else {
+        fields.push(ex);
+        preserved.push(ex.name);
+      }
+    }
+    for (const inc of remaining) {
+      fields.push({ name: inc.name, ...fieldTypeDef(inc) });
+      added.push(inc.name);
+    }
+
+    return { fields, updated, preserved, added };
+  }
+
   const api = {
     parse,
     isComputed,
     rollupFn,
     rewriteRefs,
+    fieldTypeDef,
+    findMatchingField,
+    reconcileFields,
     SIMPLE_TYPE_MAP,
-    version: 1,
+    version: 2,
   };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

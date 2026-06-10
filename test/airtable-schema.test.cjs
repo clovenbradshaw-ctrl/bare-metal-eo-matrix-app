@@ -128,6 +128,75 @@ check('accepts a single table object', AirtableSchema.parse(sample.tables[1]).ok
 check('rejects junk with a message', AirtableSchema.parse('{"nope":1}').ok === false);
 check('rejects invalid JSON string', AirtableSchema.parse('{not json').ok === false);
 
+// ── Sync field types into an EXISTING table (reconcileFields) ───────────────
+// The whole point: re-importing a base whose tables you already have must sync
+// each field's TYPE from Airtable without dropping columns you added locally.
+
+// fieldTypeDef pulls type + type params, never the name or local-only props.
+eq('fieldTypeDef: select keeps options, drops name/optionColors',
+  AirtableSchema.fieldTypeDef({ name: 'Status', type: 'select', options: ['a', 'b'], optionColors: { a: 'red' } }),
+  { type: 'select', options: ['a', 'b'] });
+eq('fieldTypeDef: formula keeps the expression',
+  AirtableSchema.fieldTypeDef({ name: 'L', type: 'formula', formula: '{x}+1' }),
+  { type: 'formula', formula: '{x}+1' });
+
+// findMatchingField: exact first, then a single case-insensitive fallback.
+const pool = [{ name: 'Status', type: 'select' }, { name: 'Owner', type: 'text' }];
+eq('findMatchingField exact', AirtableSchema.findMatchingField('Owner', pool).name, 'Owner');
+eq('findMatchingField case-insensitive', AirtableSchema.findMatchingField('owner', pool).name, 'Owner');
+check('findMatchingField miss → undefined', AirtableSchema.findMatchingField('Nope', pool) === undefined);
+
+// The core reconcile: one field changes type, one is local-only, one is new.
+const existingFields = [
+  { name: 'Name', type: 'text' },
+  { name: 'Budget', type: 'text' },                          // Airtable now says number
+  { name: 'My Note', type: 'longtext' },                      // local-only — must survive
+  { name: 'Status', type: 'select', options: ['Todo', 'Done'], optionColors: { Todo: 'red', Old: 'blue' } },
+];
+const incomingFields = [
+  { name: 'Name', type: 'text' },
+  { name: 'Budget', type: 'number' },
+  { name: 'Status', type: 'select', options: ['Todo', 'Doing', 'Done'] },
+  { name: 'Created', type: 'formula', formula: 'DATESTR(CREATED_TIME())' }, // new
+];
+const rec = AirtableSchema.reconcileFields(existingFields, incomingFields);
+
+eq('reconcile keeps existing order, appends new',
+  rec.fields.map(f => f.name), ['Name', 'Budget', 'My Note', 'Status', 'Created']);
+eq('reconcile syncs Budget type text → number', rec.fields.find(f => f.name === 'Budget').type, 'number');
+eq('reconcile preserves local-only field untouched',
+  rec.fields.find(f => f.name === 'My Note'), { name: 'My Note', type: 'longtext' });
+eq('reconcile syncs Status options from Airtable',
+  rec.fields.find(f => f.name === 'Status').options, ['Todo', 'Doing', 'Done']);
+eq('reconcile prunes optionColors to surviving choices',
+  rec.fields.find(f => f.name === 'Status').optionColors, { Todo: 'red' });
+eq('reconcile appends new Airtable field with its DEF',
+  rec.fields.find(f => f.name === 'Created'), { name: 'Created', type: 'formula', formula: 'DATESTR(CREATED_TIME())' });
+eq('reconcile reports updated', rec.updated.sort(), ['Budget', 'Name', 'Status']);
+eq('reconcile reports preserved', rec.preserved, ['My Note']);
+eq('reconcile reports added', rec.added, ['Created']);
+
+// A type change away from select must strip stale options + optionColors.
+const toText = AirtableSchema.reconcileFields(
+  [{ name: 'Status', type: 'select', options: ['a'], optionColors: { a: 'red' } }],
+  [{ name: 'Status', type: 'text' }],
+);
+eq('reconcile select → text drops options & optionColors',
+  toText.fields[0], { name: 'Status', type: 'text' });
+
+// Case-insensitive match syncs the type while keeping the LOCAL name.
+const ci = AirtableSchema.reconcileFields(
+  [{ name: 'Status', type: 'text' }],
+  [{ name: 'status', type: 'select', options: ['x'] }],
+);
+eq('reconcile case-insensitive keeps local name, syncs type',
+  ci.fields, [{ name: 'Status', type: 'select', options: ['x'] }]);
+
+// No existing fields → incoming passes through as the field list (fresh table).
+eq('reconcile with empty existing returns incoming',
+  AirtableSchema.reconcileFields([], incomingFields).fields.map(f => f.name),
+  ['Name', 'Budget', 'Status', 'Created']);
+
 // ── End-to-end: the generated schema must COMPUTE at runtime via formula.js ──
 // Load the real formula.js (a browser IIFE that assigns window.Formula) with a
 // window shim, then evaluate the very fields the importer produced — proving we
