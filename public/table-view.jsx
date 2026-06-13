@@ -1811,7 +1811,8 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
   const visibleRows = virtualize ? displayRows.slice(startIdx, endIdx) : displayRows;
   const padTop = virtualize ? startIdx * rowH : 0;
   const padBottom = virtualize ? (displayRows.length - endIdx) * rowH : 0;
-  const spacerCols = (showFormula ? 1 : 0) + (showPartitionCol ? 1 : 0) + visibleLinkedTypes.length + visibleCols.length + 1;
+  // leading 1 = row-expand rail (left edge); trailing 1 = add-column rail (right edge)
+  const spacerCols = 1 + (showFormula ? 1 : 0) + (showPartitionCol ? 1 : 0) + visibleLinkedTypes.length + visibleCols.length + 1;
 
   function commitRename() {
     if (!renamingField) return;
@@ -2065,6 +2066,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
         <table className={`dbgrid ${heatOn ? 'heat-on' : ''}`}>
           <thead>
             <tr>
+              <th className="row-expand-head" aria-hidden="true" title="expand record"></th>
               {allCols.map(c => {
                 const cs = colStats[c.name];
                 const isFormula = c.type === 'formula';
@@ -2151,6 +2153,8 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                 }}
                 title="double-click to open record"
               >
+                <td className="cell row-expand" title="expand record · view & edit all fields"
+                    onClick={() => setDetailAnchor(r._anchor)}>⤢</td>
                 {showFormula && (
                   <td
                     className="cell anchor anchor-link formula"
@@ -2214,8 +2218,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     />
                   )
                 ))}
-                <td className="cell add-col-spacer row-expand" title="expand record · view & edit all fields"
-                    onClick={() => setDetailAnchor(r._anchor)}>⤢</td>
+                <td className="cell add-col-spacer" aria-hidden="true"></td>
               </tr>
               );
             })}
@@ -2225,7 +2228,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
 
             {displayRows.length === 0 && rows.length > 0 && (
               <tr className="tv-no-match">
-                <td className="cell" colSpan={allCols.length + 1} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
+                <td className="cell" colSpan={allCols.length + 2} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
                   no rows match the active filter{filters.length !== 1 ? 's' : ''} ·{' '}
                   <button className="tv-inline-link" onClick={() => setFilters([])}>clear filter{filters.length !== 1 ? 's' : ''}</button>
                 </td>
@@ -2235,6 +2238,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             {/* Heat-map summary row */}
             {heatOn && rows.length > 0 && (
               <tr className="heat-summary">
+                <td className="cell row-expand-spacer" aria-hidden="true"></td>
                 {showFormula && <td className="cell" style={{fontSize:11,color:'var(--text-dim)',textTransform:'uppercase',letterSpacing:'1.2px',fontWeight:700}}>avg writes</td>}
                 {showPartitionCol && <td className="cell"></td>}
                 {visibleLinkedTypes.map(t => <td key={t} className="cell hs-link"></td>)}
@@ -2256,6 +2260,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             )}
             {cols.length > 0 && visibleCols.length > 0 && (
               <tr className="add-row" onClick={addRowAndFocus} title="click to add a row · or hit Enter from the last cell">
+                <td className="cell row-expand-spacer" aria-hidden="true"></td>
                 {showFormula && <td className="cell anchor add-row-gutter"><span className="add-row-plus">+</span></td>}
                 <td className="cell add-row-cell" colSpan={visibleCols.length + (showPartitionCol ? 1 : 0) + visibleLinkedTypes.length + 1}>
                   {!showFormula && <span className="add-row-plus">+</span>}
@@ -2265,7 +2270,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             )}
             {cols.length === 0 && (
               <tr>
-                <td className="cell" colSpan={allCols.length + 1} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
+                <td className="cell" colSpan={allCols.length + 2} style={{textAlign:'center',padding:'14px',color:'var(--text-faint)',fontStyle:'italic'}}>
                   no fields yet · add a field with the <span className="kbd">+</span> in the header
                 </td>
               </tr>
