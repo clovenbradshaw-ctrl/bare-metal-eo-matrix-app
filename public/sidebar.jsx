@@ -429,9 +429,6 @@ function Sidebar({
             title={t.kind === 'meta' ? "open this set's data" : "overview · stats and the schema as a table"}
           >
             <span className="sb-table-name">{t.name}</span>
-            {!t.declared && t.kind !== 'meta' && (
-              <span className="sb-unschematized" title="not in _schema.tables">?</span>
-            )}
             {renderSetCount(t)}
           </button>
           {t.kind !== 'meta' && (
