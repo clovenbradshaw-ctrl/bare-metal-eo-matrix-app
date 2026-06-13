@@ -1,9 +1,9 @@
 /* sidebar.jsx — Airtable/EODB-style left rail.
  *
  * Each room contains a list of SETS (the high-level data objects, one per
- * entity type in the room's schema + meta sets: _synthesis, _connections,
- * _schema, _violations). Clicking a set opens its data (the default table);
- * a small ⊢ button on the set opens its SCHEMA.
+ * entity type in the room's schema + meta sets: _synthesis, _schema,
+ * _violations). Clicking a set opens its data (the default table); a small ⊢
+ * button on the set opens its SCHEMA.
  *
  * Each set has a list of VIEWS (projections) — different, saved ways to view
  * the same underlying rows. Built-in (auto) view kinds:
@@ -86,16 +86,6 @@ function buildSets(state) {
       rows: Object.values(state.entities).filter(e => e._type === '_synthesis').length,
       declared: false,
       slices: [{ id: '_synthesis.table', kind: 'table', name: 'table', tableId: '_synthesis' }],
-    });
-  }
-  if (state.connections.length > 0) {
-    meta.push({
-      id: '_connections', name: '_connections', kind: 'meta',
-      rows: state.connections.length, declared: !!state.schema?.links,
-      slices: [
-        { id: '_connections.table', kind: 'table', name: 'table', tableId: '_connections' },
-        { id: '_connections.graph', kind: 'graph', name: 'graph', tableId: '_connections' },
-      ],
     });
   }
   // _schema isn't a top-level set — each set has its own schema, opened by the ⊢ button on the set.
