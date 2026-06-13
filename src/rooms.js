@@ -535,6 +535,16 @@ export async function setName(roomId, name) {
 }
 
 /**
+ * Set the signed-in user's own display name (m.room.member profile, applied
+ * account-wide by the homeserver). Other clients see it on their next sync.
+ */
+export async function setDisplayName(name) {
+  const client = getClient();
+  if (!client) throw new Error('Not connected');
+  await client.setDisplayName(String(name ?? '').trim());
+}
+
+/**
  * Resolve a user's display name from the SDK's profile cache. Returns
  * null when no profile is known yet — the caller should fall back to
  * something readable (e.g. the local part of the MXID).

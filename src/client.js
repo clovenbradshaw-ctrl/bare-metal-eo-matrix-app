@@ -762,6 +762,146 @@ export async function login(homeserver, username, password, { persist = false } 
   return { client, userId: resp.user_id, deviceId: resp.device_id };
 }
 
+// ── Password reset & change ──────────────────────────────────────────────
+//
+// Two distinct flows live here:
+//
+//   1. Reset-when-locked-out (login screen "forgot password"): the user is
+//      NOT signed in, so we talk to the homeserver with a throwaway client
+//      and no access token. The homeserver emails a verification link; once
+//      the user clicks it, the validated email 3PID is the UI-auth that
+//      authorizes the new password. This only works if the account has a
+//      verified email and the homeserver has email support configured.
+//
+//   2. Change-while-signed-in (account dashboard): the live client re-auths
+//      with the current password (m.login.password UI-auth) to set a new one.
+//
+// matrix-js-sdk's setPassword() doesn't drive User-Interactive Auth on its
+// own — a homeserver may answer the first POST with a 401 carrying a UIA
+// `session` id that must be threaded back into the auth dict. uiaSetPassword
+// handles that one retry for both flows.
+
+function friendlyMatrixError(e, fallback) {
+  const code = e?.errcode || e?.data?.errcode;
+  switch (code) {
+    case 'M_THREEPID_NOT_FOUND':
+      return new Error('No account has that email address on this homeserver.');
+    case 'M_THREEPID_DENIED':
+      return new Error('This homeserver does not allow password reset by email.');
+    case 'M_THREEPID_AUTH_FAILED':
+      return new Error("Email not verified yet — open the link the homeserver emailed you, then try again.");
+    case 'M_UNAUTHORIZED':
+      return new Error('Current password is incorrect.');
+    case 'M_FORBIDDEN':
+      return new Error('Current password is incorrect.');
+    case 'M_WEAK_PASSWORD':
+      return new Error(e?.data?.error || 'That password is too weak for this homeserver.');
+    case 'M_EXCLUSIVE':
+      return new Error('Password reset is not available for this account.');
+    default:
+      return new Error(e?.data?.error || e?.message || fallback);
+  }
+}
+
+async function uiaSetPassword(c, authStage, newPassword, logoutDevices) {
+  try {
+    return await withTimeout(c.setPassword(authStage, newPassword, logoutDevices), 30000, 'Set password');
+  } catch (e) {
+    // Homeserver wants the UIA session id threaded back into the auth dict.
+    if (e?.httpStatus === 401 && e?.data?.session) {
+      return await withTimeout(
+        c.setPassword({ ...authStage, session: e.data.session }, newPassword, logoutDevices),
+        30000,
+        'Set password'
+      );
+    }
+    throw e;
+  }
+}
+
+/**
+ * Step 1 of an email-based password reset (used from the login screen when
+ * the user is locked out). Asks the homeserver to email a verification link
+ * to `email`. Returns an opaque `creds` object the caller holds and passes
+ * back to completePasswordReset() once the user has clicked that link.
+ */
+export async function requestPasswordReset(homeserver, email) {
+  const addr = String(email || '').trim();
+  if (!addr) throw new Error('Email required');
+  if (!homeserver) throw new Error('Homeserver required');
+  const baseUrl = await discoverBaseUrl(homeserver, null);
+  const tmp = sdk.createClient({ baseUrl, logger: QUIET_LOGGER });
+  const clientSecret = tmp.generateClientSecret();
+  let res;
+  try {
+    res = await withTimeout(
+      tmp.requestPasswordEmailToken(addr, clientSecret, 1),
+      30000,
+      'Password reset email'
+    );
+  } catch (e) {
+    throw friendlyMatrixError(e, 'Could not send the reset email.');
+  }
+  return { sid: res?.sid, clientSecret, baseUrl };
+}
+
+/**
+ * Step 2 of an email-based password reset. Once the user has clicked the
+ * link the homeserver emailed, this sets the new password using the now-
+ * validated email identity as UI-auth. `creds` is the object returned by
+ * requestPasswordReset(). Other sessions are revoked so a leaked old token
+ * can't outlive the reset.
+ */
+export async function completePasswordReset(creds, newPassword) {
+  if (!newPassword) throw new Error('New password required');
+  const { sid, clientSecret, baseUrl } = creds || {};
+  if (!sid || !clientSecret || !baseUrl) {
+    throw new Error('Reset expired — start again from the email step.');
+  }
+  const tmp = sdk.createClient({ baseUrl, logger: QUIET_LOGGER });
+  const threepid = { sid, client_secret: clientSecret };
+  const authStage = {
+    type: 'm.login.email.identity',
+    // Newer spec key plus the legacy camelCase key some homeservers still read.
+    threepid_creds: threepid,
+    threepidCreds: threepid,
+  };
+  try {
+    await uiaSetPassword(tmp, authStage, newPassword, true);
+  } catch (e) {
+    throw friendlyMatrixError(e, 'Could not set the new password.');
+  }
+}
+
+/**
+ * Change the password of the signed-in account. Re-authenticates with the
+ * current password (m.login.password UI-auth) and sets the new one. By
+ * default other devices keep their sessions (logoutDevices=false) so this
+ * doesn't silently sign the user out everywhere.
+ *
+ * Note: the local vault key is derived from the Matrix password, so after a
+ * change the on-device cache can only be unlocked with the NEW password. The
+ * next cold login with the new password rotates the vault automatically (see
+ * the mismatch handling in login()); cached history re-syncs from the server.
+ */
+export async function changePassword(oldPassword, newPassword, { logoutDevices = false } = {}) {
+  if (!client) throw new Error('Not connected');
+  if (!oldPassword) throw new Error('Current password required');
+  if (!newPassword) throw new Error('New password required');
+  const userId = client.getUserId();
+  const authStage = {
+    type: 'm.login.password',
+    identifier: { type: 'm.id.user', user: userId },
+    user: userId,
+    password: oldPassword,
+  };
+  try {
+    await uiaSetPassword(client, authStage, newPassword, logoutDevices);
+  } catch (e) {
+    throw friendlyMatrixError(e, 'Could not change the password.');
+  }
+}
+
 /**
  * Restore a previously saved session. Vault must already be unlocked
  * for `userId`. Returns the client (online or offline-shimmed) or

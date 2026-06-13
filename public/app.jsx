@@ -222,7 +222,7 @@ function SyncIndicator({ status, variant = 'banner', onResync }) {
 
 function WorkspacesHome({
   session, rooms, isLive, syncReady, syncStatus, onResync,
-  onEnter, onCreate, onSignOut, onAcceptInvite,
+  onEnter, onCreate, onSignOut, onAcceptInvite, onOpenAccount,
 }) {
   const [newName, setNewName] = useState('');
   const [creating, setCreating] = useState(false);
@@ -260,7 +260,7 @@ function WorkspacesHome({
           <span>workspace</span>
         </div>
         <span className="wh-spacer" />
-        <window.IdentityChip session={session} onSignOut={onSignOut} />
+        <window.IdentityChip session={session} onSignOut={onSignOut} onOpenAccount={onOpenAccount} />
       </div>
 
       <div className="wh-body">
@@ -706,6 +706,9 @@ function App() {
   const [demoOn, setDemoOn] = useState(tweaks.demoOnStart);
 
   const [membersDialogRoomId, setMembersDialogRoomId] = useState(null);
+  // Account dashboard: null when closed, else the tab to open ('profile' |
+  // 'security' | 'people'). Live (non-demo) sessions only.
+  const [accountTab, setAccountTab] = useState(null);
 
   const [csvImport, setCsvImport] = useState(null); // {id, file, roomId} | null
   const [airtableImport, setAirtableImport] = useState(null); // {id} | null
@@ -1266,22 +1269,39 @@ function App() {
     />
   ) : null;
 
+  // The account dashboard is a fixed-position overlay, so it can ride along in
+  // either the launchpad or the in-space shell. Demo sessions don't get it
+  // (no homeserver to manage); the identity chip hides the entry point there.
+  const accountDashboardEl = (accountTab && isLive && !session?.demo) ? (
+    <window.AccountDashboard
+      session={session}
+      rooms={rooms}
+      initialTab={accountTab}
+      onClose={() => setAccountTab(null)}
+      onSignOut={() => { setAccountTab(null); handleSignOut(); }}
+    />
+  ) : null;
+
   // No room selected → show the launchpad. This is the post-login default,
   // and the place users return to when they click "← spaces" inside a space.
   if (!currentRoomId) {
     return (
-      <WorkspacesHome
-        session={session}
-        rooms={rooms}
-        isLive={isLive}
-        syncReady={syncReady}
-        syncStatus={syncStatus}
-        onResync={onResync}
-        onEnter={(id) => setCurrentRoomId(id)}
-        onCreate={onCreateRoom}
-        onSignOut={handleSignOut}
-        onAcceptInvite={handleAcceptInvite}
-      />
+      <>
+        <WorkspacesHome
+          session={session}
+          rooms={rooms}
+          isLive={isLive}
+          syncReady={syncReady}
+          syncStatus={syncStatus}
+          onResync={onResync}
+          onEnter={(id) => setCurrentRoomId(id)}
+          onCreate={onCreateRoom}
+          onSignOut={handleSignOut}
+          onAcceptInvite={handleAcceptInvite}
+          onOpenAccount={isLive ? setAccountTab : null}
+        />
+        {accountDashboardEl}
+      </>
     );
   }
 
@@ -1291,6 +1311,7 @@ function App() {
         <window.IdentityChip
           session={session}
           onSignOut={handleSignOut}
+          onOpenAccount={isLive ? setAccountTab : null}
         />
         <button
           className="topbar-spaces"
@@ -1535,6 +1556,8 @@ function App() {
           />
         );
       })()}
+
+      {accountDashboardEl}
 
       {csvImport && window.CsvImportModal && (
         <window.CsvImportModal

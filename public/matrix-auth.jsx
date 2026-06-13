@@ -199,6 +199,172 @@ function AppResetLink() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// PasswordResetBody — "forgot password" flow embedded in the login card.
+//
+// Matrix resets a forgotten password by email: the homeserver mails a
+// verification link, and only after the user clicks it does the new password
+// take effect. Two steps mirror that: (1) request the email, (2) click the
+// link then set the new password. Requires the account to have a verified
+// email and the homeserver to support email-based reset.
+// ─────────────────────────────────────────────────────────────────────────
+
+function PasswordResetBody({ defaultHomeserver, onBack }) {
+  const ML = window.MatrixLive;
+  const [step, setStep]           = useState(1);   // 1 = email · 2 = new password
+  const [homeserver, setHomeserver] = useState(defaultHomeserver || 'matrix.org');
+  const [email, setEmail]         = useState('');
+  const [creds, setCreds]         = useState(null);
+  const [pw, setPw]               = useState('');
+  const [pw2, setPw2]             = useState('');
+  const [busy, setBusy]           = useState(false);
+  const [err, setErr]             = useState(null);
+  const [done, setDone]           = useState(false);
+  const firstRef = useRef(null);
+  useEffect(() => { firstRef.current?.focus(); }, [step]);
+
+  async function sendEmail() {
+    setErr(null);
+    const hs = homeserver.trim().replace(/^https?:\/\//, '');
+    if (!email.trim()) { setErr('email address required'); return; }
+    if (!hs)           { setErr('homeserver required'); return; }
+    if (!ML?.requestPasswordReset) { setErr('matrix bridge not loaded yet — please refresh'); return; }
+    setBusy(true);
+    try {
+      const c = await ML.requestPasswordReset(hs, email.trim());
+      setCreds(c);
+      setStep(2);
+    } catch (e) {
+      setErr(e?.message || 'could not send the reset email');
+    } finally { setBusy(false); }
+  }
+
+  async function setNewPassword() {
+    setErr(null);
+    if (pw.length < 8) { setErr('use at least 8 characters'); return; }
+    if (pw !== pw2)    { setErr('passwords do not match'); return; }
+    setBusy(true);
+    try {
+      await ML.completePasswordReset(creds, pw);
+      setDone(true);
+    } catch (e) {
+      setErr(e?.message || 'could not set the new password');
+    } finally { setBusy(false); }
+  }
+
+  if (done) {
+    return (
+      <div className="login-body">
+        <div className="register-pitch" style={{borderLeftColor:'var(--triad-structure)'}}>
+          <div className="register-pitch-title">password updated ✓</div>
+          <div className="register-pitch-body">
+            your password has been reset and every other session was signed out.
+            sign in with your new password to continue.
+          </div>
+        </div>
+        <button className="login-primary" onClick={onBack}>back to sign in</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="login-body">
+      <div className="login-resetnav">
+        <button className="login-linkbtn" onClick={onBack}>← back to sign in</button>
+        <span className="login-step">step {step} of 2</span>
+      </div>
+
+      {step === 1 ? (
+        <>
+          <div className="login-sub" style={{marginTop:-4}}>
+            we'll email you a link to reset your password.
+          </div>
+          <label className="login-field">
+            <span className="login-label">email on your account</span>
+            <div className="login-input-wrap">
+              <input
+                ref={firstRef}
+                type="email"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                placeholder="you@example.com"
+                spellCheck={false}
+                disabled={busy}
+                onKeyDown={e => { if (e.key === 'Enter') sendEmail(); }}
+              />
+            </div>
+          </label>
+          <label className="login-field">
+            <span className="login-label">homeserver</span>
+            <div className="login-input-wrap">
+              <span className="login-prefix">https://</span>
+              <input
+                value={homeserver}
+                onChange={e => setHomeserver(e.target.value)}
+                placeholder="matrix.org"
+                spellCheck={false}
+                disabled={busy}
+              />
+            </div>
+            <span className="login-hint">where your account lives</span>
+          </label>
+          {err && <div className="login-err">{err}</div>}
+          <div className="login-actions">
+            <button className="login-primary" disabled={busy} onClick={sendEmail}>
+              {busy ? 'sending…' : 'send reset email'}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="register-pitch" style={{borderLeftColor:'var(--triad-structure)'}}>
+            <div className="register-pitch-title">check your inbox</div>
+            <div className="register-pitch-body">
+              we emailed <b>{email}</b> a verification link. <b>open it and confirm</b>,
+              then come back here and set your new password below.
+            </div>
+          </div>
+          <label className="login-field">
+            <span className="login-label">new password</span>
+            <div className="login-input-wrap">
+              <input
+                ref={firstRef}
+                type="password"
+                value={pw}
+                onChange={e => setPw(e.target.value)}
+                placeholder="••••••••"
+                disabled={busy}
+              />
+            </div>
+          </label>
+          <label className="login-field">
+            <span className="login-label">confirm new password</span>
+            <div className="login-input-wrap">
+              <input
+                type="password"
+                value={pw2}
+                onChange={e => setPw2(e.target.value)}
+                placeholder="••••••••"
+                disabled={busy}
+                onKeyDown={e => { if (e.key === 'Enter') setNewPassword(); }}
+              />
+            </div>
+          </label>
+          {err && <div className="login-err">{err}</div>}
+          <div className="login-actions">
+            <button className="login-primary" disabled={busy} onClick={setNewPassword}>
+              {busy ? 'updating…' : 'set new password'}
+            </button>
+            <button className="login-ghost" disabled={busy} onClick={() => { setStep(1); setErr(null); }}>
+              resend email
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // LoginScreen — gates the app
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -282,7 +448,12 @@ function LoginScreen({ onSignIn }) {
           <button className={mode === 'register' ? 'active' : ''} onClick={() => setMode('register')}>create account</button>
         </div>
 
-        {mode === 'signin' ? (
+        {mode === 'reset' ? (
+          <PasswordResetBody
+            defaultHomeserver={effectiveHomeserver}
+            onBack={() => setMode('signin')}
+          />
+        ) : mode === 'signin' ? (
           <div className="login-body">
             <label className="login-field">
               <span className="login-label">username</span>
@@ -313,7 +484,7 @@ function LoginScreen({ onSignIn }) {
                   onKeyDown={e => { if (e.key === 'Enter') submit(); }}
                 />
               </div>
-              <a className="login-hint link" href="#" onClick={e => e.preventDefault()}>forgot password</a>
+              <a className="login-hint link" href="#" onClick={e => { e.preventDefault(); setMode('reset'); }}>forgot password</a>
             </label>
 
             {!usernameIncludesServer && (
@@ -407,7 +578,7 @@ function LoginScreen({ onSignIn }) {
 // IdentityChip — topbar element, click for menu
 // ─────────────────────────────────────────────────────────────────────────
 
-function IdentityChip({ session, onSignOut }) {
+function IdentityChip({ session, onSignOut, onOpenAccount }) {
   const [open, setOpen] = useState(false);
   const [reconnectOpen, setReconnectOpen] = useState(false);
   const [pw, setPw] = useState('');
@@ -485,8 +656,9 @@ function IdentityChip({ session, onSignOut }) {
             </>
           ) : (
             <>
-              <button className="ic-panel-item" onClick={() => setOpen(false)}>account settings</button>
-              <button className="ic-panel-item" onClick={() => setOpen(false)}>security &amp; keys</button>
+              <button className="ic-panel-item" onClick={() => { setOpen(false); onOpenAccount?.('profile'); }}>account settings</button>
+              <button className="ic-panel-item" onClick={() => { setOpen(false); onOpenAccount?.('people'); }}>people &amp; permissions</button>
+              <button className="ic-panel-item" onClick={() => { setOpen(false); onOpenAccount?.('security'); }}>security &amp; keys</button>
               <button className="ic-panel-item danger" onClick={() => { setOpen(false); onSignOut(); }}>sign out</button>
             </>
           )}
@@ -623,31 +795,74 @@ function ImportButton({ roomId, disabled, isLive, onCsvFile }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// MembersDialog — manage members of a space (Matrix room).
+// Roles — Matrix power levels presented as named roles.
 //
-// Renders the current room's members as a table: mxid, membership state,
-// power level (editable inline), and a remove (kick) action. An invite
-// row at the top adds new members. All actions are gated on the signed-in
-// user's own power level — buttons disable when the action would fail.
+// Matrix has no roles, only integer power levels. The whole app converges on
+// three: member (0), moderator (50), admin (100). RoleSelect renders those as
+// a dropdown; a non-standard level still shows (as "Custom (N)") so an
+// admin-set odd value is never silently clobbered.
 // ─────────────────────────────────────────────────────────────────────────
 
-function MembersDialog({ space, mySession, onClose }) {
+const ROLE_LEVELS = [0, 50, 100];
+const ROLE_OPTIONS = [
+  { level: 0,   label: 'Member' },
+  { level: 50,  label: 'Moderator' },
+  { level: 100, label: 'Admin' },
+];
+function roleLabelForLevel(level) {
+  if (level >= 100) return 'Admin';
+  if (level >= 50)  return 'Moderator';
+  return 'Member';
+}
+
+function RoleSelect({ level, disabled, onChange, title }) {
+  const isCustom = !ROLE_LEVELS.includes(level);
+  return (
+    <select
+      className="role-select"
+      value={isCustom ? 'custom' : String(level)}
+      disabled={disabled}
+      title={title}
+      onChange={e => {
+        if (e.target.value === 'custom') return;
+        onChange(Number(e.target.value));
+      }}
+    >
+      {ROLE_OPTIONS.map(o => (
+        <option key={o.level} value={String(o.level)}>{o.label}</option>
+      ))}
+      {isCustom && <option value="custom">{`Custom (${level})`}</option>}
+    </select>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MemberManager — the reusable people-and-permissions panel for one space.
+//
+// Renders an invite row (matrix id + starting role) and a table of every
+// member with their status, an inline role dropdown, and a remove (kick)
+// button. Every action is gated on the signed-in user's own power level, so
+// buttons disable rather than fail. Used both by MembersDialog (the per-space
+// "members" button) and by the People tab of the account dashboard.
+// ─────────────────────────────────────────────────────────────────────────
+
+function MemberManager({ roomId, mySession, autoFocus }) {
   const ML = window.MatrixLive;
-  const { members, myPowerLevel } = useMembers(space?.id);
+  const { members, myPowerLevel } = useMembers(roomId);
   const [mxid, setMxid] = useState('@');
   const [level, setLevel] = useState(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const inputRef = useRef(null);
-  useEffect(() => { inputRef.current?.focus(); }, []);
+  useEffect(() => { if (autoFocus) inputRef.current?.focus(); }, [autoFocus, roomId]);
 
   // Members are lazy-loaded to keep idle memory low; pull the full list now
-  // that the dialog is open. useMembers re-renders when it arrives.
+  // that the panel is open. useMembers re-renders when it arrives.
   useEffect(() => {
-    if (space?.id && ML?.loadMembers) ML.loadMembers(space.id);
-  }, [ML, space?.id]);
+    if (roomId && ML?.loadMembers) ML.loadMembers(roomId);
+  }, [ML, roomId]);
 
-  if (!space) return null;
+  if (!roomId) return null;
   const myMxid = mySession?.mxid;
   const canInvite = myPowerLevel >= 50;
   const canKick   = myPowerLevel >= 50;
@@ -661,9 +876,9 @@ function MembersDialog({ space, mySession, onClose }) {
     }
     setErr(null); setBusy(true);
     try {
-      await ML.inviteUser(space.id, id);
+      await ML.inviteUser(roomId, id);
       if (typeof level === 'number' && level !== 0 && canSetPL) {
-        await ML.setUserPowerLevel(space.id, id, level);
+        await ML.setUserPowerLevel(roomId, id, level);
       }
       setMxid('@');
       setLevel(0);
@@ -679,7 +894,7 @@ function MembersDialog({ space, mySession, onClose }) {
     }
     if (!confirm(`Remove ${label || userId} from this workspace?`)) return;
     setErr(null); setBusy(true);
-    try { await ML.kickUser(space.id, userId); }
+    try { await ML.kickUser(roomId, userId); }
     catch (e) { setErr(e?.message || 'remove failed'); }
     finally { setBusy(false); }
   }
@@ -688,16 +903,122 @@ function MembersDialog({ space, mySession, onClose }) {
     const n = Number(newLevel);
     if (!Number.isFinite(n)) return;
     if (userId === myMxid && n < myPowerLevel) {
-      if (!confirm('Lowering your own power level may lock you out of admin actions. Continue?')) return;
+      if (!confirm('Lowering your own role may lock you out of admin actions. Continue?')) return;
     }
     setErr(null); setBusy(true);
-    try { await ML.setUserPowerLevel(space.id, userId, n); }
-    catch (e) { setErr(e?.message || 'set power level failed'); }
+    try { await ML.setUserPowerLevel(roomId, userId, n); }
+    catch (e) { setErr(e?.message || 'set role failed'); }
     finally { setBusy(false); }
   }
 
-  const myRoleLabel = myPowerLevel >= 100 ? 'admin' : myPowerLevel >= 50 ? 'mod' : 'member';
+  return (
+    <>
+      <div className="share-section">
+        <div className="share-section-label">invite member</div>
+        <div className="share-invite-row">
+          <input
+            ref={inputRef}
+            value={mxid}
+            onChange={e => setMxid(e.target.value)}
+            placeholder="@username:homeserver"
+            title="full matrix id format: @username:homeserver"
+            disabled={!canInvite || busy}
+            onKeyDown={e => { if (e.key === 'Enter') doInvite(); }}
+          />
+          <RoleSelect
+            level={level}
+            disabled={!canInvite || !canSetPL || busy}
+            onChange={setLevel}
+            title="starting role for the invited member"
+          />
+          <button className="share-invite" onClick={doInvite} disabled={!canInvite || busy}>invite</button>
+        </div>
+        {!canInvite && (
+          <div className="share-hint">you need to be a moderator or admin to invite. ask an admin.</div>
+        )}
+        {canInvite && !canSetPL && (
+          <div className="share-hint">you can invite, but assigning a role above member needs admin.</div>
+        )}
+        {err && <div className="login-err" style={{marginTop:6}}>{err}</div>}
+      </div>
 
+      <div className="share-section">
+        <div className="share-section-label">members · {members.length}</div>
+        <table className="dbgrid members-table">
+          <thead>
+            <tr>
+              <th>member</th>
+              <th>status</th>
+              <th>role</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {members.map(m => {
+              const isMe = m.userId === myMxid;
+              const canKickThis = canKick && !isMe && m.powerLevel < myPowerLevel;
+              // You can only re-role someone strictly below you (and never
+              // promote anyone above your own level — Matrix would reject it).
+              const canRoleThis = canSetPL && (isMe || m.powerLevel < myPowerLevel);
+              const nameLabel = m.displayName && m.displayName !== m.userId
+                ? m.displayName
+                : m.userId.replace(/^@/, '').split(':')[0];
+              const initial = (nameLabel[0] || '?').toUpperCase();
+              const statusLabel = m.membership === 'join' ? 'active'
+                                : m.membership === 'invite' ? 'invited'
+                                : m.membership;
+              return (
+                <tr key={m.userId}>
+                  <td title={m.userId}>
+                    <span className="share-member-avatar" style={{marginRight:8}}>
+                      {initial}
+                    </span>
+                    <span>{nameLabel}</span>
+                    {isMe && <span className="muted" style={{marginLeft:6}}>(you)</span>}
+                  </td>
+                  <td className={m.membership === 'invite' ? 'muted' : ''}>
+                    {statusLabel}
+                  </td>
+                  <td>
+                    <RoleSelect
+                      level={m.powerLevel}
+                      disabled={busy || !canRoleThis}
+                      onChange={(v) => { if (v !== m.powerLevel) doSetPL(m.userId, v); }}
+                      title={canRoleThis ? '0 = member · 50 = moderator · 100 = admin'
+                                         : 'you need a higher role to change this member'}
+                    />
+                  </td>
+                  <td>
+                    <button
+                      className="share-member-remove"
+                      disabled={!canKickThis || busy}
+                      title={isMe ? "can't remove yourself" : canKickThis ? 'remove from workspace' : 'you need a higher role to remove this member'}
+                      onClick={() => doKick(m.userId, nameLabel)}
+                    >×</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MembersDialog — per-space "members" button. A thin overlay around
+// MemberManager so the topbar/room-picker entry points keep working.
+// ─────────────────────────────────────────────────────────────────────────
+
+function MembersDialog({ space, mySession, onClose }) {
+  if (!space) return null;
+  return <MembersDialogInner space={space} mySession={mySession} onClose={onClose} />;
+}
+
+function MembersDialogInner({ space, mySession, onClose }) {
+  const { members, myPowerLevel } = useMembers(space.id);
+  const myRoleLabel = roleLabelForLevel(myPowerLevel).toLowerCase();
   return (
     <div className="share-overlay" onClick={onClose}>
       <div className="share-card" onClick={e => e.stopPropagation()}>
@@ -708,110 +1029,269 @@ function MembersDialog({ space, mySession, onClose }) {
           </div>
           <button className="share-close" onClick={onClose}>×</button>
         </div>
+        <MemberManager roomId={space.id} mySession={mySession} autoFocus />
+      </div>
+    </div>
+  );
+}
 
-        <div className="share-section">
-          <div className="share-section-label">invite member</div>
-          <div className="share-invite-row">
-            <input
-              ref={inputRef}
-              value={mxid}
-              onChange={e => setMxid(e.target.value)}
-              placeholder="username"
-              title="full matrix id format: @username:homeserver"
-              disabled={!canInvite || busy}
-              onKeyDown={e => { if (e.key === 'Enter') doInvite(); }}
-            />
-            <input
-              type="number"
-              value={level}
-              onChange={e => setLevel(Number(e.target.value))}
-              title="initial power level (0 = default, 50 = moderator, 100 = admin)"
-              min={0}
-              max={100}
-              step={1}
-              style={{width:64,padding:'6px 8px',fontSize:12}}
-              disabled={!canInvite || !canSetPL || busy}
-            />
-            <button className="share-invite" onClick={doInvite} disabled={!canInvite || busy}>invite</button>
+// ─────────────────────────────────────────────────────────────────────────
+// AccountDashboard — the signed-in user's control center.
+//
+// Four tabs: Profile (display name + identity), Security (change password +
+// recovery key), People (manage members & permissions across every space),
+// and a clean exit. Opened from the identity chip menu. Online-only actions
+// disable themselves with a hint when the session is local-only (stale).
+// ─────────────────────────────────────────────────────────────────────────
+
+function AccountDashboard({ session, rooms, initialTab, onClose, onSignOut }) {
+  const ML = window.MatrixLive;
+  const [tab, setTab] = useState(initialTab || 'profile');
+  const stale = !!session?.stale;
+
+  const joinedSpaces = (rooms || []).filter(r => r.membership === 'join');
+
+  return (
+    <div className="share-overlay" onClick={onClose}>
+      <div className="share-card acct-card" onClick={e => e.stopPropagation()}>
+        <div className="share-head">
+          <div>
+            <div className="share-title">account</div>
+            <div className="share-sub">{session?.mxid}{stale ? ' · local only' : ''}</div>
           </div>
-          {!canInvite && (
-            <div className="share-hint">you need to be a mod or admin to invite. ask an admin.</div>
-          )}
-          {canInvite && !canSetPL && (
-            <div className="share-hint">you can invite, but assigning a non-zero role needs admin.</div>
-          )}
-          {err && <div className="login-err" style={{marginTop:6}}>{err}</div>}
+          <button className="share-close" onClick={onClose}>×</button>
         </div>
 
-        <div className="share-section">
-          <div className="share-section-label">members · {members.length}</div>
-          <table className="dbgrid members-table">
-            <thead>
-              <tr>
-                <th>member</th>
-                <th>status</th>
-                <th>role</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {members.map(m => {
-                const isMe = m.userId === myMxid;
-                const canKickThis = canKick && !isMe && m.powerLevel < myPowerLevel;
-                const nameLabel = m.displayName && m.displayName !== m.userId
-                  ? m.displayName
-                  : m.userId.replace(/^@/, '').split(':')[0];
-                const initial = (nameLabel[0] || '?').toUpperCase();
-                const statusLabel = m.membership === 'join' ? 'active'
-                                  : m.membership === 'invite' ? 'invited'
-                                  : m.membership;
-                const roleLabel = m.powerLevel >= 100 ? 'admin' : m.powerLevel >= 50 ? 'mod' : 'member';
-                return (
-                  <tr key={m.userId}>
-                    <td title={m.userId}>
-                      <span className="share-member-avatar" style={{marginRight:8}}>
-                        {initial}
-                      </span>
-                      <span>{nameLabel}</span>
-                      {isMe && <span className="muted" style={{marginLeft:6}}>(you)</span>}
-                    </td>
-                    <td className={m.membership === 'invite' ? 'muted' : ''}>
-                      {statusLabel}
-                    </td>
-                    <td>
-                      <input
-                        type="number"
-                        defaultValue={m.powerLevel}
-                        min={0}
-                        max={100}
-                        step={1}
-                        disabled={!canSetPL || busy || (m.powerLevel >= myPowerLevel && !isMe)}
-                        style={{width:60,padding:'3px 6px',fontSize:12}}
-                        title="0 = member · 50 = mod · 100 = admin"
-                        onBlur={(e) => {
-                          const v = Number(e.target.value);
-                          if (v !== m.powerLevel) doSetPL(m.userId, v);
-                        }}
-                        onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
-                      />
-                      <span className="muted" style={{marginLeft:6,fontSize:11}}>{roleLabel}</span>
-                    </td>
-                    <td>
-                      <button
-                        className="share-member-remove"
-                        disabled={!canKickThis || busy}
-                        title={isMe ? "can't remove yourself" : canKickThis ? 'remove from workspace' : 'you need a higher role to remove this member'}
-                        onClick={() => doKick(m.userId, nameLabel)}
-                      >×</button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+        <div className="acct-tabs">
+          <button className={tab === 'profile'  ? 'active' : ''} onClick={() => setTab('profile')}>profile</button>
+          <button className={tab === 'security' ? 'active' : ''} onClick={() => setTab('security')}>security</button>
+          <button className={tab === 'people'   ? 'active' : ''} onClick={() => setTab('people')}>people</button>
+        </div>
+
+        {stale && (
+          <div className="acct-stale">
+            you're in local-only mode. reconnect to the homeserver to change your
+            profile, password, or members.
+          </div>
+        )}
+
+        {tab === 'profile'  && <AccountProfileTab session={session} disabled={stale} />}
+        {tab === 'security' && <AccountSecurityTab session={session} disabled={stale} onSignOut={onSignOut} />}
+        {tab === 'people'   && <AccountPeopleTab session={session} spaces={joinedSpaces} disabled={stale} />}
+      </div>
+    </div>
+  );
+}
+
+function AccountProfileTab({ session, disabled }) {
+  const ML = window.MatrixLive;
+  const profile = useMemo(() => ML?.getProfile?.() || null, [ML]);
+  const [name, setName] = useState(profile?.displayName || '');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr]   = useState(null);
+  const [saved, setSaved] = useState(false);
+
+  const mxid = profile?.mxid || session?.mxid || '';
+  const localPart = mxid.replace(/^@/, '').split(':')[0];
+  const initial = ((name || localPart || '?')[0] || '?').toUpperCase();
+
+  async function save() {
+    setErr(null); setSaved(false); setBusy(true);
+    try {
+      await ML.setMyDisplayName(name.trim());
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2500);
+    } catch (e) {
+      setErr(e?.message || 'could not update display name');
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="share-section">
+      <div className="acct-profile-head">
+        <span className="acct-avatar">{initial}</span>
+        <div className="acct-identity">
+          <div className="acct-mxid">{mxid}</div>
+          <div className="acct-meta">
+            <span><span className="acct-meta-k">homeserver</span> {profile?.homeserver || '—'}</span>
+            <span><span className="acct-meta-k">device</span> {profile?.deviceId || '—'}</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="acct-field-block">
+        <label className="login-field">
+          <span className="login-label">display name</span>
+          <div className="login-input-wrap">
+            <input
+              value={name}
+              onChange={e => setName(e.target.value)}
+              placeholder={localPart}
+              disabled={disabled || busy}
+              onKeyDown={e => { if (e.key === 'Enter') save(); }}
+            />
+          </div>
+          <span className="login-hint">how other members see you across every space.</span>
+        </label>
+        {err && <div className="login-err" style={{marginTop:8}}>{err}</div>}
+        <div className="acct-actions">
+          <button
+            className="login-primary"
+            disabled={disabled || busy || name.trim() === (profile?.displayName || '')}
+            onClick={save}
+          >
+            {busy ? 'saving…' : saved ? 'saved ✓' : 'save'}
+          </button>
         </div>
       </div>
     </div>
+  );
+}
+
+function AccountSecurityTab({ session, disabled, onSignOut }) {
+  const ML = window.MatrixLive;
+  const [cur, setCur]   = useState('');
+  const [pw, setPw]     = useState('');
+  const [pw2, setPw2]   = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr]   = useState(null);
+  const [done, setDone] = useState(false);
+
+  const [rkBusy, setRkBusy] = useState(false);
+  const [rk, setRk]         = useState(null);
+  const [rkErr, setRkErr]   = useState(null);
+  const [copied, setCopied] = useState(false);
+
+  async function changePassword() {
+    setErr(null); setDone(false);
+    if (!cur)          { setErr('enter your current password'); return; }
+    if (pw.length < 8) { setErr('new password: use at least 8 characters'); return; }
+    if (pw !== pw2)    { setErr('new passwords do not match'); return; }
+    setBusy(true);
+    try {
+      await ML.changePassword(cur, pw);
+      setDone(true);
+      setCur(''); setPw(''); setPw2('');
+    } catch (e) {
+      setErr(e?.message || 'could not change password');
+    } finally { setBusy(false); }
+  }
+
+  async function revealKey() {
+    setRkErr(null); setRkBusy(true);
+    try {
+      const key = await ML.getRecoveryKey?.();
+      if (key) setRk(key);
+      else setRkErr('no recovery key stored on this device.');
+    } catch (e) {
+      setRkErr(e?.message || 'could not read recovery key');
+    } finally { setRkBusy(false); }
+  }
+
+  async function copyKey() {
+    try {
+      await navigator.clipboard.writeText(rk);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {}
+  }
+
+  return (
+    <>
+      <div className="share-section">
+        <div className="share-section-label">change password</div>
+        <label className="login-field">
+          <span className="login-label">current password</span>
+          <div className="login-input-wrap">
+            <input type="password" value={cur} onChange={e => setCur(e.target.value)} placeholder="••••••••" disabled={disabled || busy} />
+          </div>
+        </label>
+        <label className="login-field" style={{marginTop:10}}>
+          <span className="login-label">new password</span>
+          <div className="login-input-wrap">
+            <input type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder="••••••••" disabled={disabled || busy} />
+          </div>
+        </label>
+        <label className="login-field" style={{marginTop:10}}>
+          <span className="login-label">confirm new password</span>
+          <div className="login-input-wrap">
+            <input type="password" value={pw2} onChange={e => setPw2(e.target.value)} placeholder="••••••••" disabled={disabled || busy}
+              onKeyDown={e => { if (e.key === 'Enter') changePassword(); }} />
+          </div>
+        </label>
+        {err  && <div className="login-err" style={{marginTop:8}}>{err}</div>}
+        {done && <div className="acct-ok" style={{marginTop:8}}>password changed ✓ — on next cold start, unlock this device with the new password.</div>}
+        <div className="acct-actions">
+          <button className="login-primary" disabled={disabled || busy} onClick={changePassword}>
+            {busy ? 'updating…' : 'change password'}
+          </button>
+        </div>
+      </div>
+
+      <div className="share-section">
+        <div className="share-section-label">recovery key</div>
+        <div className="share-hint" style={{marginBottom:8}}>
+          your recovery key unlocks encrypted history if you lose this device. keep it somewhere safe.
+        </div>
+        {rk ? (
+          <div className="share-link-row">
+            <div className="share-link" style={{whiteSpace:'normal',wordBreak:'break-all'}}>{rk}</div>
+            <button className="share-copy" onClick={copyKey}>{copied ? 'copied' : 'copy'}</button>
+          </div>
+        ) : (
+          <button className="login-ghost" disabled={rkBusy} onClick={revealKey}>
+            {rkBusy ? 'reading…' : 'reveal recovery key'}
+          </button>
+        )}
+        {rkErr && <div className="login-err" style={{marginTop:8}}>{rkErr}</div>}
+      </div>
+
+      <div className="share-section">
+        <div className="share-section-label">session</div>
+        <button className="login-ghost danger-ghost" onClick={() => onSignOut?.()}>sign out of this device</button>
+      </div>
+    </>
+  );
+}
+
+function AccountPeopleTab({ session, spaces, disabled }) {
+  const [roomId, setRoomId] = useState(spaces[0]?.id || null);
+
+  // Keep the selection valid as spaces load/change.
+  useEffect(() => {
+    if (!spaces.some(s => s.id === roomId)) setRoomId(spaces[0]?.id || null);
+  }, [spaces, roomId]);
+
+  if (!spaces.length) {
+    return (
+      <div className="share-section">
+        <div className="share-hint">you haven't joined any spaces yet. create or join one to manage its people.</div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="share-section">
+        <div className="share-section-label">space</div>
+        <select
+          className="acct-space-select"
+          value={roomId || ''}
+          onChange={e => setRoomId(e.target.value)}
+          disabled={disabled}
+        >
+          {spaces.map(s => (
+            <option key={s.id} value={s.id}>{s.title || 'untitled workspace'}</option>
+          ))}
+        </select>
+        <div className="share-hint" style={{marginTop:6}}>
+          permissions are per space — invite people and set their role for the selected space.
+        </div>
+      </div>
+      {!disabled && roomId && (
+        <MemberManager key={roomId} roomId={roomId} mySession={session} />
+      )}
+    </>
   );
 }
 
@@ -826,6 +1306,8 @@ Object.assign(window, {
   LoginScreen,
   IdentityChip,
   MembersDialog,
+  MemberManager,
+  AccountDashboard,
   ImportButton,
   // Console escape hatch: window.hardResetFromSource() force-refreshes the app
   // code (clears the PWA shell cache + service worker) without wiping data.
