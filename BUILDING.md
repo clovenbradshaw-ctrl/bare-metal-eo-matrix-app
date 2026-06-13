@@ -219,6 +219,54 @@ load it from the local vault cache. (b) In rooms created before this
 feature, members below the state power level can't publish their chain
 head; new rooms grant PL 0 for the three `<ns>.*` state types at creation.
 
+### Optional off-site mirror: n8n → Google Drive (`src/drivebackup.js`)
+
+The block chain lives on the homeserver's media store. If that store evicts
+a blob under a retention policy — or a cold device pays a round-trip per
+block — recovery degrades. `src/drivebackup.js` adds a **second copy of every
+block in a place you control**: a Google Drive file reached through an n8n
+webhook. It is **opt-in and purely additive** — the primary append/recovery
+path is unchanged whether or not it is configured.
+
+The encryption invariant holds. Only a block's **WCK-encrypted ciphertext**
+— the exact bytes already in the media store — is sent (base64-wrapped) to
+the webhook, so n8n and Drive see opaque blobs they cannot decrypt. Every
+block read back is verified against its `sha256` by `decodeBlock` before the
+fold trusts it, so a malicious or buggy webhook can no more inject data than
+a tampered media blob can. This slots into the existing chain loader as a
+second block source:
+
+- **Backup (up).** `appendBlock` mirrors each block as it is committed
+  (`mirrorBlock`, best-effort, detached — a mirror failure never fails the
+  append).
+- **Hydration (down).** `fetchBlock` resolves a block by content hash from
+  Drive. In **fast mode** Drive is tried *before* the media store; otherwise
+  it is the fallback for a block the media store can't serve. The whole chain
+  is pulled in **one GET** and cached, so loading N blocks costs one request.
+
+Auth uses your **live Matrix access token** (no app-managed secret): each
+request carries `Authorization: Bearer <token>`, which the n8n flow replays
+to the homeserver's `/account/whoami` and checks against an allowlist. The
+n8n contract (matching the supplied workflow) is two webhook nodes:
+
+```
+POST <backupUrl>   body { payload: { room, idx, sha256, mxc, ts, data } }   // data = base64(ciphertext)
+                   → n8n hash-chains payload into one Drive JSON file
+GET  <hydrateUrl>  → returns the whole chain { version, head, blocks:[{…,payload}] }
+```
+
+Config is per-user, **vault-encrypted at rest**, and set from the console:
+
+```js
+window.MatrixLive.setDriveBackup({
+  backupUrl:  'https://n8n.intelechia.com/webhook/731463c6-3200-4163-b497-7986bf5ad10d',
+  hydrateUrl: 'https://n8n.intelechia.com/webhook/08ceaacf-326b-4c97-87b7-d5ec6b58f333',
+  fast: false,                 // true ⇒ prefer Drive over the media store on reads
+});
+window.MatrixLive.getDriveBackup()    // { backupUrl, hydrateUrl, fast, canBackup, canHydrate }
+await window.MatrixLive.testDriveBackup()   // hits hydrate → { ok, status, blocks }
+```
+
 ---
 
 ## 4. Building a new app — the minimum viable path

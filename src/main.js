@@ -31,7 +31,7 @@ import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          onDecrypted, onLocalEchoUpdated, EventStatus,
          setName as mxSetRoomName, getDisplayName as mxGetDisplayName } from './rooms.js';
 import { EventStore, requestPersistentStorage, getOpfsBreakdown } from './store.js';
-import { vault, getLastUser } from './vault.js';
+import { vault, getLastUser, loadSecret, storeSecret, removeSecret } from './vault.js';
 import { OutboxFlusher, listAll as outboxListAll, pendingCount,
          onChange as onOutboxChange, remove as outboxRemove } from './outbox.js';
 import { onNetworkChange, getNetworkState } from './network.js';
@@ -42,6 +42,7 @@ import { ensureIdentity, loadIdentityFromVault, getIdentity, clearIdentity } fro
 import { ensureWorkspaceKey, publishMemberKey, grantWorkspaceKey,
          adoptGrantedKey, clearWorkspaceKeys } from './crypto/workspaceKey.js';
 import { appendBlock, loadChains, readOwnHead } from './blocks.js';
+import * as driveBackup from './drivebackup.js';
 
 const NAMESPACE = 'io.matrix-events';
 const ROOM_TYPE = 'eo.workspace';
@@ -69,6 +70,10 @@ const SDK_MAINTENANCE_INTERVAL_MS = 15_000;
 const META_STATE_TYPE = `${NAMESPACE}.meta`;
 
 setNamespace(NAMESPACE);
+
+// The Drive backup webhook authenticates by replaying our live Matrix access
+// token to the homeserver's /whoami, so hand it an accessor for that token.
+driveBackup.setAuthTokenProvider(() => getClient()?.getAccessToken?.() || null);
 
 // ── Live state ──
 const subscribers = new Set();
@@ -517,6 +522,11 @@ async function afterAuth(userId, homeserver) {
   startMemoryGovernor();
   ensureDurableStorage();
 
+  // Load this user's off-site backup config (vault-encrypted at rest) so the
+  // block chain can mirror to / hydrate from their n8n → Drive webhook.
+  driveBackup.loadConfig(userId, loadSecret)
+    .catch(e => console.warn('[bridge] drive backup config load failed:', e?.message || e));
+
   if (unsubRoomChanges) unsubRoomChanges();
   unsubRoomChanges = onRoomChanges(() => {
     refreshManifestFromLive();
@@ -563,6 +573,9 @@ async function afterAuthStale(userId, homeserver) {
 
   startMemoryGovernor();
   ensureDurableStorage();
+
+  driveBackup.loadConfig(userId, loadSecret)
+    .catch(e => console.warn('[bridge] drive backup config load failed:', e?.message || e));
 
   if (unsubRoomChanges) { unsubRoomChanges(); unsubRoomChanges = null; }
 
@@ -664,6 +677,7 @@ async function tearDownLiveState() {
   roomBlockSync.clear();
   clearWorkspaceKeys();
   clearIdentity();
+  driveBackup.clearConfig();
   identityReady = Promise.resolve(null);
   for (const [, fns] of roomUnsubs) fns.forEach(fn => { try { fn(); } catch {} });
   roomUnsubs.clear();
@@ -1253,6 +1267,9 @@ function waitForPrepared(timeoutMs = 12_000) {
 async function syncAllRooms() {
   if (syncStatus.phase === 'syncing') return getSyncStatus();
 
+  // A manual resync should reflect the latest off-site chain, not a cached pull.
+  driveBackup.invalidateChain();
+
   const seen = new Set();
   const targets = [];
   for (const r of listRooms()) {
@@ -1679,6 +1696,16 @@ window.MatrixLive = {
   getBlockStats,
   forceBlockSync,
   hasEnvelopeIdentity: () => !!getIdentity(),
+  // Off-site backup / fast hydration (n8n → Google Drive). Opt-in, per-user,
+  // vault-encrypted config; mirrors WCK-encrypted blocks the homeserver can't
+  // read and serves them back on a cold or lossy hydrate.
+  getDriveBackup: () => driveBackup.getConfig(),
+  setDriveBackup: (cfg) => {
+    const userId = activeSession?.mxid;
+    if (!userId) throw new Error('Sign in before configuring backup');
+    return driveBackup.saveConfig(userId, cfg, { storeSecret, removeSecret });
+  },
+  testDriveBackup: () => driveBackup.testConnection(),
   // Cold-start full sync (durable chain → OPFS) + its progress surface
   getSyncStatus,
   resync: syncAllRooms,

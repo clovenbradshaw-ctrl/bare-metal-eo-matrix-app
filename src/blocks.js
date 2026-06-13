@@ -38,6 +38,7 @@
 
 import { getClient } from './client.js';
 import { fetchMxcBytes, cacheMediaBytes, getCachedMediaBytes } from './media.js';
+import * as driveBackup from './drivebackup.js';
 import {
   encodeBlock, decodeBlock, mergeChainEvents, capManifest, manifestEntry,
 } from './crypto/blockcodec.js';
@@ -133,6 +134,15 @@ export async function appendBlock(namespace, roomId, wck, events, head, manifest
   // Mirror the decoded block locally so re-opens skip download + decrypt.
   await cacheMediaBytes(mxc, plaintext);
 
+  // BACKUP (up): mirror the SAME encrypted ciphertext off-site to the user's
+  // n8n → Google Drive webhook, when configured. Best-effort and detached —
+  // a backup failure must never fail the primary append (the block is
+  // already in the media store). Drive sees only opaque ciphertext.
+  if (driveBackup.canBackup()) {
+    driveBackup.mirrorBlock({ roomId, idx, sha256, mxc, bytes })
+      .catch(() => {});
+  }
+
   return { mxc, sha256, idx, manifest: kept, base };
 }
 
@@ -183,37 +193,57 @@ function sanitizeHead(content) {
 
 /**
  * Fetch + decode one block by pointer. Tries the local OPFS mirror first
- * (verified at download time), else downloads, verifies the ciphertext
- * hash, decodes, and mirrors. Returns the decoded block or null on any
- * failure (offline, blob gone, tampered, undecryptable).
+ * (verified at download time), then the configured block sources in order,
+ * verifying the ciphertext hash before trusting any of them, and mirrors the
+ * decoded result. Returns the decoded block or null on any failure (offline,
+ * blob gone, tampered, undecryptable).
+ *
+ * The off-site n8n → Drive backup (drivebackup.js) joins as a second source:
+ * in "fast" mode it is tried BEFORE the homeserver media store (cold device /
+ * slow or lossy media store); otherwise it is the FALLBACK for a block the
+ * media store can't serve — or serves corrupted, since a hash mismatch on one
+ * source just moves on to the next. Every source's bytes pass through
+ * decodeBlock's sha256 check, so an untrusted webhook can never inject a block.
  */
-async function fetchBlock(wck, mxc, sha256) {
+async function fetchBlock(wck, mxc, sha256, roomId) {
   const cached = await getCachedMediaBytes(mxc);
   if (cached) {
     try { return JSON.parse(decoder.decode(cached)); } catch { /* fall through */ }
   }
-  const ct = await fetchMxcBytes(mxc);
-  if (!ct) return null;                                    // offline / blob gone
-  let block;
-  try {
-    block = await decodeBlock(wck, ct, sha256);
-  } catch (e) {
-    console.warn('[blocks] bad block at', mxc, '—', e?.message || e);
-    return null;
+
+  const fromDrive = () =>
+    (driveBackup.canHydrate() ? driveBackup.getBlock({ roomId, sha256, mxc }) : null);
+  const fromMedia = () => fetchMxcBytes(mxc);
+  const sources = driveBackup.isFast()
+    ? [fromDrive, fromMedia]                                // fast: Drive first
+    : [fromMedia, fromDrive];                               // default: media first
+
+  for (const getCiphertext of sources) {
+    let ct;
+    try { ct = await getCiphertext(); } catch { ct = null; }
+    if (!ct) continue;                                      // offline / blob gone
+    let block;
+    try {
+      block = await decodeBlock(wck, ct, sha256);
+    } catch (e) {
+      console.warn('[blocks] bad block at', mxc, '—', e?.message || e);
+      continue;                                             // try the next source
+    }
+    try {
+      await cacheMediaBytes(mxc, encoder.encode(JSON.stringify(block)));
+    } catch { /* mirror is best-effort */ }
+    return block;
   }
-  try {
-    await cacheMediaBytes(mxc, encoder.encode(JSON.stringify(block)));
-  } catch { /* mirror is best-effort */ }
-  return block;
+  return null;
 }
 
 /** Walk one chain head → genesis serially. Returns { blocks, complete }. */
-async function walkChain(wck, head) {
+async function walkChain(wck, head, roomId) {
   const blocks = [];
   let ptr = head;
   let guard = 0;
   while (ptr && guard++ < MAX_CHAIN_BLOCKS) {
-    const block = await fetchBlock(wck, ptr.mxc, ptr.sha256);
+    const block = await fetchBlock(wck, ptr.mxc, ptr.sha256, roomId);
     if (!block) return { blocks, complete: false };
     blocks.push(block);
     ptr = block.prev;
@@ -226,14 +256,14 @@ async function walkChain(wck, head) {
  * Returns { blocks, complete } where complete is false if any entry failed.
  * `onBlock` is called once per resolved entry for progress reporting.
  */
-async function fetchManifestBlocks(wck, manifest, onBlock) {
+async function fetchManifestBlocks(wck, manifest, onBlock, roomId) {
   const out = new Array(manifest.length).fill(null);
   let complete = true;
   let next = 0;
   async function worker() {
     while (next < manifest.length) {
       const k = next++;
-      const block = await fetchBlock(wck, manifest[k].m, manifest[k].h);
+      const block = await fetchBlock(wck, manifest[k].m, manifest[k].h, roomId);
       if (block) out[k] = block; else complete = false;
       if (onBlock) onBlock();
     }
@@ -250,17 +280,17 @@ async function fetchManifestBlocks(wck, manifest, onBlock) {
  * listed block. Falls back entirely to the serial walk for legacy heads
  * that predate manifests.
  */
-async function loadChainBlocks(wck, info, onBlock) {
+async function loadChainBlocks(wck, info, onBlock, roomId) {
   const { head, manifest, manifestBase } = info;
-  if (!manifest) return walkChain(wck, head);
+  if (!manifest) return walkChain(wck, head, roomId);
 
-  const { blocks, complete } = await fetchManifestBlocks(wck, manifest, onBlock);
+  const { blocks, complete } = await fetchManifestBlocks(wck, manifest, onBlock, roomId);
   if (!complete || !(manifestBase > 0)) return { blocks, complete };
 
   // The manifest dropped its oldest entries to fit room state. Walk the
   // remaining tail from the oldest listed block's prev pointer.
   const oldest = blocks.reduce((m, b) => (b.idx < m.idx ? b : m), blocks[0]);
-  const tail = oldest?.prev ? await walkChain(wck, oldest.prev) : { blocks: [], complete: true };
+  const tail = oldest?.prev ? await walkChain(wck, oldest.prev, roomId) : { blocks: [], complete: true };
   return { blocks: blocks.concat(tail.blocks), complete: tail.complete };
 }
 
