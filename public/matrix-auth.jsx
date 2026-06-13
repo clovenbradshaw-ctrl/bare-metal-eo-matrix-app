@@ -89,16 +89,36 @@ function useSession() {
     if (demo) return demo;
     return ML?.getSession?.() || null;
   });
-  const [booting, setBooting] = useState(() => !!ML?.isBooting?.());
+  const [booting, setBooting] = useState(() => {
+    const M = typeof window !== 'undefined' ? window.MatrixLive : null;
+    // No bridge on `window` yet means its module is still resolving: the
+    // crypto wasm pulls main.js's import graph behind a top-level await, so
+    // the bridge can publish `window.MatrixLive` AFTER this component first
+    // renders. Treat that as "still booting" so we show the resume splash
+    // instead of flashing the login screen before auto-restore can run.
+    if (!M) return true;
+    return !!M.isBooting?.();
+  });
 
-  // The bridge runs an async auto-restore on cold boot; subscribe so
-  // React picks up the resumed session (or the "nothing to resume"
-  // signal) without flashing the login screen.
+  // Pick up the cold-boot auto-restore. This must survive two races that
+  // would otherwise strand a signed-in user on the login screen after a
+  // refresh — i.e. log them out across a reload:
+  //
+  //   1. `window.MatrixLive` may not exist yet when this effect runs (its
+  //      module is still behind the crypto-wasm top-level await). Bailing
+  //      out here would mean we never hear that a session was restored, so
+  //      instead poll briefly until the bridge appears, then subscribe.
+  //   2. The bridge fires a single 'session' notify when restore settles. If
+  //      that fired in the gap between this component's first render and this
+  //      effect running, the subscription alone would miss it — so reconcile
+  //      (re-read getSession()/isBooting()) immediately after subscribing.
   useEffect(() => {
-    const M = window.MatrixLive;
-    if (!M?.subscribe) return;
-    return M.subscribe((reason) => {
-      if (reason !== 'session') return;
+    let unsub = null;
+    let pollId = null;
+    let tries = 0;
+    const MAX_TRIES = 200;   // ~10s at 50ms, then fall back to the login screen
+
+    const reconcile = (M) => {
       setBooting(!!M.isBooting?.());
       setSession((current) => {
         if (current?.demo) return current;       // demo is user-driven
@@ -108,7 +128,38 @@ function useSession() {
         // drop down to the login screen.
         return current && !current.demo ? null : current;
       });
-    });
+    };
+
+    const attach = (M) => {
+      unsub = M.subscribe((reason) => {
+        if (reason !== 'session') return;
+        reconcile(M);
+      });
+      reconcile(M);   // catch a notify fired before we subscribed
+    };
+
+    const M = window.MatrixLive;
+    if (M?.subscribe) {
+      attach(M);
+    } else {
+      pollId = setInterval(() => {
+        const late = window.MatrixLive;
+        if (late?.subscribe) {
+          clearInterval(pollId); pollId = null;
+          attach(late);
+        } else if (++tries >= MAX_TRIES) {
+          // Bridge never came up — stop waiting and let the login screen
+          // render rather than spinning on the splash forever.
+          clearInterval(pollId); pollId = null;
+          setBooting(false);
+        }
+      }, 50);
+    }
+
+    return () => {
+      if (pollId) clearInterval(pollId);
+      if (unsub) unsub();
+    };
   }, []);
 
   useEffect(() => { saveSession(session); }, [session]);
