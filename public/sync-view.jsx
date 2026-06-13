@@ -473,6 +473,6 @@ function SyncView({
   );
 }
 
-window.SyncView = SyncView;
+window.SyncView = React.memo(SyncView);
 
 })();

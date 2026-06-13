@@ -1,7 +1,7 @@
 /* app.jsx — root: rooms store, mode switch, scrubber, tweaks */
 
 (function() {
-const { useState, useMemo, useEffect, useRef } = React;
+const { useState, useMemo, useEffect, useRef, useCallback } = React;
 const ME = window.MatrixEngine;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -866,6 +866,43 @@ function App() {
     return Array.from(dead);
   }, [state, importEntities, activeImportAnchors]);
 
+  // Drop cached row arrays for imports that aren't active anymore — a re-synced
+  // table supersedes its old import anchor and the old rows would otherwise sit
+  // in memory forever. (A 50k-row Airtable table is ~10MB per cached generation.)
+  useEffect(() => {
+    const cache = importRowsRef.current;
+    let pruned = false;
+    for (const a of Object.keys(cache)) {
+      if (!activeImportAnchors.has(a)) { delete cache[a]; pruned = true; }
+    }
+    if (pruned) {
+      // Also clear any retry bookkeeping for the dropped anchors.
+      for (const a of Object.keys(retryRef.current)) {
+        if (!activeImportAnchors.has(a)) delete retryRef.current[a];
+      }
+    }
+  }, [activeImportAnchors]);
+
+  // Under memory pressure, drop the cached import-row arrays — the materialize
+  // effect above will re-fetch them on demand from the encrypted source blob
+  // (OPFS / media store), so this is recoverable shedding, not data loss.
+  // Critical-only: a soft pressure that hits during a fresh import would yank
+  // the rows the user is staring at; critical means we'd OOM otherwise.
+  useEffect(() => {
+    const ML = window.MatrixLive;
+    if (!ML?.registerMemoryEvictor) return;
+    return ML.registerMemoryEvictor('import-rows', () => {
+      const cache = importRowsRef.current;
+      const keys = Object.keys(cache);
+      if (keys.length === 0) return false;
+      for (const k of keys) delete cache[k];
+      noProgressRef.current = 0;
+      lastPendingRef.current = -1;
+      setImportRowsVersion(v => v + 1);
+      return true;
+    }, { priority: 50, level: 'critical' });
+  }, []);
+
   // The table the user is looking at — its import chunks materialize first.
   const activeSet = selection?.tableId || null;
 
@@ -1091,6 +1128,140 @@ function App() {
     syncTables.some(t => t.expected > t.localRows)
   );
 
+  // ── Memoized props + stable callbacks for the children below ──────────
+  // Run BEFORE the session gate so the hook order stays constant whether
+  // we render the launchpad/in-space shell or the login screen.
+
+  // Memoize `rooms` against a cheap signature of the data — in live mode
+  // ML.listRooms() returns a fresh array every call, so without this every
+  // App render creates a new identity and busts every downstream memo.
+  const liveRoomsArr = isLive ? liveStore.rooms : null;
+  const liveRoomsSig = isLive
+    ? liveRoomsArr.map(r => `${r.id}|${r.eventCount}|${r.title || ''}|${r.membership || ''}|${r.encrypted ? 1 : 0}|${r.inviter || ''}`).join(';')
+    : '';
+  const demoRoomsSig = !isLive
+    ? roomIds.map(id => `${id}|${byRoom[id].length}|${demoTitleOverrides[id] || ''}`).join(';')
+    : '';
+  const rooms = useMemo(() => (
+    isLive
+      ? liveRoomsArr
+      : roomIds.map(id => ({
+          id,
+          eventCount: byRoom[id].length,
+          namespace: 'demo.tasks',
+          title: demoTitleOverrides[id] || id.replace(/^!/, '').replace(/_/g, ' '),
+        }))
+  ), [isLive, liveRoomsSig, demoRoomsSig]); // eslint-disable-line react-hooks/exhaustive-deps
+  const currentRoom = useMemo(
+    () => rooms.find(r => r.id === currentRoomId) || null,
+    [rooms, currentRoomId]
+  );
+
+  // Stable callback identities so descendants wrapped in React.memo don't
+  // re-render every time App re-renders (e.g. on ephemeral fade-outs).
+  // Refs let the closures read live state without changing identity.
+  const liveStoreRef = useRef(liveStore);
+  liveStoreRef.current = liveStore;
+  const demoStoreRef = useRef(demoStore);
+  demoStoreRef.current = demoStore;
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
+  const currentRoomIdRef = useRef(currentRoomId);
+  currentRoomIdRef.current = currentRoomId;
+
+  const onEmit = useCallback(async (op, content) => {
+    const roomId = currentRoomIdRef.current;
+    if (!roomId) return;
+    if (sessionRef.current && !sessionRef.current.demo) {
+      try { await liveStoreRef.current.emit(roomId, op, content); }
+      catch (e) { console.warn('[app] live emit failed:', e); }
+    } else {
+      demoStoreRef.current.emit(roomId, op, content, sessionRef.current?.mxid);
+    }
+    setCursor(Infinity);
+  }, []);
+
+  const onEmitRef = useRef(onEmit);
+  onEmitRef.current = onEmit;
+
+  const onEphemeral = useCallback((op, content) => {
+    const id = ++ephCounterRef.current;
+    const entry = { id, opKey: op.key, content, ts: Date.now() };
+    setEphemerals(arr => [...arr, entry].slice(-6));
+    setTimeout(() => setEphemerals(arr => arr.filter(e => e.id !== id)), 4500);
+  }, []);
+
+  // Scrubber callbacks (used by the memoized scrubberEl below).
+  const onScrubberSeek = useCallback((n) => setCursor(n), []);
+  const onScrubberLive = useCallback(() => setCursor(Infinity), []);
+  const scrubberEl = useMemo(() => (
+    (scrubberOpen || !live) ? (
+      <Scrubber
+        cursor={effectiveCursor}
+        total={total}
+        ts={ts}
+        onSeek={onScrubberSeek}
+        onLive={onScrubberLive}
+        live={live}
+      />
+    ) : null
+  ), [scrubberOpen, live, effectiveCursor, total, ts, onScrubberSeek, onScrubberLive]);
+
+  // Sidebar / TableView callbacks — stable across renders.
+  const onAirtableSchemaCb = useCallback(
+    () => setAirtableImport({ id: Date.now() }),
+    []
+  );
+  const onExportSchemaCb = useCallback(
+    () => setExportingSchema(true),
+    []
+  );
+  const onCreateTableCb = useCallback((name) => {
+    const ME = window.MatrixEngine;
+    const existing = stateRef.current.schema?.tables || [];
+    if (existing.includes(name)) {
+      setSelection({ kind: 'slice', sliceId: `${name}.table`, tableId: name, sliceKind: 'table' });
+      return;
+    }
+    onEmitRef.current(ME.OP.DEF, { anchor: null, path: '_schema.tables', value: [...existing, name] });
+    onEmitRef.current(ME.OP.DEF, {
+      anchor: null,
+      path: `_schema.fields.${name}`,
+      value: [
+        { name: 'Name', type: 'text' },
+        { name: 'Field 1', type: 'text' },
+      ],
+    });
+    const ts = Date.now();
+    const anchor = ME.makeAnchor(name, {}, '@you:demo', ts);
+    onEmitRef.current(ME.OP.INS, { anchor, entity_type: name, payload: {} });
+    setSelection({ kind: 'slice', sliceId: `${name}.table`, tableId: name, sliceKind: 'table' });
+  }, []);
+  const onUpdateViewCb = useMemo(() => (
+    selection.kind === 'slice' && selection.viewId
+      ? (patch) => {
+          const sel = selectionRef.current;
+          const cur = stateRef.current.schema?.views?.[sel.tableId] || [];
+          const next = cur.map(v => v.id === sel.viewId ? { ...v, ...patch } : v);
+          onEmitRef.current(ME.OP.DEF, { anchor: null, path: `_schema.views.${sel.tableId}`, value: next });
+        }
+      : null
+  ), [selection.kind, selection.viewId]);
+  const onSaveAsViewCb = useCallback((cfg) => {
+    const sel = selectionRef.current;
+    if (sel.kind !== 'slice') return;
+    const cur = stateRef.current.schema?.views?.[sel.tableId] || [];
+    const n = cur.filter(v => v.kind === 'table').length + 2;
+    const id = 'v' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
+    const view = { id, name: `Table ${n}`, kind: 'table', filters: cfg.filters || [], sorts: cfg.sorts || [], hidden: cfg.hidden || [] };
+    onEmitRef.current(ME.OP.DEF, { anchor: null, path: `_schema.views.${sel.tableId}`, value: [...cur, view] });
+    setSelection({ kind: 'slice', sliceId: `${sel.tableId}.view.${view.id}`, tableId: sel.tableId, sliceKind: 'table', viewId: view.id, _seed: { filters: cfg.filters, sorts: cfg.sorts, hidden: cfg.hidden } });
+  }, []);
+
   // Gate the app on auth (or demo session) — every hook is above this line.
   // While the bridge is still trying to resume a session from the
   // sessionStorage vault stash, show a splash instead of flashing the
@@ -1126,15 +1297,6 @@ function App() {
 
   const ts = effectiveCursor > 0 ? allEvents[effectiveCursor - 1].origin_server_ts : null;
 
-  const rooms = isLive
-    ? liveStore.rooms
-    : roomIds.map(id => ({
-        id,
-        eventCount: byRoom[id].length,
-        namespace: 'demo.tasks',
-        title: demoTitleOverrides[id] || id.replace(/^!/, '').replace(/_/g, ' '),
-      }));
-
   const lastEventTs = allEvents.length
     ? allEvents[allEvents.length - 1].origin_server_ts
     : null;
@@ -1147,24 +1309,6 @@ function App() {
     } else {
       setDemoTitleOverrides(o => ({ ...o, [currentRoomId]: name }));
     }
-  }
-
-  async function onEmit(op, content) {
-    if (!currentRoomId) return;
-    if (isLive) {
-      try { await liveStore.emit(currentRoomId, op, content); }
-      catch (e) { console.warn('[app] live emit failed:', e); }
-    } else {
-      demoStore.emit(currentRoomId, op, content, session.mxid);
-    }
-    setCursor(Infinity);
-  }
-
-  function onEphemeral(op, content) {
-    const id = ++ephCounterRef.current;
-    const entry = { id, opKey: op.key, content, ts: Date.now() };
-    setEphemerals(arr => [...arr, entry].slice(-6));
-    setTimeout(() => setEphemerals(arr => arr.filter(e => e.id !== id)), 4500);
   }
 
   // Capture meaningful UI activity (button clicks, tab switches, slice picks)
@@ -1277,16 +1421,11 @@ function App() {
     setCursor(Infinity);
   }
 
-  const scrubberEl = (scrubberOpen || !live) ? (
-    <Scrubber
-      cursor={effectiveCursor}
-      total={total}
-      ts={ts}
-      onSeek={(n) => setCursor(n)}
-      onLive={() => setCursor(Infinity)}
-      live={live}
-    />
-  ) : null;
+  // Saved view bound to the current selection — picked up by the TableView
+  // callbacks defined above (uses selectionRef to read live).
+  const savedViewForSelection = selection.kind === 'slice'
+    ? (activeSavedView || selection._seed || null)
+    : null;
 
   // The account dashboard is a fixed-position overlay, so it can ride along in
   // either the launchpad or the in-space shell. Demo sessions don't get it
@@ -1356,7 +1495,7 @@ function App() {
           />
         )}
         {isLive && currentRoomId && (() => {
-          const r = rooms.find(x => x.id === currentRoomId);
+          const r = currentRoom;
           if (!r || r.membership !== 'join') return null;
           const stale = !!session?.stale;
           return (
@@ -1398,38 +1537,17 @@ function App() {
 
       <div className="shell-body">
         <window.Sidebar
-          room={rooms.find(r => r.id === currentRoomId)}
+          room={currentRoom}
           state={renderState}
           selection={selection}
           setSelection={setSelection}
-          onAirtableSchema={() => setAirtableImport({ id: Date.now() })}
-          onExportSchema={() => setExportingSchema(true)}
+          onAirtableSchema={onAirtableSchemaCb}
+          onExportSchema={onExportSchemaCb}
           onCreateView={createView}
           onRenameView={renameView}
           onDuplicateView={duplicateView}
           onDeleteView={deleteView}
-          onCreateTable={(name) => {
-            const ME = window.MatrixEngine;
-            const existing = state.schema?.tables || [];
-            if (existing.includes(name)) {
-              setSelection({ kind: 'slice', sliceId: `${name}.table`, tableId: name, sliceKind: 'table' });
-              return;
-            }
-            onEmit(ME.OP.DEF, { anchor: null, path: '_schema.tables', value: [...existing, name] });
-            onEmit(ME.OP.DEF, {
-              anchor: null,
-              path: `_schema.fields.${name}`,
-              value: [
-                { name: 'Name', type: 'text' },
-                { name: 'Field 1', type: 'text' },
-              ],
-            });
-            // Seed one empty row so the user lands on a typeable grid, not an empty state.
-            const ts = Date.now();
-            const anchor = ME.makeAnchor(name, {}, '@you:demo', ts);
-            onEmit(ME.OP.INS, { anchor, entity_type: name, payload: {} });
-            setSelection({ kind: 'slice', sliceId: `${name}.table`, tableId: name, sliceKind: 'table' });
-          }}
+          onCreateTable={onCreateTableCb}
           eventsTotal={total}
           ephemeralsCount={ephemerals.length}
           onRenameRoom={onRenameCurrentRoom}
@@ -1461,7 +1579,7 @@ function App() {
           )}
           {selection.kind === 'sync' && (
             <window.SyncView
-              room={rooms.find(r => r.id === currentRoomId)}
+              room={currentRoom}
               isLive={isLive}
               session={session}
               tables={syncTables}
@@ -1485,7 +1603,7 @@ function App() {
           )}
           {selection.kind === 'chat' && (
             <window.ChatView
-              room={rooms.find(r => r.id === currentRoomId)}
+              room={currentRoom}
               state={renderState}
               setSelection={setSelection}
             />
@@ -1493,28 +1611,21 @@ function App() {
           {selection.kind === 'slice' && (selection.sliceKind === 'table') && (
             <window.TableView
               key={selection.sliceId}
-              room={rooms.find(r => r.id === currentRoomId)}
+              room={currentRoom}
               state={renderState}
               onEmit={onEmit}
               tweaks={tweaks}
               scrubber={scrubberEl}
               forceTable={selection.tableId}
               setSelection={setSelection}
-              savedView={activeSavedView || selection._seed || null}
-              onUpdateView={selection.viewId
-                ? (patch) => updateViewConfig(selection.tableId, selection.viewId, patch)
-                : null}
-              onSaveAsView={(cfg) => {
-                const v = createView(selection.tableId, { name: nextViewName(selection.tableId, 'table'), kind: 'table', ...cfg });
-                // Carry the config on the selection so the grid mounts with it
-                // even before the new view's DEF has folded back in (live mode).
-                setSelection({ kind: 'slice', sliceId: `${selection.tableId}.view.${v.id}`, tableId: selection.tableId, sliceKind: 'table', viewId: v.id, _seed: { filters: cfg.filters, sorts: cfg.sorts, hidden: cfg.hidden } });
-              }}
+              savedView={savedViewForSelection}
+              onUpdateView={onUpdateViewCb}
+              onSaveAsView={onSaveAsViewCb}
             />
           )}
           {selection.kind === 'slice' && selection.sliceKind === 'schema' && (
             <window.TableSchemaView
-              room={rooms.find(r => r.id === currentRoomId)}
+              room={currentRoom}
               state={renderState}
               entityType={selection.tableId}
               scrubber={scrubberEl}
@@ -1523,7 +1634,7 @@ function App() {
           )}
           {selection.kind === 'slice' && selection.sliceKind === 'kanban' && (
             <window.AppView
-              room={rooms.find(r => r.id === currentRoomId)}
+              room={currentRoom}
               state={renderState}
               onEmit={onEmit}
               scrubber={scrubberEl}
@@ -1533,7 +1644,7 @@ function App() {
           )}
           {selection.kind === 'slice' && selection.sliceKind === 'notebook' && (
             <window.AppView
-              room={rooms.find(r => r.id === currentRoomId)}
+              room={currentRoom}
               state={renderState}
               onEmit={onEmit}
               scrubber={scrubberEl}
@@ -1543,7 +1654,7 @@ function App() {
           )}
           {selection.kind === 'slice' && selection.sliceKind === 'graph' && (
             <window.GraphView
-              room={rooms.find(r => r.id === currentRoomId)}
+              room={currentRoom}
               state={renderState}
               onEmit={onEmit}
               scrubber={scrubberEl}
@@ -1552,7 +1663,7 @@ function App() {
           )}
           {selection.kind === 'slice' && selection.sliceKind === 'timeline' && (
             <window.EntityTimelineView
-              room={rooms.find(r => r.id === currentRoomId)}
+              room={currentRoom}
               state={renderState}
               entityType={selection.tableId}
               entityAnchor={selection.entityAnchor}
@@ -1612,7 +1723,7 @@ function App() {
 
       {exportingSchema && window.SchemaExportModal && (
         <window.SchemaExportModal
-          room={rooms.find(r => r.id === currentRoomId)}
+          room={currentRoom}
           state={renderState}
           onClose={() => setExportingSchema(false)}
         />

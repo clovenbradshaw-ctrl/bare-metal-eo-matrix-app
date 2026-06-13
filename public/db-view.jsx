@@ -479,5 +479,5 @@ function DbView({ rooms, currentRoomId, setCurrentRoomId, createRoom, eventsUpTo
   );
 }
 
-window.DbView = DbView;
+window.DbView = React.memo(DbView);
 })();

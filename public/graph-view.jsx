@@ -663,5 +663,5 @@ function RelationPrompt({ from, to, existingRels, onCommit, onCancel }) {
   );
 }
 
-window.GraphView = GraphView;
+window.GraphView = React.memo(GraphView);
 })();

@@ -586,5 +586,5 @@ function AppView({ room, state, onEmit, scrubber, forceTable, forceMode }) {
   );
 }
 
-window.AppView = AppView;
+window.AppView = React.memo(AppView);
 })();

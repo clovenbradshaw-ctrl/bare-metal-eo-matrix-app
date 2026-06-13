@@ -443,5 +443,5 @@ function suggestStarters(state, types) {
   return out.slice(0, 4);
 }
 
-window.ChatView = ChatView;
+window.ChatView = React.memo(ChatView);
 })();
