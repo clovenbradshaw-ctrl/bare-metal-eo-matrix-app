@@ -884,25 +884,24 @@ function App() {
     }
   }, [activeImportAnchors]);
 
-  // Under memory pressure, drop the cached import-row arrays — the materialize
-  // effect above will re-fetch them on demand from the encrypted source blob
-  // (OPFS / media store), so this is recoverable shedding, not data loss.
-  // Critical-only: a soft pressure that hits during a fresh import would yank
-  // the rows the user is staring at; critical means we'd OOM otherwise.
-  useEffect(() => {
-    const ML = window.MatrixLive;
-    if (!ML?.registerMemoryEvictor) return;
-    return ML.registerMemoryEvictor('import-rows', () => {
-      const cache = importRowsRef.current;
-      const keys = Object.keys(cache);
-      if (keys.length === 0) return false;
-      for (const k of keys) delete cache[k];
-      noProgressRef.current = 0;
-      lastPendingRef.current = -1;
-      setImportRowsVersion(v => v + 1);
-      return true;
-    }, { priority: 50, level: 'critical' });
-  }, []);
+  // NOTE: we deliberately do NOT register a memory evictor that drops the
+  // materialized import rows under pressure. An earlier version did, but it
+  // thrashed instead of shedding:
+  //   • It cleared only this component's `importRowsRef`, while the canonical
+  //     copy of every parsed row lives in CsvImport's module-level
+  //     `importRowCache` (csv-import.jsx). Those are the same array objects, so
+  //     deleting them here freed almost nothing — the rows stayed resident.
+  //   • It then bumped `importRowsVersion`, which immediately re-ran the
+  //     materialize effect below and re-filled `importRowsRef` from that
+  //     surviving cache.
+  // The net effect under sustained pressure: the 10s heap sampler fired the
+  // evictor every interval, so `renderState` dropped its import rows (the table
+  // and its counts flashed to zero) and then "reloaded" them a beat later — a
+  // visible refresh loop that never actually reclaimed the memory it targeted.
+  // Import-row memory is bounded by the dataset itself; the structural room/SDK
+  // caps (src/main.js) carry the heap budget. If real import-row shedding is
+  // ever wanted, it has to clear `importRowCache` too AND stop the materialize
+  // effect from eagerly re-fetching, or it will just thrash again.
 
   // The table the user is looking at — its import chunks materialize first.
   const activeSet = selection?.tableId || null;
