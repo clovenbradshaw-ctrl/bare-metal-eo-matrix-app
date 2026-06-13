@@ -1359,6 +1359,38 @@ table.dbgrid tbody tr:hover .sel-caret,.sel-td.sel-open .sel-caret{opacity:1}
 .share-member-remove{padding:0 7px;font-size:15px;line-height:1;background:transparent;border:1px solid transparent;color:var(--text-dim);cursor:pointer;font-family:var(--mono)}
 .share-member-remove:hover{color:var(--red);border-color:var(--red)}
 
+/* ── Role dropdown (named power levels) ──────────────────────────────── */
+.role-select{font-family:var(--mono);font-size:12px;padding:4px 6px;border:1px solid var(--border-strong);background:#fff;color:var(--text-bright);cursor:pointer;outline:none;border-radius:0}
+.role-select:focus{border-color:#000}
+.role-select:disabled{color:var(--text-dim);background:var(--surface-2);cursor:not-allowed}
+
+/* ── Password-reset flow (login card) ────────────────────────────────── */
+.login-resetnav{display:flex;align-items:center;justify-content:space-between;margin-bottom:2px}
+.login-linkbtn{padding:0;background:none;border:none;font-family:var(--mono);font-size:12px;color:var(--triad-structure);text-decoration:underline;text-underline-offset:2px;cursor:pointer}
+.login-linkbtn:hover{color:var(--text-bright)}
+.login-step{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:1.2px;color:var(--text-dim);font-weight:700}
+
+/* ── Account dashboard ───────────────────────────────────────────────── */
+.acct-card{max-width:600px}
+.acct-tabs{display:flex;border-bottom:1px solid var(--border-strong);background:var(--surface-2)}
+.acct-tabs button{flex:1;padding:10px 14px;font-family:var(--mono);font-size:12px;background:transparent;border:none;color:var(--text-dim);cursor:pointer;border-bottom:3px solid transparent;text-transform:lowercase;letter-spacing:.3px;font-weight:600}
+.acct-tabs button.active{color:var(--text-bright);background:#fff;border-bottom-color:#000}
+.acct-tabs button:not(.active):hover{color:var(--text-bright)}
+.acct-stale{padding:10px 20px;background:#fffcec;border-bottom:1px solid var(--signal);color:var(--text);font-size:11.5px;line-height:1.5}
+.acct-profile-head{display:flex;gap:14px;align-items:center;margin-bottom:16px}
+.acct-avatar{display:inline-flex;align-items:center;justify-content:center;width:48px;height:48px;background:#000;color:#fff;font-size:22px;font-weight:700;flex-shrink:0;font-family:var(--mono)}
+.acct-identity{min-width:0}
+.acct-mxid{font-family:var(--mono);font-size:13px;color:var(--text-bright);font-weight:700;word-break:break-all}
+.acct-meta{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:5px;font-family:var(--mono);font-size:11px;color:var(--text-dim)}
+.acct-meta-k{text-transform:uppercase;letter-spacing:1px;color:var(--text-faint);margin-right:5px;font-weight:700}
+.acct-field-block{display:flex;flex-direction:column;gap:0}
+.acct-actions{display:flex;justify-content:flex-end;margin-top:12px}
+.acct-ok{padding:8px 12px;background:#f0f8f0;border:1px solid var(--triad-structure);color:var(--text);font-size:12px;line-height:1.5}
+.acct-space-select{width:100%;font-family:var(--mono);font-size:13px;padding:8px 10px;border:1px solid var(--border-strong);background:#fff;color:var(--text-bright);cursor:pointer;outline:none;border-radius:0}
+.acct-space-select:focus{border-color:#000}
+.login-ghost.danger-ghost{color:var(--red);border-color:var(--red)}
+.login-ghost.danger-ghost:hover{background:#fdf0f0;border-color:var(--red)}
+
 /* utility */
 .muted{color:var(--text-dim)}
 .faint{color:var(--text-faint)}

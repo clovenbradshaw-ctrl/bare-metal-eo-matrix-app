@@ -20,6 +20,7 @@ import { login as mxLogin, unlock as mxUnlock,
          logout as mxLogout, hasLocalAccount, getClient,
          tryAutoUnlock, wipeLocalData,
          diagnoseBackup, restoreFromRecoveryKey, getStashedRecoveryKey,
+         requestPasswordReset, completePasswordReset, changePassword as mxChangePassword,
          setProgress, setRecoveryKeyDisplayer, setRecoveryKeyProvider } from './client.js';
 import { setNamespace, OP, ins, def, seg, con, syn, eva, rec, defSchema, getNamespace,
          setOptimisticHook, eventType as opEventType, emit as rawEmit } from './operators.js';
@@ -29,7 +30,8 @@ import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          loadTimelineSince, invite, getMembers, loadRoomMembers, myPowerLevel, kickMember,
          setMemberPowerLevel, onMembersChange, acceptInvite, onRoomChanges,
          onDecrypted, onLocalEchoUpdated, EventStatus,
-         setName as mxSetRoomName, getDisplayName as mxGetDisplayName } from './rooms.js';
+         setName as mxSetRoomName, getDisplayName as mxGetDisplayName,
+         setDisplayName as mxSetDisplayName } from './rooms.js';
 import { EventStore, requestPersistentStorage, getOpfsBreakdown } from './store.js';
 import { vault, getLastUser } from './vault.js';
 import { OutboxFlusher, listAll as outboxListAll, pendingCount,
@@ -1622,6 +1624,34 @@ function getMyDisplayName() {
   return mxGetDisplayName(activeSession.mxid);
 }
 
+// A compact snapshot of the signed-in identity for the account dashboard:
+// who you are, where the account lives, and which device this is.
+function getProfile() {
+  if (!activeSession) return null;
+  const c = getClient();
+  return {
+    mxid: activeSession.mxid,
+    displayName: mxGetDisplayName(activeSession.mxid) || null,
+    homeserver: activeSession.homeserver || c?.getHomeserverUrl?.() || null,
+    deviceId: activeSession.device_id || c?.getDeviceId?.() || null,
+    stale: !!activeSession.stale,
+    demo: !!activeSession.demo,
+  };
+}
+
+// Update your own display name account-wide, then nudge the UI so the
+// identity chip and any open member lists pick it up without a reload.
+async function setMyDisplayName(name) {
+  await mxSetDisplayName(name);
+  notify('members');
+  notify('session');
+}
+
+// Change the signed-in account's password (re-auths with the current one).
+async function changePassword(oldPassword, newPassword) {
+  return mxChangePassword(oldPassword, newPassword);
+}
+
 // ── Recovery key prompts: relay to React via a window slot ──
 setRecoveryKeyDisplayer((key) => new Promise((resolve) => {
   if (typeof window.__matrixLiveRecoveryDisplay === 'function') {
@@ -1651,6 +1681,12 @@ window.MatrixLive = {
   clearLocalData,
   hasLocalAccount,
   getLastUser,
+  // Account management: profile, password reset (locked-out), password change
+  getProfile,
+  setMyDisplayName,
+  requestPasswordReset,
+  completePasswordReset,
+  changePassword,
   getSession: () => activeSession,
   isAuthed: () => !!activeSession,
   isStale: () => !!(activeSession && activeSession.stale),
