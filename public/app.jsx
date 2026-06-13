@@ -781,6 +781,7 @@ function App() {
   const allEvents = byRoom[currentRoomId] || [];
   const total = allEvents.length;
   const effectiveCursor = Math.min(cursor, total);
+  const ts = effectiveCursor > 0 ? allEvents[effectiveCursor - 1].origin_server_ts : null;
   const live = cursor >= total;
 
   useEffect(() => { if (live) setCursor(Infinity); }, [total]); // eslint-disable-line
@@ -1294,8 +1295,6 @@ function App() {
       alert('Accept invite failed: ' + (e?.message || e));
     }
   }
-
-  const ts = effectiveCursor > 0 ? allEvents[effectiveCursor - 1].origin_server_ts : null;
 
   const lastEventTs = allEvents.length
     ? allEvents[allEvents.length - 1].origin_server_ts
