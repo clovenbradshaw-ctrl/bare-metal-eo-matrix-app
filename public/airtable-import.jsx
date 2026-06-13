@@ -332,20 +332,24 @@
       return window.AirtableSchema ? window.AirtableSchema.parse(schemaText) : { ok: false, error: 'airtable-schema.js not loaded' };
     }, [schemaText]);
 
-    // Default which tables are checked. A table we've synced from this base
-    // before is a RE-SYNC — default it on so re-opening the dialog refreshes its
-    // schema (computed-field definitions included) and re-pulls its rows without
-    // duplicating them. A name that merely collides with a hand-built table
-    // stays off, so we don't silently replace someone's authored schema. Fresh
-    // tables default on.
+    // Default which tables are checked, via AirtableSchema.defaultIncludeForTable:
+    // a RE-SYNC (already imported from this base) ticks on so re-opening refreshes
+    // its schema and re-pulls rows without duplicating; a brand-new table ticks
+    // on; and a table whose declared schema was LOST — named in _schema.tables but
+    // with no field list — also ticks on, since re-syncing is how its columns come
+    // back. A table that still carries a hand-built field list stays off, so we
+    // never silently replace someone's authored schema.
     useEffect(() => {
       if (!parsed || !parsed.ok) return;
       setInclude(prev => {
         const next = { ...prev };
         for (const t of parsed.tables) {
           if (t.name in next) continue;
-          const resync = hasPriorAirtableSync(state, base?.id, t);
-          next[t.name] = resync || !existingTables.has(t.name);
+          next[t.name] = window.AirtableSchema.defaultIncludeForTable({
+            inDeclaredTables: existingTables.has(t.name),
+            declaredFields: existingFieldsFor(t.name),
+            isResync: hasPriorAirtableSync(state, base?.id, t),
+          });
         }
         return next;
       });
@@ -675,8 +679,13 @@
                         // For an existing table, preview the field-type sync:
                         // which columns Airtable updates, which stay, which are
                         // new. (reconcileFields is the same routine emitSchema runs.)
-                        const recon = (collides && Array.isArray(existingFieldsFor(t.name)) && window.AirtableSchema)
-                          ? window.AirtableSchema.reconcileFields(existingFieldsFor(t.name), t.fields.map(cleanField))
+                        const declaredHere = existingFieldsFor(t.name);
+                        const hasLocalFields = Array.isArray(declaredHere) && declaredHere.length > 0;
+                        // Declared by name but its field list is gone → there's
+                        // nothing to reconcile; re-syncing restores the columns.
+                        const schemaLost = collides && !hasLocalFields;
+                        const recon = (collides && hasLocalFields && window.AirtableSchema)
+                          ? window.AirtableSchema.reconcileFields(declaredHere, t.fields.map(cleanField))
                           : null;
                         return (
                           <div key={t.name} style={{ border: '1px solid var(--border, #e3e3e3)', marginBottom: 10, opacity: on ? 1 : 0.5 }}>
@@ -691,7 +700,12 @@
                                 {t.counts.total} field{t.counts.total === 1 ? '' : 's'}
                                 {t.counts.computed > 0 && <> · <b style={{ color: 'var(--accent,#b45)' }}>{t.counts.computed} computed</b></>}
                               </span>
-                              {recon
+                              {schemaLost
+                                ? <span className="csv-warn" style={{ marginLeft: 'auto' }} title="this table's declared fields are missing locally — re-syncing restores the full schema from Airtable">
+                                    schema lost — restores {t.counts.total} field{t.counts.total === 1 ? '' : 's'} from Airtable
+                                    {resync && <> · rows replace previous</>}
+                                  </span>
+                                : recon
                                 ? <span className="csv-warn" style={{ marginLeft: 'auto' }} title="Airtable is the source of truth for these fields' types; your other fields are kept">
                                     {resync ? 're-sync' : 'exists'} — syncs {recon.updated.length} field type{recon.updated.length === 1 ? '' : 's'} from Airtable
                                     {recon.added.length > 0 && <> · +{recon.added.length} new</>}

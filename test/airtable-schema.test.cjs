@@ -197,6 +197,24 @@ eq('reconcile with empty existing returns incoming',
   AirtableSchema.reconcileFields([], incomingFields).fields.map(f => f.name),
   ['Name', 'Budget', 'Status', 'Created']);
 
+// ── defaultIncludeForTable: which tables tick ON by default in the importer ──
+// This is the hardening that makes a lost table schema recoverable by re-syncing:
+// a table declared by name but with no field list must tick ON so its columns
+// come back — while a table that still carries authored fields stays OFF so a
+// re-import never silently clobbers it.
+const inc = (o) => AirtableSchema.defaultIncludeForTable(o);
+const someFields = [{ name: 'A', type: 'text' }];
+check('default ON: brand-new table (not in declared tables)',
+  inc({ inDeclaredTables: false, declaredFields: undefined, isResync: false }) === true);
+check('default ON: re-sync of a prior Airtable table',
+  inc({ inDeclaredTables: true, declaredFields: someFields, isResync: true }) === true);
+check('default OFF: declared table that still has its fields',
+  inc({ inDeclaredTables: true, declaredFields: someFields, isResync: false }) === false);
+check('default ON: declared but field list MISSING (schema lost)',
+  inc({ inDeclaredTables: true, declaredFields: undefined, isResync: false }) === true);
+check('default ON: declared but field list EMPTY (schema lost)',
+  inc({ inDeclaredTables: true, declaredFields: [], isResync: false }) === true);
+
 // ── End-to-end: the generated schema must COMPUTE at runtime via formula.js ──
 // Load the real formula.js (a browser IIFE that assigns window.Formula) with a
 // window shim, then evaluate the very fields the importer produced — proving we

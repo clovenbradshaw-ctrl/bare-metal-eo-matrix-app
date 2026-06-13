@@ -359,6 +359,24 @@
     return { fields, updated, preserved, added };
   }
 
+  // ── Should this table be ticked by default when (re)importing from Airtable? ─
+  // The importer ticks a table on when re-syncing it is the obviously-right thing
+  // to do, and leaves it off only when ticking it could silently clobber schema
+  // you authored by hand. A table defaults ON when:
+  //   • it's a re-sync — already imported from this same Airtable base+table; or
+  //   • it's brand new — not present in the workspace's declared tables; or
+  //   • its schema was LOST — declared in `_schema.tables` but with a missing or
+  //     empty field list, so re-syncing is exactly how its columns come back.
+  // A table that still carries a declared field list (and wasn't sourced from
+  // this base) defaults OFF, so importing never overwrites authored columns
+  // unless you opt in.
+  function defaultIncludeForTable({ inDeclaredTables, declaredFields, isResync }) {
+    if (isResync) return true;
+    if (!inDeclaredTables) return true;
+    const hasFields = Array.isArray(declaredFields) && declaredFields.length > 0;
+    return !hasFields;
+  }
+
   const api = {
     parse,
     isComputed,
@@ -367,8 +385,9 @@
     fieldTypeDef,
     findMatchingField,
     reconcileFields,
+    defaultIncludeForTable,
     SIMPLE_TYPE_MAP,
-    version: 2,
+    version: 3,
   };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
