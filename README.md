@@ -117,12 +117,14 @@ tracks the latest engine — see `public/data-chat.js`'s `EOREADER_DEFAULT`, or
 set `window.EOREADER_BASE` to point at a local eoreader3 while you work on both).
 It adds arithmetic, fuzzy matching, and prose answers. **Smart parse is always
 on**: once your data has loaded, a **small on-device model** (wllama /
-WebAssembly, smallest by default to stay within the memory budget) and a local
-**Python runtime** (Pyodide + numpy + pandas, loaded only when there's heap
-headroom) come up automatically for tougher questions and data analysis — both
-run entirely in your browser, best-effort, so a failed or skipped download never
-blocks asking. There is **no cloud LLM option**: nothing about your data leaves
-the tab.
+WebAssembly, smallest by default so it actually finishes downloading and stays
+within the memory budget) comes up automatically for tougher questions — it runs
+entirely in your browser, best-effort, so a failed or skipped download never
+blocks asking. (A local **Python runtime** — Pyodide + numpy + pandas — is wired
+up behind `ensurePython()` for a future pandas-backed analysis step, but is *not*
+auto-loaded: it's a heavy download nothing queries yet, so pulling it on every
+visit would only starve the model fetch and the memory budget.) There is **no
+cloud LLM option**: nothing about your data leaves the tab.
 
 The two pieces:
 
