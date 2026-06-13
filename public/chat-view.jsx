@@ -192,7 +192,7 @@ function pickColumns(result) {
 // ───────────────────────────────────────────────────────────────────────────
 // One assistant result, rendered by kind.
 // ───────────────────────────────────────────────────────────────────────────
-function ResultBlock({ result, onOpenProfile, onOpenTable }) {
+function ResultBlock({ result, onOpenProfile, onOpenTable, onChooseConfirm }) {
   if (!result) return null;
   if (result.kind === 'value') {
     return (
@@ -216,6 +216,34 @@ function ResultBlock({ result, onOpenProfile, onOpenTable }) {
   }
   if (result.kind === 'answer') {
     return <div className="dc-answer">{result.text}</div>;
+  }
+  if (result.kind === 'confirm') {
+    // A check-in before flooding the thread: either "which table did you
+    // mean?" (reason='type') or "this matches N records — first 25 or all?"
+    // (reason='flood'). Tapping a button runs that choice's plan with
+    // skipConfirm=true so the gate never re-fires on the same question.
+    const icon = result.reason === 'flood' ? 'ph-warning-circle' : 'ph-question';
+    return (
+      <div className="dc-confirm" role="group" aria-label="confirm">
+        <div className="dc-confirm-head">
+          <i className={`ph ${icon}`} aria-hidden="true"></i>
+          <span className="dc-confirm-text">{result.text}</span>
+        </div>
+        <div className="dc-confirm-choices">
+          {(result.choices || []).map((c, i) => (
+            <button
+              key={i}
+              className="dc-confirm-choice"
+              onClick={() => onChooseConfirm && onChooseConfirm(c, result)}
+              title={c.hint || ''}
+            >
+              <span className="dc-confirm-label">{c.label}</span>
+              {c.hint && <span className="dc-confirm-hint">{c.hint}</span>}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
   }
   // empty
   return (
@@ -266,6 +294,28 @@ function ChatView({ room, state, setSelection }) {
   const onOpenTable = useCallback((type) => {
     setSelection && setSelection({ kind: 'slice', sliceId: `${type}.table`, tableId: type, sliceKind: 'table' });
   }, [setSelection]);
+
+  // The user tapped one of a confirm card's choices: run that exact plan
+  // (DataChat hands it to us pre-built) and append the result as a new
+  // assistant turn. skipConfirm prevents re-prompting on the same question.
+  const onChooseConfirm = useCallback(async (choice, confirmResult) => {
+    if (!choice || !choice.plan || busy) return;
+    const labelTrace = choice.label || (choice.plan && choice.plan.type) || 'that';
+    setMessages(m => [...m, { role: 'user', text: '↳ ' + labelTrace, isChoice: true }]);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const dc = DC();
+      const q = (confirmResult && confirmResult.spec && confirmResult.spec.question) || '';
+      const result = await dc.executePlan(stateRef.current, choice.plan, { q, opts: { skipConfirm: true } });
+      setMessages(m => [...m, { role: 'assistant', result }]);
+      if (result.kind === 'profile') setProfile({ anchor: result.anchor, type: result.type });
+    } catch (e) {
+      setMessages(m => [...m, { role: 'assistant', result: { kind: 'answer', text: 'Something went wrong: ' + e.message } }]);
+    } finally {
+      setBusy(false);
+    }
+  }, [busy]);
 
   const ask = useCallback(async (text) => {
     const q = String(text || '').trim();
@@ -338,7 +388,7 @@ function ChatView({ room, state, setSelection }) {
               ? <div className="dc-bubble">{m.text}</div>
               : <div className="dc-assistant">
                   {m.viaLLM && <div className="dc-via">interpreted with on-device model</div>}
-                  <ResultBlock result={m.result} onOpenProfile={onOpenProfile} onOpenTable={onOpenTable} />
+                  <ResultBlock result={m.result} onOpenProfile={onOpenProfile} onOpenTable={onOpenTable} onChooseConfirm={onChooseConfirm} />
                 </div>}
           </div>
         ))}

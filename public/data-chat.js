@@ -10,6 +10,10 @@
      { kind: 'profile', anchor, type }                   // open the popup
      { kind: 'answer',  text, records, audit }            // prose fallback
      { kind: 'empty',   message, suggestions }
+     { kind: 'confirm', reason, text, choices, spec }    // "which table?" /
+                                                          // "show all of these?"
+                                                          // — choices carry a
+                                                          // ready-to-run plan
 
    Design: the query layer (type/field/value resolution, filters, aggregation,
    sort, foreign-key traversal) is PURE and deterministic — it runs in Node
@@ -410,6 +414,85 @@
     const fields = fieldsForType(state, type);
     return fields.map(f => ({ name: f.name, type: f.type }));
   }
+
+  // Names that read as a record label (the chat-view uses MAX_COLS=6, so the
+  // first column needs to be something a person recognizes — not "Meta Data").
+  const LABEL_FIELD_RE = /^(name|title|body|label|summary|claim|what|client name|client name help|matter|description|case name|first name|family name|full name|display name)$/i;
+  function isLabelField(name) { return LABEL_FIELD_RE.test(String(name || '').trim()); }
+
+  // Order the columns of a result table so the most useful 5–6 land at the
+  // front (since chat-view caps the preview at MAX_COLS). Priority:
+  //   1. ONE label-like field (Name / Title / Body / Matter …), in declaration
+  //      order — promoting every label-like field crowds out the columns the
+  //      user actually asked about.
+  //   2. anything the spec touched — filter/sort/aggregate field, groupBy
+  //   3. typed, enumerable fields (select / date / number / boolean)
+  //   4. everything else, in declaration order
+  // Falls back to columnsForType behavior when fields is empty.
+  function preferredColumns(state, type, spec) {
+    const fields = fieldsForType(state, type);
+    if (!fields.length) return [];
+    const score = new Map();
+    fields.forEach((f, i) => score.set(f.name, { f, base: 0, idx: i }));
+    const bump = (name, n) => {
+      const e = name && score.get(name);
+      if (e) e.base = Math.max(e.base, n);
+    };
+    const label = fields.find(f => isLabelField(f.name));
+    if (label) bump(label.name, 100);
+    if (spec) {
+      for (const flt of (spec.filters || [])) bump(flt && flt.field, 80);
+      if (spec.sort) bump(spec.sort.field, 75);
+      if (spec.agg) { bump(spec.agg.field, 70); bump(spec.agg.groupBy, 70); }
+    }
+    for (const f of fields) {
+      if (f.type === 'select' || f.type === 'multiselect') bump(f.name, 40);
+      else if (Array.isArray(f.options) && f.options.length) bump(f.name, 40);
+      else if (f.type === 'date' || f.type === 'number' || f.type === 'boolean') bump(f.name, 25);
+      else if (f.type === 'longtext') bump(f.name, 5);
+    }
+    return fields.slice()
+      .sort((a, b) => {
+        const sa = score.get(a.name), sb = score.get(b.name);
+        return (sb.base - sa.base) || (sa.idx - sb.idx);
+      })
+      .map(f => ({ name: f.name, type: f.type }));
+  }
+
+  // Pick the schema fields to show the on-device LLM. The full schema dump can
+  // be hundreds of fields per table (real Airtable bases routinely are), and a
+  // small CPU model can't reason over a long context — so this trims to the
+  // fields most likely to matter for THIS question:
+  //   • label-like fields (so the model can sort/filter on what users see)
+  //   • fields whose name overlaps a content word in the question
+  //   • fields whose select-option labels match a word in the question
+  //   • a few enumerable / typed fields as background context
+  // Pure / deterministic — no model, no engine. Safe to call without a question
+  // (degrades to the first N by declaration order, matching the prior behavior).
+  const PROMPT_FIELDS_FLOOR = 14;
+  const PROMPT_FIELDS_CEIL = 32;
+  function selectFieldsForPrompt(fields, q, limit) {
+    if (!fields || !fields.length) return [];
+    const cap = Math.max(1, limit | 0) || PROMPT_FIELDS_FLOOR;
+    if (fields.length <= cap) return fields.slice();
+    const qw = q ? norm(q).split(/[^a-z0-9]+/).filter(w => w.length > 2 && !STOP.has(w)) : [];
+    const scored = fields.map((f, i) => {
+      let s = 0;
+      const fn = norm(f.name);
+      if (isLabelField(f.name)) s += 12;
+      if (Array.isArray(f.options) && f.options.length) s += 5;
+      if (f.type === 'select' || f.type === 'multiselect') s += 4;
+      else if (f.type === 'date' || f.type === 'number' || f.type === 'boolean') s += 2;
+      for (const w of qw) {
+        if (fn.indexOf(w) >= 0) s += 8;
+        if (Array.isArray(f.options) && f.options.some(o => norm(o).indexOf(w) >= 0)) s += 10;
+      }
+      return { f, s, i };
+    });
+    scored.sort((a, b) => (b.s - a.s) || (a.i - b.i));
+    return scored.slice(0, cap).map(x => x.f);
+  }
+
   function displayValue(v) {
     if (v === undefined || v === null) return '';
     if (Array.isArray(v)) return v.join(', ');
@@ -475,11 +558,27 @@
   // { intent:'profile'|'query'|'aggregate'|'search', type, record, filters[],
   //   agg{agg,field,groupBy}|null, sort{field,dir}|null, limit, source }
 
+  // Build a query/aggregate plan for a specific (type, question) pair. Pulled
+  // out of buildPlan so the disambiguation flow can produce one ready-to-run
+  // plan per candidate table without re-walking the type matcher.
+  function buildPlanForType(q, state, type, source) {
+    const fields = type ? fieldsForType(state, type) : [];
+    let filters = parseFilters(q, fields);
+    filters = filters.concat(parseStandaloneOptions(q, fields, filters));
+    const agg = parseAggregate(q, fields);
+    const sort = parseSort(q, fields);
+    const limit = parseLimit(q);
+    return {
+      intent: agg ? 'aggregate' : 'query',
+      type, record: null, filters, agg, sort, limit,
+      source: source || 'deterministic',
+    };
+  }
+
   // Deterministic parse → { plan, confidence, alternatives }. No engine needed.
   function buildPlan(q, state) {
     const ts = matchTypeScored(state, q);
     const type = ts.type;
-    const fields = type ? fieldsForType(state, type) : [];
 
     // profile intent — a verb phrase pointing at a named record (not a table)
     if (PROFILE_RE.test(q)) {
@@ -497,14 +596,9 @@
       return { plan: { intent: 'search', type: null, record: null, filters: [], agg: null, sort: null, limit: null, source: 'deterministic' }, confidence: 0.2, alternatives: ts.candidates };
     }
 
-    let filters = parseFilters(q, fields);
-    filters = filters.concat(parseStandaloneOptions(q, fields, filters));
-    const agg = parseAggregate(q, fields);
-    const sort = parseSort(q, fields);
-    const limit = parseLimit(q);
-    const plan = { intent: agg ? 'aggregate' : 'query', type, record: null, filters, agg, sort, limit, source: 'deterministic' };
+    const plan = buildPlanForType(q, state, type, 'deterministic');
     let conf = ts.confident ? 0.8 : 0.5;
-    if (filters.length || agg || sort || limit) conf += 0.12;
+    if (plan.filters.length || plan.agg || plan.sort || plan.limit) conf += 0.12;
     return { plan, confidence: Math.min(1, conf), alternatives: ts.candidates };
   }
 
@@ -550,7 +644,8 @@
       if (limit) rows = rows.slice(0, limit);
       return {
         kind: 'table', type: plan.type, title: titleFor(plan.type, filters, sort, limit),
-        columns: columnsForType(state, plan.type), rows, total: filtered.length,
+        columns: preferredColumns(state, plan.type, { filters, sort, agg: null }),
+        rows, total: filtered.length,
         note: filters.length ? whereNote(filters) : null, alternatives: ctx.alternatives,
         spec: { ...spec, type: plan.type, filters, sort, limit },
       };
@@ -610,10 +705,83 @@
     return { field: fd.name, dir: /desc/i.test(sort.dir) ? 'desc' : 'asc' };
   }
 
+  // ── confirmation gates ────────────────────────────────────────────────────
+  // The chat is mechanical by design — every value comes from a deterministic
+  // query, not a model summary — but mechanical can still be wrong. Two cases
+  // are worth a one-tap check-in before answering:
+  //
+  //   1) TYPE AMBIGUITY  — multiple tables score close to each other for the
+  //      question (e.g. "show notes" against both `Case Notes` and
+  //      `case_notes`). Better to ask "which table?" than to silently pick.
+  //
+  //   2) BROAD QUERY     — the question would dump the entire table (no
+  //      filters, no sort/limit), and the table is large. Show a count and
+  //      let the user pick "first 25" or "all of them".
+  //
+  // Both are surfaced as { kind: 'confirm', choices: [{label, hint, plan}] }.
+  // The chat-view renders the choices as buttons; tapping one runs that exact
+  // plan with skipConfirm=true so we never loop on the same gate twice.
+  const CONFIRM_TYPE_FLOOR = 1.0;   // both candidates must score at least this
+  const CONFIRM_TYPE_GAP = 0.25;    // and be within this many points of each other
+  const CONFIRM_FLOOD_ROWS = 200;   // ask before dumping more than N rows
+
+  function maybeTypeConfirm(state, q, det) {
+    const cands = (det && det.alternatives) || [];
+    if (cands.length < 2) return null;
+    const [a, b] = cands;
+    if (!a || !b) return null;
+    if (a.score < CONFIRM_TYPE_FLOOR) return null;
+    if (a.score - b.score >= CONFIRM_TYPE_GAP) return null;
+    const top = cands.slice(0, 4).filter(c => a.score - c.score < CONFIRM_TYPE_GAP);
+    const choices = top.map(c => {
+      const plan = buildPlanForType(q, state, c.type, 'confirm-type');
+      const total = entitiesOfType(state, c.type).length;
+      return {
+        label: c.type,
+        hint: total.toLocaleString() + ' record' + (total === 1 ? '' : 's'),
+        plan,
+      };
+    });
+    return {
+      kind: 'confirm',
+      reason: 'type',
+      text: 'I read that as either ' + top.map(c => '“' + c.type + '”').join(' or ') + '. Which did you mean?',
+      choices,
+      spec: { question: q, source: 'confirm-type' },
+    };
+  }
+
+  function maybeFloodConfirm(state, q, plan, result) {
+    if (!result || result.kind !== 'table') return null;
+    if (!plan || plan.intent !== 'query' || !plan.type) return null;
+    if ((plan.filters && plan.filters.length) || (plan.limit && plan.limit > 0)) return null;
+    const total = (result.rows && result.rows.length) || result.total || 0;
+    if (total <= CONFIRM_FLOOD_ROWS) return null;
+    const allPlan = { ...plan, source: 'confirm-flood' };
+    const previewPlan = { ...plan, source: 'confirm-flood', limit: 25 };
+    return {
+      kind: 'confirm',
+      reason: 'flood',
+      text: 'That matches ' + total.toLocaleString() + ' ' + plural(plan.type) +
+            '. Want a quick look first, or all of them?',
+      choices: [
+        { label: 'Show first 25', hint: 'quick look', plan: previewPlan },
+        { label: 'Show all ' + total.toLocaleString(), hint: 'full set', plan: allPlan },
+      ],
+      spec: { question: q, source: 'confirm-flood', type: plan.type, total },
+    };
+  }
+
   // ════════════════════════════════════════════════════════════════════════
   // interpret — the one entry point the Ask view calls. Deterministic-first;
   // the local LLM is consulted only when the deterministic plan is unsure AND
   // opts.useLLM is set (the "Smart parse" toggle).
+  //
+  // Confirmation gating: when the deterministic parser is uncertain about
+  // which table the user means, or when running the plan would flood the
+  // thread with hundreds of rows, interpret returns a 'confirm' result with
+  // explicit choices instead. Set opts.skipConfirm=true to bypass — used by
+  // the chat-view when the user has already tapped one of those choices.
   // ════════════════════════════════════════════════════════════════════════
   async function interpret(question, state, opts) {
     opts = opts || {};
@@ -640,7 +808,22 @@
       const lp = await planWithLLM(q, state, opts).catch(() => null);
       if (lp && (lp.type || lp.record || lp.intent === 'search')) { plan = lp; usedLLM = true; }
     }
+
+    // Gate 1: type ambiguity — but skip if the user has already chosen, or if
+    // the LLM produced a plan (they opted in to that path).
+    if (!opts.skipConfirm && !usedLLM) {
+      const conf = maybeTypeConfirm(state, q, det);
+      if (conf) return conf;
+    }
+
     const result = await executePlan(state, plan, { q, opts, alternatives: det.alternatives });
+
+    // Gate 2: broad query — many rows, no filters. Always safe to ask.
+    if (!opts.skipConfirm) {
+      const flood = maybeFloodConfirm(state, q, plan, result);
+      if (flood) return flood;
+    }
+
     result.spec = { ...(result.spec || {}), usedLLM, confidence: det.confidence };
     return result;
   }
@@ -658,15 +841,18 @@
     'otherwise "query". Pick type/field names ONLY from the provided schema.',
   ].join(' ');
 
-  function schemaPrompt(state) {
+  function schemaPrompt(state, q) {
     const lines = ['Tables and fields:'];
     for (const t of knownTypes(state)) {
-      const fs = fieldsForType(state, t).slice(0, 14).map(f => {
+      const all = fieldsForType(state, t);
+      const picked = selectFieldsForPrompt(all, q, PROMPT_FIELDS_CEIL);
+      const fs = picked.map(f => {
         let s = f.name + ':' + f.type;
         if (Array.isArray(f.options) && f.options.length) s += '[' + f.options.slice(0, 8).join('|') + ']';
         return s;
       });
-      lines.push('- "' + t + '" → ' + (fs.join(', ') || '(no fields)'));
+      const extra = all.length > picked.length ? ' (+' + (all.length - picked.length) + ' more fields)' : '';
+      lines.push('- "' + t + '" → ' + (fs.join(', ') || '(no fields)') + extra);
     }
     const links = state?.schema?.links;
     if (Array.isArray(links) && links.length) {
@@ -719,7 +905,7 @@
         const ok = await window.EOLLM.load(key, opts && opts.onModelProgress);
         if (ok === false) return null;
       }
-      const user = schemaPrompt(state) + '\n\nQuestion: ' + q + '\nJSON:';
+      const user = schemaPrompt(state, q) + '\n\nQuestion: ' + q + '\nJSON:';
       const raw = await window.EOLLM.phrase({ mlcKey: key, mode: 'plain-chat', sysOverride: LLM_SYSTEM, question: user, maxTokens: 220, onToken: opts && opts.onPlanToken });
       const plan = parsePlanJSON(raw);
       if (!plan) return null;
@@ -793,7 +979,21 @@
   function dot(a, b) { let s = 0; const n = Math.min(a.length, b.length); for (let i = 0; i < n; i++) s += a[i] * b[i]; return s; }
 
   // ── phrasing helpers ──────────────────────────────────────────────────────
-  function plural(type) { const t = norm(type); return /s$/.test(t) ? t : t + 's'; }
+  // Airtable bases commonly suffix table names with "Info", "View", "Master
+  // View", or "Table" (so a "clients" table is "Client Info"). For chat copy
+  // we strip those suffixes before pluralizing, so a suggestion reads "show
+  // all clients" instead of "show all client infos".
+  const TYPE_ADMIN_SUFFIX = /\s+(?:master\s+)?(?:info|infos|view|views|table|tables|list|lists|data|records?)$/i;
+  function plural(type) {
+    const raw = String(type == null ? '' : type).trim();
+    if (!raw) return '';
+    const stripped = raw.replace(TYPE_ADMIN_SUFFIX, '').trim() || raw;
+    const t = norm(stripped);
+    if (!t) return norm(raw);
+    if (/s$/.test(t)) return t;
+    if (/y$/.test(t) && !/[aeiou]y$/.test(t)) return t.slice(0, -1) + 'ies';
+    return t + 's';
+  }
   function aggLabel(agg) { return { count: 'Count', sum: 'Sum', avg: 'Average', min: 'Min', max: 'Max' }[agg.agg] + (agg.field ? ' (' + agg.field + ')' : ''); }
   function whereNote(filters) {
     return 'where ' + filters.map(f => {
@@ -883,13 +1083,15 @@
 
   // ── exports ───────────────────────────────────────────────────────────────
   const api = {
-    interpret, buildPlan, executePlan, planWithLLM, ensureEngine, ensureLLM, warmEmbeddings,
+    interpret, buildPlan, buildPlanForType, executePlan, planWithLLM, ensureEngine, ensureLLM, warmEmbeddings,
     defaultLLMKey, schemaPrompt, parsePlanJSON,
+    maybeTypeConfirm, maybeFloodConfirm,
     // pure helpers (exposed for tests + the chat view's profile popup)
-    recordLabel, knownTypes, fieldsForType, columnsForType, entitiesOfType,
+    recordLabel, knownTypes, fieldsForType, columnsForType, preferredColumns, entitiesOfType,
     matchType, matchTypeScored, resolveField, validateFilters, applyFilters, parseFilters,
     parseAggregate, aggregate, parseSort, parseLimit, sortRecords, relatedRecords,
-    linkedTypesFor, resolveRecord, globalSearch, displayValue, plural, _version: '1',
+    linkedTypesFor, resolveRecord, globalSearch, selectFieldsForPrompt,
+    displayValue, plural, _version: '2',
   };
   if (typeof window !== 'undefined') window.DataChat = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
