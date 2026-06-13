@@ -37,6 +37,49 @@
   const isUnderscore = (k) => typeof k === 'string' && k[0] === '_';
   const uniq = (a) => Array.from(new Set(a));
 
+  // ── per-state index (one O(N) pass, reused across helpers) ──────────────────
+  // The query pipeline + the LLM schema prompt call knownTypes / entitiesOfType
+  // / fieldsForType / relatedRecords many times for a single question — each a
+  // full Object.values(entities) (or connections) scan. For a workspace with T
+  // tables and N records that made one question O(T×N); building the model
+  // prompt alone walked every entity once per table. This caches a by-type
+  // entity index and an edges-by-anchor index on the state object (WeakMap, so
+  // it's discarded when the fold produces a new state), keyed by a cheap
+  // fingerprint so an in-place mutation can't serve stale data. Read-only: the
+  // cached arrays are never mutated by callers (filters/sorts always copy).
+  const _stateCache = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+  // Must be O(1) — it runs on every index access. Every mutating fold event
+  // advances state.cursor (see fold.js dispatch), so cursor + connection count
+  // distinguishes any in-place change to a reused state object without walking
+  // the entity map.
+  function stateFingerprint(state) {
+    if (!state) return '0:0';
+    const c = Array.isArray(state.connections) ? state.connections.length : 0;
+    return (state.cursor != null ? state.cursor : 0) + ':' + c;
+  }
+  function stateIndex(state) {
+    if (!state || !_stateCache) return null;
+    const fp = stateFingerprint(state);
+    let idx = _stateCache.get(state);
+    if (idx && idx.fp === fp) return idx;
+    const byType = new Map();
+    for (const e of Object.values(state.entities || {})) {
+      const t = e && e._type;
+      if (!t) continue;
+      let arr = byType.get(t);
+      if (!arr) { arr = []; byType.set(t, arr); }
+      arr.push(e);
+    }
+    const edges = new Map(); // anchor → connections touching it (matches relatedRecords' walk)
+    for (const c of (state.connections || [])) {
+      if (c.source != null) { let a = edges.get(c.source); if (!a) { a = []; edges.set(c.source, a); } a.push(c); }
+      if (c.target != null && c.target !== c.source) { let a = edges.get(c.target); if (!a) { a = []; edges.set(c.target, a); } a.push(c); }
+    }
+    idx = { fp, byType, edges, known: null, fields: new Map() };
+    _stateCache.set(state, idx);
+    return idx;
+  }
+
   // Mirror table-view.jsx's record label so chat and grid agree on titles.
   function recordLabel(e) {
     if (!e) return '';
@@ -47,13 +90,20 @@
 
   // ── schema introspection (over live fold state) ───────────────────────────
   function knownTypes(state) {
+    const idx = stateIndex(state);
     const fromSchema = Array.isArray(state?.schema?.tables) ? state.schema.tables : [];
+    if (idx) {
+      if (!idx.known) idx.known = uniq([...fromSchema, ...idx.byType.keys()]);
+      return idx.known;
+    }
     const fromData = uniq(Object.values(state?.entities || {}).map(e => e._type).filter(Boolean));
     return uniq([...fromSchema, ...fromData]);
   }
 
   // Field defs for a type: schema first, then any plain keys observed on records.
   function fieldsForType(state, type) {
+    const idx = stateIndex(state);
+    if (idx) { const hit = idx.fields.get(type); if (hit) return hit; }
     const out = [];
     const seen = new Set();
     const sch = state?.schema?.fields?.[type];
@@ -71,6 +121,7 @@
         out.push({ name: k, type: inferFieldType(e[k]), options: null });
       }
     }
+    if (idx) idx.fields.set(type, out);
     return out;
   }
 
@@ -94,6 +145,8 @@
   }
 
   function entitiesOfType(state, type) {
+    const idx = stateIndex(state);
+    if (idx) return idx.byType.get(type) || [];
     return Object.values(state?.entities || {}).filter(e => e._type === type);
   }
 
@@ -377,7 +430,9 @@
   // ── foreign keys: linked records via CON edges (+ schema.links) ────────────
   function relatedRecords(state, anchor) {
     const groups = new Map(); // key `${dir}:${rel}:${type}` → { type, rel, dir, records }
-    for (const c of (state?.connections || [])) {
+    const idx = stateIndex(state);
+    const edges = idx ? (idx.edges.get(anchor) || []) : (state?.connections || []);
+    for (const c of edges) {
       let otherAnchor = null, dir = null;
       if (c.source === anchor) { otherAnchor = c.target; dir = 'out'; }
       else if (c.target === anchor) { otherAnchor = c.source; dir = 'in'; }
@@ -957,6 +1012,10 @@
   async function embedReady() {
     return typeof window !== 'undefined' && window.EOEmbed && window.EOEmbed.ready && window.EOEmbed.ready();
   }
+  // Embedding the full label set is the costly half of a fuzzy lookup; cache it
+  // per (state, type) so repeated "tell me about …" turns don't re-embed every
+  // record label each time. Invalidated by the state fingerprint (any edit).
+  let _labelEmbed = { key: '', vs: null };
   async function fuzzyResolveRecord(state, phrase, type) {
     if (!(await embedReady())) return null;
     const pool = type ? entitiesOfType(state, type) : Object.values(state.entities || {});
@@ -964,7 +1023,9 @@
     if (!labels.length) return null;
     try {
       const qv = await window.EOEmbed.embedQuery(phrase);
-      const vs = await window.EOEmbed.embedSentences(labels);
+      const cacheKey = (type || '*') + '|' + stateFingerprint(state);
+      let vs = (_labelEmbed.key === cacheKey) ? _labelEmbed.vs : null;
+      if (!vs) { vs = await window.EOEmbed.embedSentences(labels); _labelEmbed = { key: cacheKey, vs }; }
       if (!qv || !vs) return null;
       let best = -1, bi = -1;
       for (let i = 0; i < vs.length; i++) { const s = dot(qv, vs[i]); if (s > best) { best = s; bi = i; } }
