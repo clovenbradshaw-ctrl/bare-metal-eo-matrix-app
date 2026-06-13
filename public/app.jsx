@@ -4,6 +4,11 @@
 const { useState, useMemo, useEffect, useRef, useCallback } = React;
 const ME = window.MatrixEngine;
 
+// Graph views are hidden for now. Flip to re-enable the graph projection
+// (the "start in graph" tweak, restoring a saved graph selection, and the
+// graph render branch below). Keep in sync with the same flag in sidebar.jsx.
+const GRAPH_VIEW_ENABLED = false;
+
 // ─────────────────────────────────────────────────────────────────────────
 // In-memory event store · persisted for the demo session so spaces and
 // edits survive a reload (the real Matrix path persists on its own via
@@ -132,7 +137,8 @@ function validSavedSelection(sel) {
   if (!sel || typeof sel !== 'object') return false;
   if (sel.kind === 'log' || sel.kind === 'sync' || sel.kind === 'chat') return true;
   if (sel.kind !== 'slice') return false;
-  return ['table', 'schema', 'kanban', 'notebook', 'graph', 'timeline'].includes(sel.sliceKind);
+  return ['table', 'schema', 'kanban', 'notebook', 'timeline',
+    ...(GRAPH_VIEW_ENABLED ? ['graph'] : [])].includes(sel.sliceKind);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -498,7 +504,7 @@ function TweakControls({ t, setTweak, onLoadSeed, onClearAll }) {
           options={[
             { value: 'db',    label: 'log'    },
             { value: 'table', label: 'sets'   },
-            { value: 'graph', label: 'graph'  },
+            ...(GRAPH_VIEW_ENABLED ? [{ value: 'graph', label: 'graph' }] : []),
             { value: 'app',   label: 'kanban' },
           ]}
         />
@@ -1651,7 +1657,7 @@ function App() {
               forceMode="notebook"
             />
           )}
-          {selection.kind === 'slice' && selection.sliceKind === 'graph' && (
+          {GRAPH_VIEW_ENABLED && selection.kind === 'slice' && selection.sliceKind === 'graph' && (
             <window.GraphView
               room={currentRoom}
               state={renderState}

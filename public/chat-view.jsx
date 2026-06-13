@@ -114,7 +114,7 @@ function ProfilePopup({ state, start, onClose, onOpenTable }) {
           )}
 
           {related.length === 0 && (
-            <p className="dc-empty">No linked records yet. Draw a relationship in the graph or table view to connect this record to others.</p>
+            <p className="dc-empty">No linked records yet. Draw a relationship in the table view to connect this record to others.</p>
           )}
         </div>
 

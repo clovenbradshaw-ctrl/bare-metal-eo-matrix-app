@@ -35,8 +35,14 @@ const SLICE_KINDS = {
   log:       { icon: '⊟', label: 'log',       blurb: 'append-only event timeline'               },
 };
 
-// The four user-pickable view types (in the new-view modal).
-const PROJECTION_TYPES = ['table', 'kanban', 'timeline', 'graph'];
+// Graph views are hidden for now. Flip to re-surface the graph projection
+// (auto view under connected sets, saved graph views, and the new-view modal
+// tile). Keep in sync with the same flag in app.jsx.
+const GRAPH_VIEW_ENABLED = false;
+
+// The user-pickable view types (in the new-view modal).
+const PROJECTION_TYPES = ['table', 'kanban', 'timeline',
+  ...(GRAPH_VIEW_ENABLED ? ['graph'] : [])];
 
 // ─────────────────────────────────────────────────────────────────────────
 // Derive the sets + their views (auto + saved) from state.
@@ -62,14 +68,16 @@ function buildSets(state) {
     const slices = [
       { id: `${name}.table`, kind: 'table', name: 'table', tableId: name },
       ...(hasPartitions ? [{ id: `${name}.kanban`, kind: 'kanban', name: 'kanban', tableId: name }] : []),
-      ...(hasConnections ? [{ id: `${name}.graph`, kind: 'graph', name: 'graph', tableId: name }] : []),
+      ...(GRAPH_VIEW_ENABLED && hasConnections ? [{ id: `${name}.graph`, kind: 'graph', name: 'graph', tableId: name }] : []),
       ...(name === 'observation' || name === 'hypothesis'
         ? [{ id: `${name}.notebook`, kind: 'notebook', name: 'notebook', tableId: name }] : []),
     ];
     // Saved views — persisted in the log under _schema.views.<set>.
-    const savedViews = (state.schema?.views?.[name] || []).map(v => ({
-      id: `${name}.view.${v.id}`, kind: v.kind, name: v.name, tableId: name, viewId: v.id, saved: true,
-    }));
+    const savedViews = (state.schema?.views?.[name] || [])
+      .filter(v => GRAPH_VIEW_ENABLED || v.kind !== 'graph')
+      .map(v => ({
+        id: `${name}.view.${v.id}`, kind: v.kind, name: v.name, tableId: name, viewId: v.id, saved: true,
+      }));
     return {
       id: name, name, kind: 'entity', rows: rows.length,
       declared: declared.includes(name),
