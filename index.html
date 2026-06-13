@@ -194,12 +194,14 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .sb-export:disabled{opacity:.5;cursor:not-allowed}
 
 /* ── Inline +column header (airtable) ────────────────────────────────── */
-.dbgrid th.add-col{width:48px;padding:0;background:var(--surface-3);border-left:1px dashed var(--border);position:sticky;top:0;z-index:3;overflow:visible}
+.dbgrid th.add-col{width:48px;padding:0;background:var(--surface-3);border-left:1px dashed var(--border);position:sticky;top:0;right:0;z-index:4;overflow:visible}
 .dbgrid .add-col-btn{width:100%;height:100%;min-height:30px;background:transparent;border:none;cursor:pointer;color:var(--text-dim);font-size:16px;font-weight:700;font-family:var(--mono)}
 .dbgrid .add-col-btn:hover{background:#fff;color:#000}
 .dbgrid th.renaming{background:#fff}
 .dbgrid .col-rename-input{font-family:var(--mono);font-size:12px;font-weight:700;padding:2px 5px;border:1px solid #000;outline:none;background:#fff;color:var(--text-bright);min-width:60px;width:auto;max-width:180px;text-transform:none;letter-spacing:0}
-.dbgrid td.add-col-spacer{background:var(--surface-3);border-left:1px dashed var(--border);color:var(--text-faint);text-align:center;cursor:pointer;font-size:12px;width:48px}
+/* Pin the row-expand column to the right edge of the scrolling viewport so
+ * wide tables don't push the "open record" affordance off-screen. */
+.dbgrid td.add-col-spacer{background:var(--surface-3);border-left:1px dashed var(--border);color:var(--text-faint);text-align:center;cursor:pointer;font-size:12px;width:48px;position:sticky;right:0;z-index:2}
 .dbgrid td.add-col-spacer:hover{background:#fff;color:var(--text-bright)}
 
 /* formula field column styling */
