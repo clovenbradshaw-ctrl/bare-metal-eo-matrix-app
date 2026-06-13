@@ -219,6 +219,73 @@ load it from the local vault cache. (b) In rooms created before this
 feature, members below the state power level can't publish their chain
 head; new rooms grant PL 0 for the three `<ns>.*` state types at creation.
 
+### Optional off-site mirror: n8n → Google Drive (`src/drivebackup.js`)
+
+The block chain lives on the homeserver's media store. If that store evicts
+a blob under a retention policy — or a cold device pays a round-trip per
+block — recovery degrades. `src/drivebackup.js` adds a **second copy of every
+block in a place you control**: a Google Drive file reached through an n8n
+webhook. It is **opt-in and purely additive** — the primary append/recovery
+path is unchanged whether or not it is configured.
+
+The encryption invariant holds. Each backed-up record is one block's
+**WCK-encrypted ciphertext** — the same bytes already in the media store — so
+n8n and Drive see opaque blobs they cannot decrypt. Every block read back is
+verified against its `sha256` by `decodeBlock` before the fold trusts it, so a
+malicious or buggy webhook can no more inject data than a tampered media blob
+can. This is a **Drive-specific block cycle** layered beside the media-store
+chain (which is left exactly as-is):
+
+- **Backup (up).** `appendBlock` queues each committed block; `drivebackup`
+  batches them and flushes **every ~100 events** (or after a short idle) as a
+  length-prefixed **binary record stream**. Records accumulate into one
+  **segment file** (genesis = segment 0) until it would exceed **25 MB**, then
+  the client **rolls over** to a new segment. Best-effort and detached — a
+  backup failure never affects the primary append.
+- **Hydration (down).** `fetchBlock` replays each block from the **fastest
+  source**: the local OPFS cache, else an already-pulled fresh Drive chain
+  (sync, no network), else a **race** between the homeserver media store and
+  Drive — first valid block wins. The whole Drive chain is pulled in **one
+  GET** (every segment concatenated) and cached, so a hydration of N blocks
+  costs one Drive request. *Latest* is guaranteed by the source of the block
+  list: the room-state manifest/head is always current, and Drive can only
+  ever serve a block whose `sha256` that manifest already names.
+- **Genesis.** On sign-in, if Drive holds no segment yet, the client creates
+  the empty genesis file (only on a *confirmed*-empty state, so a transient
+  error never overwrites an existing chain).
+
+Wire format — a self-delimiting binary record (segment boundaries are
+irrelevant; a reader concatenates every segment and parses one flat stream):
+
+```
+[uint32 BE headerLen][header UTF-8 JSON {room,idx,sha256,mxc,ts,n}][ciphertext n bytes]
+```
+
+Auth uses your **live Matrix access token** (no app-managed secret): every
+request carries `Authorization: Bearer <token>`, which the n8n flow replays to
+the homeserver's `/account/whoami` and checks against an allowlist. The
+contract is **three webhook nodes**:
+
+```
+GET  <stateUrl>    → JSON { index, bytes, exists } of the newest segment
+POST <backupUrl>   headers X-Segment-Index:<n>, X-Segment-Mode:create|append
+                   body  = the binary record stream (Content-Type octet-stream)
+                   → upsert segment-<n> in Drive; respond { index, bytes }
+GET  <hydrateUrl>  → application/octet-stream: every segment concatenated, oldest first
+```
+
+Config is per-user, **vault-encrypted at rest**, and set from the console:
+
+```js
+window.MatrixLive.setDriveBackup({
+  stateUrl:   'https://n8n.intelechia.com/webhook/<state-id>',
+  backupUrl:  'https://n8n.intelechia.com/webhook/731463c6-3200-4163-b497-7986bf5ad10d',
+  hydrateUrl: 'https://n8n.intelechia.com/webhook/08ceaacf-326b-4c97-87b7-d5ec6b58f333',
+});
+window.MatrixLive.getDriveBackup()          // { stateUrl, backupUrl, hydrateUrl, canBackup, canHydrate }
+await window.MatrixLive.testDriveBackup()    // hits hydrate → { ok, status, blocks }
+```
+
 ---
 
 ## 4. Building a new app — the minimum viable path

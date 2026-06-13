@@ -38,6 +38,7 @@
 
 import { getClient } from './client.js';
 import { fetchMxcBytes, cacheMediaBytes, getCachedMediaBytes } from './media.js';
+import * as driveBackup from './drivebackup.js';
 import {
   encodeBlock, decodeBlock, mergeChainEvents, capManifest, manifestEntry,
 } from './crypto/blockcodec.js';
@@ -133,6 +134,16 @@ export async function appendBlock(namespace, roomId, wck, events, head, manifest
   // Mirror the decoded block locally so re-opens skip download + decrypt.
   await cacheMediaBytes(mxc, plaintext);
 
+  // BACKUP (up): queue the SAME encrypted ciphertext for the off-site n8n →
+  // Google Drive mirror, when configured. The Drive path has its own cycle —
+  // it batches blocks and rewrites a binary segment file every ~100 events,
+  // rolling to a new file at a size cap (drivebackup.js). Best-effort and
+  // detached: the block is already in the media store, so a backup failure
+  // never affects the primary append. Drive sees only opaque ciphertext.
+  if (driveBackup.canBackup()) {
+    driveBackup.queueBlock({ roomId, idx, sha256, mxc, bytes, events: events.length });
+  }
+
   return { mxc, sha256, idx, manifest: kept, base };
 }
 
@@ -182,25 +193,73 @@ function sanitizeHead(content) {
 }
 
 /**
- * Fetch + decode one block by pointer. Tries the local OPFS mirror first
- * (verified at download time), else downloads, verifies the ciphertext
- * hash, decodes, and mirrors. Returns the decoded block or null on any
- * failure (offline, blob gone, tampered, undecryptable).
- */
-async function fetchBlock(wck, mxc, sha256) {
-  const cached = await getCachedMediaBytes(mxc);
-  if (cached) {
-    try { return JSON.parse(decoder.decode(cached)); } catch { /* fall through */ }
-  }
-  const ct = await fetchMxcBytes(mxc);
-  if (!ct) return null;                                    // offline / blob gone
-  let block;
+/** Fetch a source's ciphertext and decode+verify it against `sha256`. Returns
+ *  the decoded block, or null on any failure (offline, blob gone, tampered).
+ *  Never throws, so it is safe to race. */
+async function decodeFromSource(getCiphertext, wck, sha256, mxc) {
+  let ct;
+  try { ct = await getCiphertext(); } catch { return null; }
+  if (!ct) return null;
   try {
-    block = await decodeBlock(wck, ct, sha256);
+    return await decodeBlock(wck, ct, sha256);
   } catch (e) {
     console.warn('[blocks] bad block at', mxc, '—', e?.message || e);
     return null;
   }
+}
+
+/** Resolve with the first promise to yield a truthy value; null if none do. */
+function firstValid(promises) {
+  return new Promise((resolve) => {
+    let remaining = promises.length;
+    if (!remaining) return resolve(null);
+    let done = false;
+    const lose = () => { if (!done && --remaining === 0) resolve(null); };
+    for (const p of promises) {
+      p.then((v) => { if (done) return; if (v) { done = true; resolve(v); } else lose(); }, lose);
+    }
+  });
+}
+
+/**
+ * Fetch + decode one block by pointer, from the FASTEST available source.
+ *
+ * Order of preference is by speed, not by trust — every candidate's bytes
+ * pass through decodeBlock's sha256 check, so a wrong/tampered/undecryptable
+ * blob from any source is simply ignored:
+ *   1. the local OPFS mirror (verified at download time) — instant;
+ *   2. an already-pulled, fresh Drive chain (sync peek, no network) — so a
+ *      hydration of N blocks pays a single Drive GET;
+ *   3. otherwise RACE the homeserver media store against the Drive backup and
+ *      take whichever returns a valid block first.
+ *
+ * "Latest" is guaranteed elsewhere: the block list comes from the room-state
+ * manifest/head, which is always current, and Drive can only ever serve a
+ * block whose sha256 the manifest already names.
+ */
+async function fetchBlock(wck, mxc, sha256, roomId) {
+  const cached = await getCachedMediaBytes(mxc);
+  if (cached) {
+    try { return JSON.parse(decoder.decode(cached)); } catch { /* fall through */ }
+  }
+
+  // Drive's whole-chain pull is shared across the hydration; once it lands,
+  // serve from memory and skip a redundant media round-trip entirely.
+  let block = null;
+  const peeked = driveBackup.canHydrate() ? driveBackup.peekBlock({ sha256 }) : null;
+  if (peeked) {
+    try { block = await decodeBlock(wck, peeked, sha256); } catch { block = null; }
+  }
+
+  if (!block) {
+    const racers = [decodeFromSource(() => fetchMxcBytes(mxc), wck, sha256, mxc)];
+    if (driveBackup.canHydrate()) {
+      racers.push(decodeFromSource(() => driveBackup.getBlock({ sha256 }), wck, sha256, mxc));
+    }
+    block = await firstValid(racers);
+  }
+  if (!block) return null;
+
   try {
     await cacheMediaBytes(mxc, encoder.encode(JSON.stringify(block)));
   } catch { /* mirror is best-effort */ }
@@ -208,12 +267,12 @@ async function fetchBlock(wck, mxc, sha256) {
 }
 
 /** Walk one chain head → genesis serially. Returns { blocks, complete }. */
-async function walkChain(wck, head) {
+async function walkChain(wck, head, roomId) {
   const blocks = [];
   let ptr = head;
   let guard = 0;
   while (ptr && guard++ < MAX_CHAIN_BLOCKS) {
-    const block = await fetchBlock(wck, ptr.mxc, ptr.sha256);
+    const block = await fetchBlock(wck, ptr.mxc, ptr.sha256, roomId);
     if (!block) return { blocks, complete: false };
     blocks.push(block);
     ptr = block.prev;
@@ -226,14 +285,14 @@ async function walkChain(wck, head) {
  * Returns { blocks, complete } where complete is false if any entry failed.
  * `onBlock` is called once per resolved entry for progress reporting.
  */
-async function fetchManifestBlocks(wck, manifest, onBlock) {
+async function fetchManifestBlocks(wck, manifest, onBlock, roomId) {
   const out = new Array(manifest.length).fill(null);
   let complete = true;
   let next = 0;
   async function worker() {
     while (next < manifest.length) {
       const k = next++;
-      const block = await fetchBlock(wck, manifest[k].m, manifest[k].h);
+      const block = await fetchBlock(wck, manifest[k].m, manifest[k].h, roomId);
       if (block) out[k] = block; else complete = false;
       if (onBlock) onBlock();
     }
@@ -250,17 +309,17 @@ async function fetchManifestBlocks(wck, manifest, onBlock) {
  * listed block. Falls back entirely to the serial walk for legacy heads
  * that predate manifests.
  */
-async function loadChainBlocks(wck, info, onBlock) {
+async function loadChainBlocks(wck, info, onBlock, roomId) {
   const { head, manifest, manifestBase } = info;
-  if (!manifest) return walkChain(wck, head);
+  if (!manifest) return walkChain(wck, head, roomId);
 
-  const { blocks, complete } = await fetchManifestBlocks(wck, manifest, onBlock);
+  const { blocks, complete } = await fetchManifestBlocks(wck, manifest, onBlock, roomId);
   if (!complete || !(manifestBase > 0)) return { blocks, complete };
 
   // The manifest dropped its oldest entries to fit room state. Walk the
   // remaining tail from the oldest listed block's prev pointer.
   const oldest = blocks.reduce((m, b) => (b.idx < m.idx ? b : m), blocks[0]);
-  const tail = oldest?.prev ? await walkChain(wck, oldest.prev) : { blocks: [], complete: true };
+  const tail = oldest?.prev ? await walkChain(wck, oldest.prev, roomId) : { blocks: [], complete: true };
   return { blocks: blocks.concat(tail.blocks), complete: tail.complete };
 }
 
