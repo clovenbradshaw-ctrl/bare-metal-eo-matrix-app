@@ -658,6 +658,65 @@ function foldCommitted(ME, cache, committed, cc, roomId) {
   return fresh;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// View error boundary. The view tree is transpiled in-browser and leans on
+// lazily-loaded globals (window.ChatView, the eoreader engine, …); a single
+// render throw used to unmount the whole React root and leave a blank screen
+// with no clue why. This contains the failure to the view area: the sidebar
+// and topbar stay live so the user can switch away, the real error is shown
+// (and logged) instead of a white page, and "Reset & reload" clears a stale
+// service-worker shell — the usual culprit when a view stops loading after a
+// deploy. Keyed by the current selection so navigating away clears the error.
+// ─────────────────────────────────────────────────────────────────────────
+async function hardReset() {
+  try {
+    if (navigator.serviceWorker) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+  } catch (e) { /* best-effort — reload regardless */ }
+  window.location.reload();
+}
+
+class ViewErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) {
+    try { console.error('[view crash]', error, info && info.componentStack); } catch (e) {}
+  }
+  render() {
+    const err = this.state.error;
+    if (!err) return this.props.children;
+    const msg = err && err.message ? err.message : String(err);
+    const appLevel = this.props.level === 'app';
+    return (
+      <div className="view-error" role="alert">
+        <div className="view-error-card">
+          <div className="view-error-title">
+            <i className="ph ph-warning-octagon" aria-hidden="true"></i>
+            {appLevel ? 'The app hit an error and couldn’t render' : 'This view hit an error and couldn’t render'}
+          </div>
+          <pre className="view-error-msg">{msg}</pre>
+          <p className="view-error-hint">
+            {appLevel
+              ? 'Reload to recover. If this started after an update, “Reset & reload” clears the cached app shell, which is the usual fix.'
+              : 'The rest of the app is still working — switch views in the sidebar, or reload. If this started after an update, “Reset & reload” clears the cached app shell.'}
+          </p>
+          <div className="view-error-actions">
+            <button className="view-error-btn" onClick={() => this.setState({ error: null })}>Try again</button>
+            <button className="view-error-btn" onClick={() => window.location.reload()}>Reload</button>
+            <button className="view-error-btn primary" onClick={hardReset}>Reset &amp; reload</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+}
+
 function App() {
   const [session, setSession, booting] = window.useSession();
   const [tweaks, setTweak] = window.useTweaks(TWEAK_DEFAULTS);
@@ -1555,6 +1614,9 @@ function App() {
         />
 
         <div className="view-area">
+          <ViewErrorBoundary
+            key={`${selection.kind}:${selection.sliceKind || ''}:${selection.tableId || ''}:${selection.viewId || ''}:${selection.entityAnchor || ''}`}
+          >
           {selection.kind === 'log' && (
             <window.DbView
               rooms={rooms}
@@ -1670,6 +1732,7 @@ function App() {
               setSelection={setSelection}
             />
           )}
+          </ViewErrorBoundary>
         </div>
       </div>
 
@@ -1730,5 +1793,7 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <ViewErrorBoundary level="app"><App /></ViewErrorBoundary>
+);
 })();
