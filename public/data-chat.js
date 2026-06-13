@@ -1130,7 +1130,11 @@
     if (typeof window === 'undefined' || !window.EOLLM) return null;
     try {
       const models = window.EOLLM.wllamaModels ? window.EOLLM.wllamaModels() : {};
-      if (models['qwen25-05b']) return 'wllama:qwen25-05b';
+      // Prefer the balanced model, but only if the heap can actually hold it —
+      // on a heavy workspace the default must never pick a model that can't
+      // load (which is what left the chat stuck on "Loading engine…").
+      if (models['qwen25-05b'] && modelFits('wllama:qwen25-05b')) return 'wllama:qwen25-05b';
+      if (models['smollm2-360m']) return 'wllama:smollm2-360m';
       if (window.EOLLM.fallbackKey) return window.EOLLM.fallbackKey();
     } catch (e) {}
     return window.EOLLM.fallbackKey ? window.EOLLM.fallbackKey() : null;
@@ -1163,13 +1167,14 @@
 
   async function planWithLLM(q, state, opts) {
     if (typeof window === 'undefined' || !window.EOLLM || !window.EOLLM.phrase) return null;
-    const key = (opts && opts.llmKey) || defaultLLMKey();
+    const requested = (opts && opts.llmKey) || defaultLLMKey();
+    if (!requested) return null;
+    // Load (or reuse) the model through loadModel, which watchdogs a hung
+    // download and falls back to deterministic local parsing rather than letting
+    // the ask hang. Returns the key actually loaded (or null → no model).
+    const key = await loadModel(requested, opts && opts.onModelProgress, opts && opts.onStatus);
     if (!key) return null;
     try {
-      if (window.EOLLM.isLoaded && !window.EOLLM.isLoaded(key)) {
-        const ok = await window.EOLLM.load(key, opts && opts.onModelProgress);
-        if (ok === false) return null;
-      }
       const user = schemaPrompt(state, q) + '\n\nQuestion: ' + q + '\nJSON:';
       const raw = await window.EOLLM.phrase({ mlcKey: key, mode: 'plain-chat', sysOverride: LLM_SYSTEM, question: user, maxTokens: 220, onToken: opts && opts.onPlanToken });
       const plan = parsePlanJSON(raw);
@@ -1453,21 +1458,80 @@
   }
   function warmEmbeddings() { try { if (window.EOEmbed && window.EOEmbed.warm) window.EOEmbed.warm(); } catch (e) {} }
 
+  // ── on-device model: lazy, watchdog-protected loading ──────────────────────
+  // wllama loads a model's weights into WASM linear memory, so a model on an
+  // already-heavy workspace can take a while and push memory up. The "stuck on
+  // Loading engine…" the chat showed was an eager 770 MB download kicked off the
+  // moment data arrived — before the user even opened the chat — that then never
+  // reported progress. The fix is intent + resilience, not refusal: the model
+  // budget is soft and a model is allowed to exceed it, so we (a) load LAZILY,
+  // only once the user engages with the Ask view (see chat-view.jsx), and (b)
+  // put a stall-watchdog on the load so a hung fetch falls back to local parsing
+  // instead of spinning forever. modelFits() stays advisory — it only keeps the
+  // *default* pick conservative; an explicit choice is always honored.
+  const MODEL_MB_UNIT = 1024 * 1024;
+  const MODEL_MB = { 'wllama:smollm2-360m': 270, 'wllama:qwen25-05b': 380, 'wllama:llama32-1b': 770 };
+  const MODEL_LOAD_STALL_MS = 60000;  // no progress for this long ⇒ treat as hung
+
+  function heapInfo() {
+    try {
+      const m = (typeof performance !== 'undefined') && performance.memory;
+      if (m && m.usedJSHeapSize > 0 && m.jsHeapSizeLimit > 0) return { used: m.usedJSHeapSize, limit: m.jsHeapSizeLimit };
+    } catch (e) {}
+    return null;
+  }
+  function isModelLoaded(key) {
+    try { return !!(typeof window !== 'undefined' && window.EOLLM && window.EOLLM.isLoaded && window.EOLLM.isLoaded(key)); } catch (e) { return false; }
+  }
+  // Will `key`'s weights fit alongside what's already on the heap? Downloading +
+  // decoding a GGUF peaks well above its on-disk size, so budget ~1.5×. No heap
+  // signal (Firefox/Safari) ⇒ allow and lean on the watchdog. Exposed so the UI
+  // can flag a model that won't fit before the user waits on it.
+  function modelFits(key) {
+    if (isModelLoaded(key)) return true;        // already resident — no new alloc
+    const h = heapInfo();
+    if (!h) return true;
+    const need = (MODEL_MB[key] || 400) * MODEL_MB_UNIT * 1.5;
+    return (h.used + need) < (h.limit * 0.9);
+  }
+  // Race a model load against a stall watchdog: while progress keeps ticking we
+  // wait, but a long silence (hung download / blocked allocation) resolves false
+  // so the UI can fall back instead of hanging. The underlying load can't be
+  // cancelled, but the view is no longer held hostage to it.
+  function loadWithWatchdog(key, onProgress) {
+    return new Promise((resolve) => {
+      let settled = false, lastBeat = Date.now();
+      const finish = (v) => { if (!settled) { settled = true; clearInterval(iv); resolve(v); } };
+      const iv = setInterval(() => {
+        if (!settled && Date.now() - lastBeat > MODEL_LOAD_STALL_MS) finish(false);
+      }, 5000);
+      let p;
+      try { p = window.EOLLM.load(key, (prog) => { lastBeat = Date.now(); if (onProgress) onProgress(prog); }); }
+      catch (e) { return finish(false); }
+      Promise.resolve(p).then((r) => finish(r !== false), () => finish(false));
+    });
+  }
+
   // Install the on-device intent model's WEIGHTS (the heavy part). ensureLLM
-  // loads only the runtime; this downloads/initializes the chosen model so the
-  // chat can actually use it. Idempotent + best-effort — returns false if the
-  // model backend (eoreader3 llm.js) or the download isn't available, so a
-  // failure here never blocks the deterministic query core.
-  async function loadModel(key, onProgress) {
+  // loads only the runtime; this downloads/initializes the requested model so
+  // the chat can use it. We deliberately DON'T refuse on a tight heap — the
+  // memory budget is soft and the model is allowed to push past it — but the
+  // load is lazy (the Ask view only calls this once the user engages) and a
+  // stall-watchdog means a hung download falls back to local parsing instead of
+  // spinning forever. Idempotent + best-effort: returns the key actually loaded
+  // (truthy) or false, so a skip/failure never blocks the deterministic core.
+  async function loadModel(key, onProgress, onStatus) {
     const ready = await ensureLLM();
     if (!ready || typeof window === 'undefined' || !window.EOLLM || !window.EOLLM.load) return false;
-    const k = key || defaultLLMKey();
-    if (!k) return false;
-    try {
-      if (window.EOLLM.isLoaded && window.EOLLM.isLoaded(k)) return true;
-      const ok = await window.EOLLM.load(k, onProgress);
-      return ok !== false;
-    } catch (e) { return false; }
+    const eff = key || defaultLLMKey();
+    if (!eff) return false;
+    if (isModelLoaded(eff)) return eff;
+    // Free what caches we can before a big allocation — the model may exceed the
+    // app's soft budget, so reclaim headroom first to make room for it.
+    try { if (window.MatrixLive && window.MatrixLive.checkMemory) window.MatrixLive.checkMemory(); } catch (e) {}
+    const ok = await loadWithWatchdog(eff, onProgress);
+    if (!ok && onStatus) onStatus('Couldn’t load the model — using local parsing (queries still work)');
+    return ok ? eff : false;
   }
 
   // Is there heap headroom to pull in a heavy WASM runtime? This app governs a
@@ -1526,16 +1590,16 @@
     opts = opts || {};
     await ensureEngine();                       // compromise + math.js + EOCompute + EOEmbed
     let model = false, python = false;
-    if (opts.loadModel !== false) model = await loadModel(opts.modelKey, opts.onModelProgress).catch(() => false);
+    if (opts.loadModel !== false) model = await loadModel(opts.modelKey, opts.onModelProgress, opts.onStatus).catch(() => false);
     if (opts.loadPython) python = await ensurePython(opts).catch(() => false);
     const w = (typeof window !== 'undefined') ? window : {};
-    return { engine: !!w.EOEngine, math: !!w.math, model: !!model, python: !!python };
+    return { engine: !!w.EOEngine, math: !!w.math, model: !!model, modelKey: (typeof model === 'string' ? model : null), python: !!python };
   }
 
   // ── exports ───────────────────────────────────────────────────────────────
   const api = {
     interpret, buildPlan, buildPlanForType, executePlan, planWithLLM, ensureEngine, ensureLLM, warmEmbeddings,
-    loadModel, ensurePython, pythonReady, ensureAnalysis, describe,
+    loadModel, modelFits, ensurePython, pythonReady, ensureAnalysis, describe,
     defaultLLMKey, schemaPrompt, parsePlanJSON,
     maybeTypeConfirm, maybeFloodConfirm,
     // EO-notation read-back of a query (also the query the Ask view renders so

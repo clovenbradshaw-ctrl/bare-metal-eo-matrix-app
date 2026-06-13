@@ -322,6 +322,8 @@ function ChatView({ room, state, setSelection }) {
   const [status, setStatus] = useState(null);      // per-question thinking text
   const [modelStage, setModelStage] = useState('off'); // 'off' | 'loading' | 'ready'
   const [modelMsg, setModelMsg] = useState('');        // status-pill text
+  const [armed, setArmed] = useState(false);           // user engaged → start loading the model
+  const arm = useCallback(() => setArmed(true), []);   // idempotent; React bails if unchanged
   const scrollRef = useRef(null);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -331,18 +333,21 @@ function ChatView({ room, state, setSelection }) {
     try { const t = (DC().knownTypes(state) || []); return suggestStarters(state, t); } catch (e) { return []; }
   }, [state && state.cursor, Object.keys(state.entities || {}).length]);
 
-  // Auto-load the analysis stack once the workspace data is in (Smart parse is
-  // always on — there's no toggle). Order is memory-conscious: the deterministic
-  // engine + math.js first (cheap, always useful), THEN the on-device model
-  // weights, THEN the Python (numpy/pandas) runtime — but only if there's heap
-  // headroom, so we never OOM a big workspace pulling in a WASM stack. Every
-  // step is best-effort: deterministic queries answer immediately regardless,
-  // so a failed or skipped download never blocks asking.
+  // Load the analysis stack LAZILY — only once the user actually engages with
+  // the Ask view (focuses/clicks/asks), never just because data arrived. On a
+  // heavy workspace a model is hundreds of MB, so we don't pile it onto the tab
+  // until there's intent to use it. Order: the deterministic engine + math.js
+  // first (cheap), THEN the on-device model weights, THEN Python (numpy/pandas).
+  // Every step is best-effort and narrates its progress (engine → downloading
+  // model · % → preparing → ready); deterministic queries answer immediately
+  // regardless, so a slow or failed download never blocks asking.
   useEffect(() => {
-    if (!entityCount) return; // wait until the data has loaded
+    if (!armed || !entityCount) return; // lazy: wait for engagement + data
     const dc = DC();
     if (!dc || !dc.ensureAnalysis) return;
     let alive = true;
+    const picked = LOCAL_MODELS.find(m => m.key === model);
+    const shortName = picked ? picked.label.split('·')[0].trim() : 'model';
     setModelStage('loading'); setModelMsg('Loading engine…');
     dc.ensureAnalysis({
       modelKey: model,
@@ -350,17 +355,23 @@ function ChatView({ room, state, setSelection }) {
       onModelProgress: (p) => {
         if (!alive) return;
         const pct = p && typeof p.progress === 'number' ? Math.round(p.progress * 100) : null;
-        setModelMsg(`Installing model${pct != null ? ` · ${pct}%` : '…'}`);
+        if (pct != null && pct >= 99) setModelMsg(`Preparing ${shortName}…`);
+        else setModelMsg(`Downloading ${shortName}${pct != null ? ` · ${pct}%` : '…'}`);
       },
       onStatus: (s) => { if (alive) setModelMsg(s); },
     }).then((caps) => {
       if (!alive) return;
       if (dc.warmEmbeddings) dc.warmEmbeddings();
-      if (caps && caps.model) { setModelStage('ready'); setModelMsg(caps.python ? 'Model + Python ready' : 'Model ready · Python off'); }
-      else { setModelStage('off'); setModelMsg('Local parsing'); }
+      if (caps && caps.model) {
+        setModelStage('ready');
+        setModelMsg(shortName + ' ready' + (caps.python ? ' · Python on' : ''));
+      } else {
+        setModelStage('off');
+        setModelMsg('Local parsing');
+      }
     }).catch(() => { if (alive) { setModelStage('off'); setModelMsg('Local parsing'); } });
     return () => { alive = false; };
-  }, [entityCount > 0, model]);
+  }, [armed, entityCount > 0, model]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -396,6 +407,7 @@ function ChatView({ room, state, setSelection }) {
   const ask = useCallback(async (text) => {
     const q = String(text || '').trim();
     if (!q || busy) return;
+    arm();              // asking is engagement → bring the model up if it isn't
     setInput('');
     setMessages(m => [...m, { role: 'user', text: q }]);
     setBusy(true);
@@ -430,12 +442,15 @@ function ChatView({ room, state, setSelection }) {
       setBusy(false);
       setStatus(null);
     }
-  }, [busy, model]);
+  }, [busy, model, arm]);
 
   const onSubmit = (e) => { e.preventDefault(); ask(input); };
 
+  // Clicking/typing anywhere in the Ask view is "engagement" → arm the lazy
+  // model load. Focus alone (e.g. the input's autoFocus) deliberately doesn't,
+  // so the heavy download waits for real intent.
   return (
-    <div className="dc-view">
+    <div className="dc-view" onMouseDown={arm}>
       <div className="dc-bar">
         <div className="dc-bar-title"><i className="ph ph-chat-circle-dots" aria-hidden="true"></i> Ask {room ? room.title : 'your data'}</div>
         <div className="dc-bar-right">
@@ -464,7 +479,7 @@ function ChatView({ room, state, setSelection }) {
                 {starters.map((s, i) => <button key={i} className="dc-starter" onClick={() => ask(s)}>{s}</button>)}
               </div>
             )}
-            <p className="dc-note">Smart parse is always on. A small model ({LOCAL_MODELS.find(m => m.key === model)?.label}) and a local Python (pandas) runtime load automatically once your data is in, then run fully offline — but you can ask right away, since local parsing answers immediately.</p>
+            <p className="dc-note">Ask right away — local parsing answers instantly. The first time you click in here, a small on-device model ({LOCAL_MODELS.find(m => m.key === model)?.label}) and a local Python (pandas) runtime start loading in the background to sharpen trickier questions, then run fully offline.</p>
           </div>
         )}
 
@@ -492,7 +507,7 @@ function ChatView({ room, state, setSelection }) {
           className="dc-input"
           value={input}
           placeholder="Ask about your data…"
-          onChange={e => setInput(e.target.value)}
+          onChange={e => { setInput(e.target.value); arm(); }}
           disabled={busy}
           autoFocus
         />
