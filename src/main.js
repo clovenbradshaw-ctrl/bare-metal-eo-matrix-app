@@ -523,9 +523,11 @@ async function afterAuth(userId, homeserver) {
   ensureDurableStorage();
 
   // Load this user's off-site backup config (vault-encrypted at rest) so the
-  // block chain can mirror to / hydrate from their n8n → Drive webhook.
+  // block chain can mirror to / hydrate from their n8n → Drive webhook. Then,
+  // if Drive is empty, seed the genesis hydration file so it always exists.
   driveBackup.loadConfig(userId, loadSecret)
-    .catch(e => console.warn('[bridge] drive backup config load failed:', e?.message || e));
+    .then(() => driveBackup.ensureBackupInitialized())
+    .catch(e => console.warn('[bridge] drive backup init failed:', e?.message || e));
 
   if (unsubRoomChanges) unsubRoomChanges();
   unsubRoomChanges = onRoomChanges(() => {
@@ -677,6 +679,7 @@ async function tearDownLiveState() {
   roomBlockSync.clear();
   clearWorkspaceKeys();
   clearIdentity();
+  driveBackup.flushBackup().catch(() => {});   // drain a partial batch first
   driveBackup.clearConfig();
   identityReady = Promise.resolve(null);
   for (const [, fns] of roomUnsubs) fns.forEach(fn => { try { fn(); } catch {} });
@@ -1697,8 +1700,10 @@ window.MatrixLive = {
   forceBlockSync,
   hasEnvelopeIdentity: () => !!getIdentity(),
   // Off-site backup / fast hydration (n8n → Google Drive). Opt-in, per-user,
-  // vault-encrypted config; mirrors WCK-encrypted blocks the homeserver can't
-  // read and serves them back on a cold or lossy hydrate.
+  // vault-encrypted config { stateUrl, backupUrl, hydrateUrl }. Mirrors
+  // WCK-encrypted blocks the homeserver can't read into rotating binary Drive
+  // segments, and races Drive against the media store to replay from whichever
+  // is fastest on hydrate.
   getDriveBackup: () => driveBackup.getConfig(),
   setDriveBackup: (cfg) => {
     const userId = activeSession?.mxid;

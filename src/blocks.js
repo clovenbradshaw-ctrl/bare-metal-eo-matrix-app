@@ -134,13 +134,14 @@ export async function appendBlock(namespace, roomId, wck, events, head, manifest
   // Mirror the decoded block locally so re-opens skip download + decrypt.
   await cacheMediaBytes(mxc, plaintext);
 
-  // BACKUP (up): mirror the SAME encrypted ciphertext off-site to the user's
-  // n8n → Google Drive webhook, when configured. Best-effort and detached —
-  // a backup failure must never fail the primary append (the block is
-  // already in the media store). Drive sees only opaque ciphertext.
+  // BACKUP (up): queue the SAME encrypted ciphertext for the off-site n8n →
+  // Google Drive mirror, when configured. The Drive path has its own cycle —
+  // it batches blocks and rewrites a binary segment file every ~100 events,
+  // rolling to a new file at a size cap (drivebackup.js). Best-effort and
+  // detached: the block is already in the media store, so a backup failure
+  // never affects the primary append. Drive sees only opaque ciphertext.
   if (driveBackup.canBackup()) {
-    driveBackup.mirrorBlock({ roomId, idx, sha256, mxc, bytes })
-      .catch(() => {});
+    driveBackup.queueBlock({ roomId, idx, sha256, mxc, bytes, events: events.length });
   }
 
   return { mxc, sha256, idx, manifest: kept, base };
@@ -192,18 +193,49 @@ function sanitizeHead(content) {
 }
 
 /**
- * Fetch + decode one block by pointer. Tries the local OPFS mirror first
- * (verified at download time), then the configured block sources in order,
- * verifying the ciphertext hash before trusting any of them, and mirrors the
- * decoded result. Returns the decoded block or null on any failure (offline,
- * blob gone, tampered, undecryptable).
+/** Fetch a source's ciphertext and decode+verify it against `sha256`. Returns
+ *  the decoded block, or null on any failure (offline, blob gone, tampered).
+ *  Never throws, so it is safe to race. */
+async function decodeFromSource(getCiphertext, wck, sha256, mxc) {
+  let ct;
+  try { ct = await getCiphertext(); } catch { return null; }
+  if (!ct) return null;
+  try {
+    return await decodeBlock(wck, ct, sha256);
+  } catch (e) {
+    console.warn('[blocks] bad block at', mxc, '—', e?.message || e);
+    return null;
+  }
+}
+
+/** Resolve with the first promise to yield a truthy value; null if none do. */
+function firstValid(promises) {
+  return new Promise((resolve) => {
+    let remaining = promises.length;
+    if (!remaining) return resolve(null);
+    let done = false;
+    const lose = () => { if (!done && --remaining === 0) resolve(null); };
+    for (const p of promises) {
+      p.then((v) => { if (done) return; if (v) { done = true; resolve(v); } else lose(); }, lose);
+    }
+  });
+}
+
+/**
+ * Fetch + decode one block by pointer, from the FASTEST available source.
  *
- * The off-site n8n → Drive backup (drivebackup.js) joins as a second source:
- * in "fast" mode it is tried BEFORE the homeserver media store (cold device /
- * slow or lossy media store); otherwise it is the FALLBACK for a block the
- * media store can't serve — or serves corrupted, since a hash mismatch on one
- * source just moves on to the next. Every source's bytes pass through
- * decodeBlock's sha256 check, so an untrusted webhook can never inject a block.
+ * Order of preference is by speed, not by trust — every candidate's bytes
+ * pass through decodeBlock's sha256 check, so a wrong/tampered/undecryptable
+ * blob from any source is simply ignored:
+ *   1. the local OPFS mirror (verified at download time) — instant;
+ *   2. an already-pulled, fresh Drive chain (sync peek, no network) — so a
+ *      hydration of N blocks pays a single Drive GET;
+ *   3. otherwise RACE the homeserver media store against the Drive backup and
+ *      take whichever returns a valid block first.
+ *
+ * "Latest" is guaranteed elsewhere: the block list comes from the room-state
+ * manifest/head, which is always current, and Drive can only ever serve a
+ * block whose sha256 the manifest already names.
  */
 async function fetchBlock(wck, mxc, sha256, roomId) {
   const cached = await getCachedMediaBytes(mxc);
@@ -211,30 +243,27 @@ async function fetchBlock(wck, mxc, sha256, roomId) {
     try { return JSON.parse(decoder.decode(cached)); } catch { /* fall through */ }
   }
 
-  const fromDrive = () =>
-    (driveBackup.canHydrate() ? driveBackup.getBlock({ roomId, sha256, mxc }) : null);
-  const fromMedia = () => fetchMxcBytes(mxc);
-  const sources = driveBackup.isFast()
-    ? [fromDrive, fromMedia]                                // fast: Drive first
-    : [fromMedia, fromDrive];                               // default: media first
-
-  for (const getCiphertext of sources) {
-    let ct;
-    try { ct = await getCiphertext(); } catch { ct = null; }
-    if (!ct) continue;                                      // offline / blob gone
-    let block;
-    try {
-      block = await decodeBlock(wck, ct, sha256);
-    } catch (e) {
-      console.warn('[blocks] bad block at', mxc, '—', e?.message || e);
-      continue;                                             // try the next source
-    }
-    try {
-      await cacheMediaBytes(mxc, encoder.encode(JSON.stringify(block)));
-    } catch { /* mirror is best-effort */ }
-    return block;
+  // Drive's whole-chain pull is shared across the hydration; once it lands,
+  // serve from memory and skip a redundant media round-trip entirely.
+  let block = null;
+  const peeked = driveBackup.canHydrate() ? driveBackup.peekBlock({ sha256 }) : null;
+  if (peeked) {
+    try { block = await decodeBlock(wck, peeked, sha256); } catch { block = null; }
   }
-  return null;
+
+  if (!block) {
+    const racers = [decodeFromSource(() => fetchMxcBytes(mxc), wck, sha256, mxc)];
+    if (driveBackup.canHydrate()) {
+      racers.push(decodeFromSource(() => driveBackup.getBlock({ sha256 }), wck, sha256, mxc));
+    }
+    block = await firstValid(racers);
+  }
+  if (!block) return null;
+
+  try {
+    await cacheMediaBytes(mxc, encoder.encode(JSON.stringify(block)));
+  } catch { /* mirror is best-effort */ }
+  return block;
 }
 
 /** Walk one chain head → genesis serially. Returns { blocks, complete }. */
