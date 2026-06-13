@@ -130,7 +130,7 @@ function saveLastView(user, roomId, selection) {
 // blank pane.
 function validSavedSelection(sel) {
   if (!sel || typeof sel !== 'object') return false;
-  if (sel.kind === 'log' || sel.kind === 'sync') return true;
+  if (sel.kind === 'log' || sel.kind === 'sync' || sel.kind === 'chat') return true;
   if (sel.kind !== 'slice') return false;
   return ['table', 'schema', 'kanban', 'notebook', 'graph', 'timeline'].includes(sel.sliceKind);
 }
@@ -1456,6 +1456,13 @@ function App() {
                 lastPendingRef.current = -1;
                 setImportRowsVersion(v => v + 1);
               }}
+            />
+          )}
+          {selection.kind === 'chat' && (
+            <window.ChatView
+              room={rooms.find(r => r.id === currentRoomId)}
+              state={renderState}
+              setSelection={setSelection}
             />
           )}
           {selection.kind === 'slice' && (selection.sliceKind === 'table') && (
