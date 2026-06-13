@@ -89,7 +89,7 @@ function StatusDot({ tone, label }) {
 function SyncView({
   room, isLive, session, tables = [],
   committedCount = 0, pendingPart = 0, eventsTotal = 0, scrubber,
-  onRefreshTables,
+  onRefreshTables, reclaimableMedia = [], onReclaimMedia,
 }) {
   const ML = (typeof window !== 'undefined' && window.MatrixLive) || null;
   const live = isLive && !!ML;
@@ -104,8 +104,9 @@ function SyncView({
   const [outbox, setOutbox] = useState(0);
   const [hasIdentity, setHasIdentity] = useState(true);
   const [log, setLog] = useState([]);
-  const [busy, setBusy] = useState(null);     // 'persist' | 'resync' | 'block' | null
+  const [busy, setBusy] = useState(null);     // 'persist' | 'resync' | 'block' | 'reclaim' | null
   const [lastRefreshed, setLastRefreshed] = useState(0);
+  const [reclaimed, setReclaimed] = useState(null);   // { removed, bytes } after a reclaim
   const mounted = useRef(true);
 
   const refresh = useCallback(async () => {
@@ -161,6 +162,16 @@ function SyncView({
     catch (e) { console.warn('[sync-view] force block sync failed:', e); }
     finally { if (mounted.current) setBusy(null); }
   }
+  async function onReclaim() {
+    if (!onReclaimMedia || !reclaimableMedia.length) return;
+    setBusy('reclaim');
+    try {
+      const r = await onReclaimMedia();
+      if (mounted.current && r) setReclaimed(r);
+      await refresh();
+    } catch (e) { console.warn('[sync-view] reclaim failed:', e); }
+    finally { if (mounted.current) setBusy(null); }
+  }
 
   // ── derived status ──
   const syncing = sync?.phase === 'syncing';
@@ -170,6 +181,23 @@ function SyncView({
   const totalExpected = tables.reduce((s, t) => s + (t.expected || 0), 0);
   const totalLocal = tables.reduce((s, t) => s + (t.localRows || 0), 0);
   const anyIncomplete = tables.some(t => t.expected > t.localRows);
+
+  // ── storage breakdown (origin buckets) ──
+  // OPFS is just this app's own cache; the encryption store (IndexedDB) and the
+  // app shell (Cache Storage) are usually the larger, otherwise-invisible
+  // buckets — the answer to "why is the origin so much bigger than 'cache used'".
+  const ud = storage?.usageDetails || null;
+  const idbBytes = ud && typeof ud.indexedDB === 'number' ? ud.indexedDB : null;
+  const cacheBytes = storage?.caches?.bytes != null
+    ? storage.caches.bytes
+    : (ud && typeof ud.caches === 'number' ? ud.caches : null);
+  const opfsBytes = storage?.opfs?.totalBytes ?? null;
+  const estimateOk = storage?.estimateReliable !== false;
+  const measuredBytes = storage?.measuredBytes || 0;
+  // The crypto store carries every megolm session + device key for the WHOLE
+  // account, so it usually dominates and is the surprise in "why so large".
+  const idbDominates = idbBytes != null &&
+    idbBytes > (opfsBytes || 0) && idbBytes > (cacheBytes || 0);
 
   return (
     <div className="table-view sync-view">
@@ -243,15 +271,72 @@ function SyncView({
             </div>
 
             <div className="sync-stats">
-              <Stat label="cache used" value={fmtBytes(storage?.opfs?.totalBytes)} hint="total bytes this app holds in OPFS" />
+              <Stat label="cache used" value={fmtBytes(opfsBytes)} hint="total bytes this app holds in OPFS (event logs + dataset blobs)" />
               <Stat label="event logs" value={fmtBytes(storage?.opfs?.room?.bytes)} hint={`${fmtNum(storage?.opfs?.room?.files || 0)} room file(s)`} />
               <Stat label="dataset blobs" value={fmtBytes(storage?.opfs?.media?.bytes)} hint={`${fmtNum(storage?.opfs?.media?.files || 0)} cached media blob(s) — imported rows live here`} />
-              <Stat label="origin quota" value={storage?.quota ? `${fmtBytes(storage?.usage)} / ${fmtBytes(storage?.quota)}` : '—'} hint="browser-reported usage across this origin" />
+              <Stat
+                label="origin total"
+                value={estimateOk && storage?.usage != null ? fmtBytes(storage.usage) : fmtBytes(measuredBytes)}
+                tone={estimateOk ? undefined : 'warn'}
+                hint={estimateOk
+                  ? 'browser-reported usage across this whole origin'
+                  : 'browser estimate looks fuzzed — showing the bytes this app measured directly'}
+              />
             </div>
-            {storage?.quota ? (
+
+            {/* Where the origin's bytes actually sit. The 'cache used' tile is
+                only this app's OPFS; these are the bigger, invisible buckets. */}
+            {(idbBytes != null || cacheBytes != null) && (
+              <div className="sync-substats">
+                <span>workspace cache (OPFS): <b>{fmtBytes(opfsBytes)}</b></span>
+                {idbBytes != null && <span>encryption + queues (IndexedDB): <b>{fmtBytes(idbBytes)}</b></span>}
+                {cacheBytes != null && <span>app shell (Cache): <b>{fmtBytes(cacheBytes)}</b></span>}
+              </div>
+            )}
+
+            {estimateOk && storage?.quota ? (
               <Meter label="origin storage" part={storage.usage || 0} whole={storage.quota}
                 tone="neutral" right={`${pct(storage.usage, storage.quota)}%`} />
             ) : null}
+
+            {!estimateOk && (
+              <div className="sync-note muted">
+                This browser reports <b>{fmtBytes(storage?.usage)}</b> used against a{' '}
+                <b>{fmtBytes(storage?.quota)}</b> quota — usage above quota is impossible, so
+                the figure is being fuzzed for fingerprint resistance (Brave and Tor do this).
+                The bytes above are what this app actually measured on disk.
+              </div>
+            )}
+
+            {idbDominates && (
+              <div className="sync-note muted">
+                Most of the origin is the <b>Matrix encryption store</b> — every megolm
+                session and device key for your <em>whole</em> account, not just this
+                workspace. It rebuilds from the homeserver, so signing out and back in
+                (or “Clear all” in tweaks) reclaims it; this workspace’s history still
+                comes back from the durable chain.
+              </div>
+            )}
+
+            {reclaimableMedia.length > 0 && (
+              <div className="sync-actions">
+                {/* The superseded import *entities* stay in the log after a
+                    reclaim (only their mirrored blobs are deleted), so gate the
+                    button on the result — a second click would free nothing. */}
+                {reclaimed ? (
+                  <span className="sync-actions-meta">
+                    reclaimed {fmtBytes(reclaimed.bytes)} from {fmtNum(reclaimed.removed)} stale import blob{reclaimed.removed === 1 ? '' : 's'}
+                  </span>
+                ) : (
+                  <button className="sync-btn" onClick={onReclaim} disabled={busy === 'reclaim'}
+                    title="delete the mirrored source blobs of import generations that a later re-sync superseded — they re-download if ever needed">
+                    {busy === 'reclaim'
+                      ? 'reclaiming…'
+                      : `Reclaim ${fmtNum(reclaimableMedia.length)} stale import blob${reclaimableMedia.length === 1 ? '' : 's'}`}
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
           {/* ── This workspace ── */}

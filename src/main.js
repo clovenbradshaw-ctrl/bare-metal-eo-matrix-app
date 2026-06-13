@@ -32,12 +32,12 @@ import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          onDecrypted, onLocalEchoUpdated, EventStatus,
          setName as mxSetRoomName, getDisplayName as mxGetDisplayName,
          setDisplayName as mxSetDisplayName } from './rooms.js';
-import { EventStore, requestPersistentStorage, getOpfsBreakdown } from './store.js';
+import { EventStore, requestPersistentStorage, getOpfsBreakdown, getCacheStorageUsage } from './store.js';
 import { vault, getLastUser, loadSecret, storeSecret, removeSecret } from './vault.js';
 import { OutboxFlusher, listAll as outboxListAll, pendingCount,
          onChange as onOutboxChange, remove as outboxRemove } from './outbox.js';
 import { onNetworkChange, getNetworkState } from './network.js';
-import { uploadFile as mediaUploadFile, getMediaBytes } from './media.js';
+import { uploadFile as mediaUploadFile, getMediaBytes, purgeMediaByMxc } from './media.js';
 import { loadManifest, saveManifest } from './roomManifest.js';
 import * as memory from './memory.js';
 import { ensureIdentity, loadIdentityFromVault, getIdentity, clearIdentity } from './crypto/identity.js';
@@ -1600,6 +1600,28 @@ async function getStorageStatus() {
     usage: null,
     quota: null,
     opfs: null,
+    // Per-bucket origin breakdown the browser reports (Chromium): where the
+    // origin's bytes actually sit — { indexedDB, caches, fileSystem, … }. This
+    // is what names the gap between our OPFS total and the whole-origin usage:
+    // the matrix-js-sdk Rust-crypto store (every megolm session + device key
+    // for the WHOLE account) lands in `indexedDB`, not OPFS, so the sync page
+    // would otherwise show 269 MB while the origin holds gigabytes.
+    usageDetails: null,
+    // Cache Storage (Service Worker app shell) — measured directly when the
+    // browser doesn't itemize it for us.
+    caches: null,
+    // Names of this origin's IndexedDB databases (sizes aren't exposed
+    // per-DB cross-browser; the names alone tell the user the crypto store
+    // and outbox are what's there).
+    idbNames: null,
+    // False when the estimate is clearly unreliable — Brave/Tor deliberately
+    // fuzz estimate() for fingerprint resistance, which is why a real session
+    // can report usage > quota (impossible) with a pinned 100% bar. When this
+    // is false the UI leads with `measuredBytes` (ground truth) instead.
+    estimateReliable: true,
+    // Bytes we counted ourselves (OPFS + Cache Storage), independent of the
+    // fuzzable estimate.
+    measuredBytes: 0,
   };
   try {
     if (navigator.storage?.persisted) status.persisted = await navigator.storage.persisted();
@@ -1609,10 +1631,44 @@ async function getStorageStatus() {
       const est = await navigator.storage.estimate();
       status.usage = est.usage ?? null;
       status.quota = est.quota ?? null;
+      status.usageDetails = est.usageDetails || null;
     }
   } catch {}
   try { status.opfs = await getOpfsBreakdown(); } catch {}
+
+  // Cache Storage: prefer the browser's own itemized figure (free) and only
+  // walk the caches ourselves when it isn't offered.
+  if (status.usageDetails && typeof status.usageDetails.caches === 'number') {
+    status.caches = { bytes: status.usageDetails.caches, entries: null, source: 'estimate' };
+  } else {
+    try { status.caches = { ...(await getCacheStorageUsage()), source: 'measured' }; } catch {}
+  }
+
+  try {
+    if (typeof indexedDB !== 'undefined' && indexedDB.databases) {
+      const dbs = await indexedDB.databases();
+      status.idbNames = dbs.map(d => d.name).filter(Boolean);
+    }
+  } catch {}
+
+  // Ground truth we trust regardless of a fuzzed estimate.
+  status.measuredBytes = (status.opfs?.totalBytes || 0) + (status.caches?.bytes || 0);
+  // usage < measured is fine (estimate rounds down / lags); usage > quota is
+  // the impossible signature of a fuzzed estimate.
+  if (status.quota != null && status.usage != null) {
+    status.estimateReliable = status.usage <= status.quota;
+  }
   return status;
+}
+
+// Reclaim local disk by deleting specific mirrored media blobs (by mxc). The
+// React layer is the only place that knows which blobs are dead — it holds the
+// folded workspace and can see which import generations were superseded — so it
+// passes the dead mxc list here. Returns { removed, bytes }. See
+// purgeMediaByMxc: dropping a still-wanted blob is non-destructive (it just
+// re-downloads), so this is safe even if the caller is over-eager.
+async function purgeMediaBlobs(mxcList) {
+  return purgeMediaByMxc(mxcList);
 }
 
 // Ask the browser to pin local storage against eviction (sync page button).
@@ -1754,6 +1810,7 @@ window.MatrixLive = {
   // a refresh can lose it, and the control to pin it against eviction.
   getStorageStatus,
   requestPersistentStorage: makeStorageDurable,
+  purgeMediaBlobs,
   roomStoreCount,
   // Memory governor
   getMemoryStats: () => memory.getStats(),
