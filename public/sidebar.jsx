@@ -610,7 +610,10 @@ function Sidebar({
   );
 }
 
-window.Sidebar = Sidebar;
+// React.memo: Sidebar receives stable callbacks + state from App, but App
+// re-renders on every event arrival and on ephemeral fade-outs. Without memo
+// the whole sidebar (incl. buildSets over every entity) re-runs every time.
+window.Sidebar = React.memo(Sidebar);
 window.SLICE_KINDS = SLICE_KINDS;
 
 })();

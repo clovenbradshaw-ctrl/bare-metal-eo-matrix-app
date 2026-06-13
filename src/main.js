@@ -1765,6 +1765,10 @@ window.MatrixLive = {
   setMemoryBudget: (bytes) => memory.setBudget(bytes),
   onMemoryPressure: (fn) => memory.onPressure(fn),
   checkMemory: () => memory.checkPressure(),
+  // Let UI components register their own evictors (e.g. materialized import
+  // rows held by the React tree) so the governor can free them under pressure
+  // instead of only shedding SDK-side caches.
+  registerMemoryEvictor: (name, fn, opts) => memory.registerEvictor(name, fn, opts),
   // Net status
   getNetwork: () => netState,
   getSyncState: () => getClient()?.getSyncState?.() || null,

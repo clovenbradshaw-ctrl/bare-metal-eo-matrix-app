@@ -220,6 +220,6 @@ function EntityTimelineView({
   );
 }
 
-window.EntityTimelineView = EntityTimelineView;
+window.EntityTimelineView = React.memo(EntityTimelineView);
 
 })();

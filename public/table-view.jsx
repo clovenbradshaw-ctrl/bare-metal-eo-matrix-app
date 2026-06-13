@@ -1700,15 +1700,25 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
 
   // ── View controls: hide → filter → sort ───────────────────────────────
   // Columns the user can toggle off (field cols + derived link/partition cols).
-  const hideItems = [
+  // Memoized so cell renders don't recompute them every keystroke.
+  const hideItems = useMemo(() => ([
     ...(partitioned ? [{ key: 'p:_partition', label: '_partition', kind: 'partition' }] : []),
     ...linkedTypes.map(t => ({ key: 'l:' + t, label: t, kind: 'link' })),
     ...cols.map(c => ({ key: 'f:' + c.name, label: c.name, kind: c.type })),
-  ];
-  const hiddenCount = hideItems.filter(it => hidden.has(it.key)).length;
+  ]), [partitioned, linkedTypes, cols]);
+  const hiddenCount = useMemo(
+    () => hideItems.reduce((n, it) => n + (hidden.has(it.key) ? 1 : 0), 0),
+    [hideItems, hidden]
+  );
   const showPartitionCol = partitioned && !hidden.has('p:_partition');
-  const visibleLinkedTypes = linkedTypes.filter(t => !hidden.has('l:' + t));
-  const visibleCols = cols.filter(c => !hidden.has('f:' + c.name));
+  const visibleLinkedTypes = useMemo(
+    () => linkedTypes.filter(t => !hidden.has('l:' + t)),
+    [linkedTypes, hidden]
+  );
+  const visibleCols = useMemo(
+    () => cols.filter(c => !hidden.has('f:' + c.name)),
+    [cols, hidden]
+  );
 
   // Filtered + sorted rows actually rendered. Filters/sorts read computed cell
   // values (formula/rollup included) so the view matches what's on screen.
@@ -3306,7 +3316,7 @@ function paramsLabel(r) {
   return r.params || <span style={{color:'var(--text-faint)'}}>—</span>;
 }
 
-window.TableSchemaView = TableSchemaView;
+window.TableSchemaView = React.memo(TableSchemaView);
 
 // ─────────────────────────────────────────────────────────────────────────
 // Syntheses table — SYN events materialize as entities of _type='_synthesis'
@@ -3707,5 +3717,9 @@ function TableView({ room, state, onEmit, tweaks, scrubber, forceTable, hideHead
   );
 }
 
-window.TableView = TableView;
+// React.memo: TableView reads state + selection; App re-renders on every
+// ephemeral fade-out and on the sub-second sync indicator updates. Without
+// memo the whole grid (incl. buildTable / displayRows / colStats) re-runs
+// every time even when nothing in the table changed.
+window.TableView = React.memo(TableView);
 })();
