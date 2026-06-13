@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node test/airtable-schema.test.cjs && node test/formula.test.cjs && node test/crypto-envelope.test.mjs && node test/blocks.test.mjs && node test/drivebackup.test.mjs"
+    "test": "node test/airtable-schema.test.cjs && node test/formula.test.cjs && node test/schema-export.test.cjs && node test/crypto-envelope.test.mjs && node test/blocks.test.mjs && node test/drivebackup.test.mjs && node test/data-chat.test.cjs"
   },
   "dependencies": {
     "@babel/standalone": "^7.29.0",

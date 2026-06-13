@@ -130,7 +130,7 @@ function saveLastView(user, roomId, selection) {
 // blank pane.
 function validSavedSelection(sel) {
   if (!sel || typeof sel !== 'object') return false;
-  if (sel.kind === 'log' || sel.kind === 'sync') return true;
+  if (sel.kind === 'log' || sel.kind === 'sync' || sel.kind === 'chat') return true;
   if (sel.kind !== 'slice') return false;
   return ['table', 'schema', 'kanban', 'notebook', 'graph', 'timeline'].includes(sel.sliceKind);
 }
@@ -712,6 +712,7 @@ function App() {
 
   const [csvImport, setCsvImport] = useState(null); // {id, file, roomId} | null
   const [airtableImport, setAirtableImport] = useState(null); // {id} | null
+  const [exportingSchema, setExportingSchema] = useState(false);
   // Time-travel scrubber: collapsed by default; opens via the topbar toggle.
   // We also force-open it whenever the cursor is *not* live, so the user
   // can always see/return from a scrubbed state.
@@ -1197,6 +1198,10 @@ function App() {
     () => setAirtableImport({ id: Date.now() }),
     []
   );
+  const onExportSchemaCb = useCallback(
+    () => setExportingSchema(true),
+    []
+  );
   const onCreateTableCb = useCallback((name) => {
     const ME = window.MatrixEngine;
     const existing = stateRef.current.schema?.tables || [];
@@ -1519,6 +1524,7 @@ function App() {
           selection={selection}
           setSelection={setSelection}
           onAirtableSchema={onAirtableSchemaCb}
+          onExportSchema={onExportSchemaCb}
           onCreateView={createView}
           onRenameView={renameView}
           onDuplicateView={duplicateView}
@@ -1570,6 +1576,13 @@ function App() {
                 lastPendingRef.current = -1;
                 setImportRowsVersion(v => v + 1);
               }}
+            />
+          )}
+          {selection.kind === 'chat' && (
+            <window.ChatView
+              room={currentRoom}
+              state={renderState}
+              setSelection={setSelection}
             />
           )}
           {selection.kind === 'slice' && (selection.sliceKind === 'table') && (
@@ -1682,6 +1695,14 @@ function App() {
           state={state}
           onEmit={onEmit}
           onClose={() => setAirtableImport(null)}
+        />
+      )}
+
+      {exportingSchema && window.SchemaExportModal && (
+        <window.SchemaExportModal
+          room={currentRoom}
+          state={renderState}
+          onClose={() => setExportingSchema(false)}
         />
       )}
     </div>

@@ -328,7 +328,7 @@ function Sidebar({
   room, state, selection, setSelection, onCreateTable,
   onCreateView, onRenameView, onDuplicateView, onDeleteView,
   eventsTotal, ephemeralsCount, onRenameRoom, lastEventTs, onAirtableSchema,
-  syncOutOfDate, syncByTable,
+  onExportSchema, syncOutOfDate, syncByTable,
 }) {
   const { sets, meta, raw } = useMemo(() => buildSets(state), [state]);
   const allSets = [...sets, ...meta];
@@ -514,6 +514,15 @@ function Sidebar({
         </div>
       </div>
 
+      <button
+        className={`sb-ask ${selection.kind === 'chat' ? 'active' : ''}`}
+        onClick={() => setSelection({ kind: 'chat' })}
+        title="chat with your data — ask in plain language, get tables and record profiles linked by foreign key"
+      >
+        <i className="ph ph-chat-circle-dots" aria-hidden="true"></i>
+        <span className="sb-ask-label">Ask your data</span>
+      </button>
+
       <div className="sb-section">
         <div className="sb-section-head">
           <span>sets</span>
@@ -544,6 +553,13 @@ function Sidebar({
         {allSets.map(renderSet)}
         {allSets.length === 0 && (
           <div className="sb-empty">no sets yet</div>
+        )}
+        {onExportSchema && allSets.length > 0 && (
+          <button
+            className="sb-export"
+            onClick={onExportSchema}
+            title="copy or download this workspace's schema as SQL DDL, JSON, or Markdown"
+          >⇩ export schema</button>
         )}
       </div>
 

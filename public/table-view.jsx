@@ -2131,7 +2131,26 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
             {visibleRows.map((r, vIdx) => {
               const rIdx = startIdx + vIdx;
               return (
-              <tr key={r._anchor} ref={vIdx === 0 ? firstRowRef : undefined}>
+              <tr
+                key={r._anchor}
+                ref={vIdx === 0 ? firstRowRef : undefined}
+                onDoubleClick={(e) => {
+                  // Skip when the dblclick is aimed at a control that has its
+                  // own click behavior — link pills, select chips, the inline
+                  // option/rename popovers. A text cell's <input> is still fair
+                  // game: the first click of the dblclick puts the cell into
+                  // edit mode (so the second click lands on the input), and we
+                  // still want the panel to open.
+                  if (e.target.closest('button, a, select')) return;
+                  // Flush any in-flight cell edit so its input doesn't linger
+                  // under the panel and silently commit when it loses focus.
+                  if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                    document.activeElement.blur();
+                  }
+                  setDetailAnchor(r._anchor);
+                }}
+                title="double-click to open record"
+              >
                 {showFormula && (
                   <td
                     className="cell anchor anchor-link formula"
@@ -2232,7 +2251,7 @@ function DbTable({ entityType, state, room, onEmit, onJump, jumpHighlight, showD
                     </td>
                   );
                 })}
-                <td className="cell"></td>
+                <td className="cell add-col-spacer"></td>
               </tr>
             )}
             {cols.length > 0 && visibleCols.length > 0 && (
