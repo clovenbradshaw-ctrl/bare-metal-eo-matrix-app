@@ -1617,6 +1617,14 @@ table.csv-preview tr:last-child td{border-bottom:none}
 .dc-smart{margin-left:auto;display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:12px;color:var(--text-dim);cursor:pointer;user-select:none;white-space:nowrap}
 .dc-smart input{cursor:pointer}
 .dc-model{font-family:var(--mono);font-size:11px;padding:3px 6px;border:1px solid var(--border);background:var(--surface);color:var(--text)}
+.dc-bar-right{margin-left:auto;display:flex;align-items:center;gap:10px;min-width:0}
+.dc-status{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;color:var(--text-dim);white-space:nowrap;max-width:280px;overflow:hidden;text-overflow:ellipsis}
+.dc-status .dc-dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex-shrink:0}
+.dc-status.is-ready{color:#3a9a6a}
+.dc-status.is-loading{color:var(--blue)}
+.dc-status.is-off{color:var(--text-faint)}
+.dc-restate{font-family:var(--mono);font-size:11.5px;color:var(--text-dim);margin-bottom:7px;display:flex;align-items:flex-start;gap:6px;line-height:1.5}
+.dc-restate i{font-size:13px;color:var(--blue);margin-top:1px;flex-shrink:0}
 
 .dc-thread{flex:1;min-height:0;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
 .dc-msg{display:flex;flex-direction:column;max-width:780px;width:100%}

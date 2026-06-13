@@ -34,6 +34,10 @@
   // ── small utils ───────────────────────────────────────────────────────────
   const lc = (s) => String(s == null ? '' : s).toLowerCase();
   const norm = (s) => lc(s).replace(/[_\s]+/g, ' ').trim();
+  // accent-folded normal form — so "mexico" matches "México" and "jose" ↔ "José"
+  // (immigration data is full of accented place/people names). Used by value
+  // matching + the filter executor so what we find is what we filter on.
+  const nfold = (s) => { try { return norm(s).normalize('NFD').replace(/[̀-ͯ]/g, ''); } catch (e) { return norm(s); } };
   const isUnderscore = (k) => typeof k === 'string' && k[0] === '_';
   const uniq = (a) => Array.from(new Set(a));
 
@@ -250,13 +254,13 @@
       return numCompare(a, b, op);
     }
     if (kind === 'multiselect') {
-      const arr = Array.isArray(cell) ? cell.map(norm) : [norm(cell)];
-      const t = norm(target);
+      const arr = Array.isArray(cell) ? cell.map(nfold) : [nfold(cell)];
+      const t = nfold(target);
       if (op === 'ncontains') return !arr.includes(t);
       return arr.includes(t); // contains / eq
     }
-    // text & select
-    const a = norm(cell), b = norm(target);
+    // text & select — accent-folded so "mexico" matches "México"
+    const a = nfold(cell), b = nfold(target);
     switch (op) {
       case 'eq': return a === b;
       case 'neq': return a !== b;
@@ -354,14 +358,17 @@
   // (not its field) is the anchor. parseFilters needs "<field> <op> <value>", so
   // "clients are from mexico" lost the whole clause (left side "clients" is not a
   // field) and the question silently counted everything. Here we bind the value
-  // back to a field: first any select/multiselect whose options include it
-  // ("Mexico" in a Country option set), else a location-named text field. When
-  // nothing matches we record the phrase as UNMATCHED so the answer can say so
-  // out loud instead of pretending the filter wasn't asked for.
+  // back to a field: a select/multiselect whose options include it ("Mexico" in a
+  // Country option set), else a location-named text field, else — for an oddly
+  // named field — whichever field actually carries that value (a record-value
+  // scan, fieldForValue). Matching is accent-folded, so "mexico" binds "México".
+  // When nothing matches we record the phrase as UNMATCHED so the answer can say
+  // so out loud instead of pretending the filter wasn't asked for.
   const LOCATION_FIELD_RE = /\b(country|countries|nationality|city|cities|town|state|province|region|county|location|origin|residence|address|place|zip|postal)\b/i;
   const VALUE_PREPS = [['based in', true], ['located in', true], ['living in', true], ['residing in', true], ['from', true], ['in', false], ['at', false]];
   const VAL_STOP = new Set(['the', 'a', 'an', 'total', 'all', 'each', 'any', 'my', 'our', 'their', 'this', 'that', 'it', 'them', 'here', 'there']);
   const VAL_BREAK = /^(and|or|but|with|where|whose|by|per|grouped|group|sorted|sort|order|ordered|that|having|which|is|are|was|were|times|multiplied|plus|minus|divided|over|of|for|to)$/;
+  const VALUE_SCAN_CAP = 20000; // don't scan a giant table to resolve one value
   function prepPhrases(q) {
     const out = [];
     const text = ' ' + lc(q).replace(/[?.!,]+/g, ' ') + ' ';
@@ -383,20 +390,67 @@
     }
     return out;
   }
-  function parseValueAnchoredFilters(q, fields, already) {
+
+  // Scan a type's records for whichever field carries `phrase` as a value — the
+  // fallback when the value is neither a select option nor in a location-named
+  // field. Accent-folded; prefers an exact, non-label match, then exact-on-label,
+  // then a word-boundary contains. Bounded so a giant table can't stall a query.
+  function fieldForValue(state, type, fields, phrase) {
+    const p = nfold(phrase);
+    if (!p || p.length < 2) return null;
+    if (typeVariants(type).map(nfold).indexOf(p) >= 0) return null; // just the table name
+    for (const f of fields) {
+      if (!Array.isArray(f.options) || !f.options.length) continue;
+      const opt = f.options.find(o => nfold(o) === p) || f.options.find(o => (' ' + nfold(o) + ' ').indexOf(' ' + p + ' ') >= 0);
+      if (opt) return { field: f.name, op: filterKind(f.type) === 'multiselect' ? 'contains' : 'eq', value: opt, kind: filterKind(f.type) };
+    }
+    const records = entitiesOfType(state, type);
+    if (records.length > VALUE_SCAN_CAP) return null;
+    let exactNon = null, exactLabel = null, containsNon = null, containsLabel = null;
+    for (const f of fields) {
+      if (Array.isArray(f.options) && f.options.length) continue; // handled above
+      const isLabel = isLabelField(f.name);
+      for (const r of records) {
+        const cell = r[f.name];
+        if (cell == null || cell === '') continue;
+        const cv = nfold(displayValue(cell));
+        if (!cv) continue;
+        if (cv === p) {
+          if (isLabel) { exactLabel = exactLabel || { field: f.name, op: 'eq', value: cell }; }
+          else { exactNon = { field: f.name, op: 'eq', value: cell }; }
+          break;
+        }
+        if ((' ' + cv + ' ').indexOf(' ' + p + ' ') >= 0) {
+          if (isLabel) containsLabel = containsLabel || { field: f.name, op: 'contains', value: phrase };
+          else containsNon = containsNon || { field: f.name, op: 'contains', value: phrase };
+        }
+      }
+      if (exactNon) break; // best possible (a select option was already ruled out)
+    }
+    const hit = exactNon || exactLabel || containsNon || containsLabel;
+    if (!hit) return null;
+    const fd = fields.find(f => f.name === hit.field);
+    return { field: hit.field, op: hit.op, value: hit.value, kind: filterKind(fd ? fd.type : 'text') };
+  }
+
+  function parseValueAnchoredFilters(q, fields, already, state, type) {
     const used = new Set((already || []).map(f => f.field));
     const filters = [], unmapped = [];
     for (const { prep, strong, value } of prepPhrases(q)) {
       let bound = false;
       const optF = fieldWithOption(fields, value);
       if (optF && !used.has(optF.name)) {
-        const opt = optF.options.find(o => norm(o) === norm(value)) || value;
+        const opt = optF.options.find(o => nfold(o) === nfold(value)) || value;
         filters.push({ field: optF.name, op: filterKind(optF.type) === 'multiselect' ? 'contains' : 'eq', value: opt, kind: filterKind(optF.type) });
         used.add(optF.name); bound = true;
       }
       if (!bound) {
         const locF = fields.find(f => LOCATION_FIELD_RE.test(norm(f.name)) && filterKind(f.type) === 'text' && !used.has(f.name));
         if (locF) { filters.push({ field: locF.name, op: 'contains', value, kind: 'text' }); used.add(locF.name); bound = true; }
+      }
+      if (!bound && state && type) {
+        const hit = fieldForValue(state, type, fields, value);
+        if (hit && !used.has(hit.field)) { filters.push(hit); used.add(hit.field); bound = true; }
       }
       if (!bound && strong) unmapped.push(prep + ' ' + value);
     }
@@ -686,11 +740,14 @@
   function searchTerms(q) {
     return uniq(norm(q).split(/[^a-z0-9]+/).filter(w => w.length > 1 && !STOP.has(w)));
   }
+  const GLOBAL_SEARCH_CAP = 50000; // bound the catch-all scan on huge workspaces
   function globalSearch(state, q, limit) {
     const terms = searchTerms(q);
     if (!terms.length) return [];
     const scored = [];
+    let scanned = 0;
     for (const e of Object.values(state?.entities || {})) {
+      if (++scanned > GLOBAL_SEARCH_CAP) break;
       let hay = recordLabel(e) + ' ';
       for (const k of Object.keys(e)) if (!isUnderscore(k)) hay += displayValue(e[k]) + ' ';
       hay = norm(hay);
@@ -726,7 +783,7 @@
     const fields = type ? fieldsForType(state, type) : [];
     let filters = parseFilters(q, fields);
     filters = filters.concat(parseStandaloneOptions(q, fields, filters));
-    const va = parseValueAnchoredFilters(q, fields, filters);
+    const va = parseValueAnchoredFilters(q, fields, filters, state, type);
     filters = filters.concat(va.filters);
     const agg = parseAggregate(q, fields);
     // a scalar arithmetic op ("× 2") only makes sense on a single aggregate value
@@ -971,7 +1028,27 @@
   // explicit choices instead. Set opts.skipConfirm=true to bypass — used by
   // the chat-view when the user has already tapped one of those choices.
   // ════════════════════════════════════════════════════════════════════════
+  // Public entry. Wraps interpretInner so a parser/engine/data hiccup can never
+  // crash the Ask view: on any throw we retry deterministic-only (no engine, no
+  // prose), and if even that fails we return a friendly note instead of letting
+  // the error bubble up to the view.
   async function interpret(question, state, opts) {
+    try {
+      return await interpretInner(question, state, opts);
+    } catch (e) {
+      try {
+        const q = String(question || '').trim();
+        const det = buildPlan(q, state);
+        const r = await executePlan(state, det.plan, { q, opts: Object.assign({}, opts, { noProse: true }) });
+        r.spec = Object.assign({}, r.spec, { recovered: true });
+        return r;
+      } catch (e2) {
+        return { kind: 'answer', text: 'I couldn’t read that one — try naming a table, like “how many clients”.', spec: { error: String((e && e.message) || e) } };
+      }
+    }
+  }
+
+  async function interpretInner(question, state, opts) {
     opts = opts || {};
     const q = String(question || '').trim();
     if (!q) return { kind: 'empty', message: 'Ask about your data.', suggestions: suggestions(state) };
@@ -1105,9 +1182,11 @@
 
   // ── engine-backed enhancers (browser only, optional) ──────────────────────
   let _proseDoc = null, _proseKey = '';
+  const PROSE_DOC_CAP = 4000; // building a prose corpus over a huge workspace would OOM
   function proseKey(state) { return (state?.cursor || 0) + ':' + Object.keys(state?.entities || {}).length; }
   async function buildProseDoc(state) {
     if (typeof window === 'undefined' || !window.EOEngine || !window.EOEngine.parseDocument) return null;
+    if (Object.keys(state?.entities || {}).length > PROSE_DOC_CAP) return null;
     const key = proseKey(state);
     if (_proseDoc && _proseKey === key) return _proseDoc;
     const lines = [];
@@ -1275,6 +1354,33 @@
     if (sort) t += ' · by ' + sort.field + ' ' + sort.dir;
     return t;
   }
+
+  // A one-line restatement of the query we're about to run, shown in the Ask
+  // view BEFORE the answer so a misread is obvious at a glance: "Count of
+  // clients" with no "where …" means it didn't catch your filter. Built from
+  // the executed spec, so it always mirrors the query that actually ran.
+  function describe(spec) {
+    if (!spec) return '';
+    if (spec.intent === 'calc') return 'Reading that as arithmetic.';
+    if (spec.intent === 'profile') return 'Opening the profile' + (spec.target ? ' for “' + stripQuotes(spec.target) + '”' : '') + '.';
+    const type = spec.type;
+    if (!type) {
+      const q = String(spec.question || '').replace(/[?.!]+$/, '').trim();
+      return q ? 'Searching every record for “' + q + '”.' : 'Searching your records.';
+    }
+    const noun = plural(type);
+    if (spec.agg && spec.agg.agg) {
+      let s = aggLabel(spec.agg) + ' of ' + noun;
+      if (spec.agg.groupBy) s += ', grouped by ' + spec.agg.groupBy;
+      if (spec.filters && spec.filters.length) s += ', ' + whereNote(spec.filters);
+      return s + '.';
+    }
+    let s = (spec.limit ? 'First ' + spec.limit + ' ' : 'All ') + noun;
+    if (spec.filters && spec.filters.length) s += ' ' + whereNote(spec.filters);
+    if (spec.sort) s += ', sorted by ' + spec.sort.field + ' (' + spec.sort.dir + ')';
+    return s + '.';
+  }
+
   function suggestions(state) {
     const types = knownTypes(state).slice(0, 3);
     const out = [];
@@ -1347,9 +1453,89 @@
   }
   function warmEmbeddings() { try { if (window.EOEmbed && window.EOEmbed.warm) window.EOEmbed.warm(); } catch (e) {} }
 
+  // Install the on-device intent model's WEIGHTS (the heavy part). ensureLLM
+  // loads only the runtime; this downloads/initializes the chosen model so the
+  // chat can actually use it. Idempotent + best-effort — returns false if the
+  // model backend (eoreader3 llm.js) or the download isn't available, so a
+  // failure here never blocks the deterministic query core.
+  async function loadModel(key, onProgress) {
+    const ready = await ensureLLM();
+    if (!ready || typeof window === 'undefined' || !window.EOLLM || !window.EOLLM.load) return false;
+    const k = key || defaultLLMKey();
+    if (!k) return false;
+    try {
+      if (window.EOLLM.isLoaded && window.EOLLM.isLoaded(k)) return true;
+      const ok = await window.EOLLM.load(k, onProgress);
+      return ok !== false;
+    } catch (e) { return false; }
+  }
+
+  // Is there heap headroom to pull in a heavy WASM runtime? This app governs a
+  // memory budget and sheds caches under pressure (src/memory.js); we must not
+  // OOM the tab loading Pyodide on top of a big workspace. No signal ⇒ allow.
+  function memoryHeadroomOK() {
+    try {
+      const m = (typeof performance !== 'undefined') && performance.memory;
+      if (m && typeof m.usedJSHeapSize === 'number' && typeof m.jsHeapSizeLimit === 'number' && m.jsHeapSizeLimit > 0) {
+        return m.usedJSHeapSize < m.jsHeapSizeLimit * 0.85;
+      }
+    } catch (e) {}
+    return true;
+  }
+
+  // Optional Python data-analysis runtime: Pyodide + numpy + pandas, loaded
+  // lazily and only when there's headroom. Exposes window.EOPy = { pyodide,
+  // ready, df(type) } on success. Best-effort: the query core never depends on
+  // it. df(type) materializes a table's records as a pandas DataFrame so the
+  // chat (or a future NL→pandas step) can run real analysis on the live fold.
+  let _pyPromise = null;
+  const PYODIDE_CDN = 'https://cdn.jsdelivr.net/pyodide/v0.26.2/full/';
+  function ensurePython(opts) {
+    if (typeof window === 'undefined') return Promise.resolve(false);
+    if (_pyPromise) return _pyPromise;
+    _pyPromise = (async () => {
+      try {
+        if (!memoryHeadroomOK()) { if (window.console) console.warn('[DataChat] skipping Python load — low memory headroom'); _pyPromise = null; return false; }
+        if (opts && opts.onStatus) opts.onStatus('Loading Python runtime…');
+        if (!window.loadPyodide) await loadScript(PYODIDE_CDN + 'pyodide.js');
+        const pyodide = await window.loadPyodide({ indexURL: PYODIDE_CDN });
+        if (opts && opts.onStatus) opts.onStatus('Loading numpy + pandas…');
+        await pyodide.loadPackage(['numpy', 'pandas']);
+        window.EOPy = {
+          pyodide, ready: true,
+          // Hand a table's live records to pandas (plain fields only).
+          df(type, state) {
+            const rows = entitiesOfType(state, type).map(e => {
+              const o = {}; for (const k of Object.keys(e)) if (!isUnderscore(k)) o[k] = e[k]; return o;
+            });
+            pyodide.globals.set('__rows', pyodide.toPy(rows));
+            return pyodide.runPython('import pandas as pd\npd.DataFrame(__rows.to_py() if hasattr(__rows, "to_py") else __rows)');
+          },
+        };
+        return true;
+      } catch (e) { if (window.console) console.warn('[DataChat] Python load failed:', e && e.message); _pyPromise = null; return false; }
+    })();
+    return _pyPromise;
+  }
+  function pythonReady() { return typeof window !== 'undefined' && !!(window.EOPy && window.EOPy.ready); }
+
+  // Bring up the analysis stack in a memory-safe order: the deterministic
+  // engine + math.js first (cheap, always useful), then the model weights, then
+  // the Python stack (heaviest, headroom-gated). Each step is best-effort.
+  async function ensureAnalysis(opts) {
+    opts = opts || {};
+    await ensureEngine();                       // compromise + math.js + EOCompute + EOEmbed
+    let model = false, python = false;
+    if (opts.loadModel !== false) model = await loadModel(opts.modelKey, opts.onModelProgress).catch(() => false);
+    if (opts.loadPython) python = await ensurePython(opts).catch(() => false);
+    const w = (typeof window !== 'undefined') ? window : {};
+    return { engine: !!w.EOEngine, math: !!w.math, model: !!model, python: !!python };
+  }
+
   // ── exports ───────────────────────────────────────────────────────────────
   const api = {
     interpret, buildPlan, buildPlanForType, executePlan, planWithLLM, ensureEngine, ensureLLM, warmEmbeddings,
+    loadModel, ensurePython, pythonReady, ensureAnalysis, describe,
     defaultLLMKey, schemaPrompt, parsePlanJSON,
     maybeTypeConfirm, maybeFloodConfirm,
     // EO-notation read-back of a query (also the query the Ask view renders so
@@ -1360,7 +1546,7 @@
     matchType, matchTypeScored, resolveField, validateFilters, applyFilters, parseFilters,
     parseAggregate, aggregate, parseSort, parseLimit, sortRecords, relatedRecords,
     linkedTypesFor, resolveRecord, globalSearch, selectFieldsForPrompt,
-    displayValue, plural, _version: '2',
+    fieldForValue, displayValue, plural, _version: '3',
   };
   if (typeof window !== 'undefined') window.DataChat = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

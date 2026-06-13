@@ -425,5 +425,61 @@ const state = {
   ok('eoTrace(plan): SEG then EVA then SYN', trace[0].op === 'SEG' && trace.some(s => s.op === 'EVA') && trace.some(s => s.op === 'SYN'));
   ok('EO_OPS catalog has the nine glyphs', Object.keys(DC.EO_OPS).length === 9 && DC.EO_OPS.SEG.glyph === '｜');
 
+  // ── accent-folding + free-text / oddly-named value binding ──────────────────
+  // Complements the select-option + location-field cases above: a free-text
+  // country field, an accented value, and a field whose NAME isn't location-like
+  // (so it can only be found by scanning real record values — fieldForValue).
+  const geoTextState = {
+    entities: {
+      t1: ent('t1', 'Client Info', { Name: 'Acme', Country: 'Mexico', Background: 'Mexico' }),
+      t2: ent('t2', 'Client Info', { Name: 'Globex', Country: 'United States', Background: 'USA' }),
+      t3: ent('t3', 'Client Info', { Name: 'Initech', Country: 'México', Background: 'Mexico' }),
+      t4: ent('t4', 'Client Info', { Name: 'Umbrella', Country: 'Canada', Background: 'Canada' }),
+    },
+    connections: [], partitions: {},
+    schema: { tables: ['Client Info'], fields: { 'Client Info': [
+      { name: 'Name', type: 'text' }, { name: 'Country', type: 'text' }, { name: 'Background', type: 'text' },
+    ] }, links: [] },
+    cursor: 4,
+  };
+
+  // free-text Country (a location-named field) → count just the Mexican clients,
+  // accent-folded so an ASCII query also catches "México" (Mexico + México = 2).
+  r = await DC.interpret('how many clients are from mexico?', geoTextState);
+  eq('free-text from-mexico → value', r.kind, 'value');
+  eq('free-text from-mexico count is 2 (Mexico + México)', r.value, 2);
+  r = await DC.interpret('clients from méxico', geoTextState);
+  eq('accented query rows', r.rows.length, 2);
+
+  // an oddly-named field (no location word in its name) is found by SCANNING
+  // real values — the fieldForValue fallback, exercised directly.
+  const noCountry = DC.fieldsForType(geoTextState, 'Client Info').filter(f => f.name !== 'Country');
+  const ff = DC.fieldForValue(geoTextState, 'Client Info', noCountry, 'canada');
+  ok('fieldForValue resolves a bare value by scanning records', ff && ff.field === 'Background');
+
+  // NO false positives: "in cases" just renames the table; "all" stays unfiltered.
+  r = await DC.interpret('sum of priority in cases', state);
+  eq('“in cases” adds no bogus filter — sum still 15', r.value, 15);
+  r = await DC.interpret('show all clients', geoTextState);
+  ok('all clients → no value filter', (r.spec.filters || []).length === 0 && r.rows.length === 4);
+
+  // ── plain-English restatement: describe() mirrors the executed query ────────
+  r = await DC.interpret('how many clients are from mexico?', geoTextState);
+  ok('describe restates the count + filter', /count/i.test(DC.describe(r.spec)) && /country/i.test(DC.describe(r.spec)));
+  r = await DC.interpret('show all clients', geoTextState);
+  ok('describe restates an unfiltered list', /all clients/i.test(DC.describe(r.spec)) && !/where/i.test(DC.describe(r.spec)));
+  r = await DC.interpret('count cases by status', state);
+  ok('describe restates a grouped count', /grouped by/i.test(DC.describe(r.spec)));
+  eq('describe handles a profile', DC.describe({ intent: 'profile', target: 'Acme Corp' }), 'Opening the profile for “Acme Corp”.');
+
+  // ── crash-proofing: interpret never throws, even on a hostile state ─────────
+  let threw = false;
+  try {
+    const bad = { entities: { x: { _anchor: 'x', _type: 'T', f: { nested: 1 } } }, get connections() { throw new Error('boom'); }, schema: { tables: ['T'] }, cursor: 1 };
+    const safe = await DC.interpret('how many T from anywhere', bad);
+    ok('interpret recovers from a throwing state', safe && typeof safe.kind === 'string');
+  } catch (e) { threw = true; }
+  ok('interpret did not propagate the throw', threw === false);
+
   console.log(`data-chat.test: ${passed} assertions passed`);
 })().catch(e => { console.error(e); process.exit(1); });

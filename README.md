@@ -99,17 +99,30 @@ log.
   the grid's linked columns and the graph view use — so a client surfaces its
   cases, each case its events and notes, and so on.
 
+- **Name a value, not the field.** “how many clients are from Mexico?”, “cases
+  in California”, “matters named Acme” all work — the value you name is resolved
+  to whichever field actually carries it (a select option first, then a real
+  record value), so you never have to know the column name. Matching is
+  accent-folded, so `mexico` finds `México`.
+- **It restates the question before answering.** Every answer is preceded by a
+  one-line restatement of the query it ran (“Count of clients, where Country is
+  Mexico”) so a misread is obvious at a glance.
+
 **How it stays private.** The query layer (type/field/value resolution, filters,
 aggregation, foreign-key traversal) is pure, deterministic JavaScript and runs
 even with no engine and no network — it's exercised headlessly in
-`test/data-chat.test.cjs`. The Cleo engine is loaded **lazily, on first ask,
+`test/data-chat.test.cjs`. The Cleo engine is loaded **lazily, after your data,
 from the eoreader3 deployment** (it's developed in that repo, so this app always
 tracks the latest engine — see `public/data-chat.js`'s `EOREADER_DEFAULT`, or
 set `window.EOREADER_BASE` to point at a local eoreader3 while you work on both).
-It adds arithmetic, fuzzy matching, and prose answers. A **“Smart parse”**
-toggle can additionally load a **small on-device model** (wllama / WebAssembly)
-to interpret looser questions — it runs entirely in your browser. There is **no
-cloud LLM option**: nothing about your data leaves the tab.
+It adds arithmetic, fuzzy matching, and prose answers. **Smart parse is always
+on**: once your data has loaded, a **small on-device model** (wllama /
+WebAssembly, smallest by default to stay within the memory budget) and a local
+**Python runtime** (Pyodide + numpy + pandas, loaded only when there's heap
+headroom) come up automatically for tougher questions and data analysis — both
+run entirely in your browser, best-effort, so a failed or skipped download never
+blocks asking. There is **no cloud LLM option**: nothing about your data leaves
+the tab.
 
 The two pieces:
 
