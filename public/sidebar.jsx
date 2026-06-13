@@ -328,7 +328,7 @@ function Sidebar({
   room, state, selection, setSelection, onCreateTable,
   onCreateView, onRenameView, onDuplicateView, onDeleteView,
   eventsTotal, ephemeralsCount, onRenameRoom, lastEventTs, onAirtableSchema,
-  syncOutOfDate, syncByTable,
+  onExportSchema, syncOutOfDate, syncByTable,
 }) {
   const { sets, meta, raw } = useMemo(() => buildSets(state), [state]);
   const allSets = [...sets, ...meta];
@@ -553,6 +553,13 @@ function Sidebar({
         {allSets.map(renderSet)}
         {allSets.length === 0 && (
           <div className="sb-empty">no sets yet</div>
+        )}
+        {onExportSchema && allSets.length > 0 && (
+          <button
+            className="sb-export"
+            onClick={onExportSchema}
+            title="copy or download this workspace's schema as SQL DDL, JSON, or Markdown"
+          >⇩ export schema</button>
         )}
       </div>
 
