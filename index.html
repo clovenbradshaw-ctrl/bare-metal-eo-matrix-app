@@ -173,6 +173,26 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .proj-modal-create:hover:not(:disabled){background:#222}
 .proj-modal-create:disabled{background:var(--text-faint);border-color:var(--text-faint);cursor:not-allowed}
 
+/* ── Schema export modal ─────────────────────────────────────────────── */
+.schema-export-modal .proj-modal-body{gap:10px}
+.se-tabs{display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--border-strong);padding-bottom:0}
+.se-tab{padding:7px 14px;background:transparent;border:1px solid transparent;border-bottom:none;font-family:var(--mono);font-size:12px;color:var(--text-dim);cursor:pointer;font-weight:600;text-transform:lowercase;letter-spacing:.3px;margin-bottom:-1px}
+.se-tab:hover{color:var(--text-bright)}
+.se-tab.on{background:#fff;border-color:var(--border-strong);border-bottom:1px solid #fff;color:var(--text-bright);font-weight:700}
+.se-action{padding:5px 12px;background:#fff;border:1px solid var(--border-strong);font-family:var(--mono);font-size:11.5px;color:var(--text);cursor:pointer;font-weight:600;text-transform:lowercase;letter-spacing:.3px;margin-bottom:-1px}
+.se-action:hover{border-color:#000;color:var(--text-bright)}
+.se-action.primary{background:#000;color:#fff;border-color:#000;font-weight:700}
+.se-action.primary:hover{background:#222}
+.se-preview{margin:0;padding:14px 16px;background:var(--surface-2);border:1px solid var(--border-strong);font-family:var(--mono);font-size:12px;color:var(--text-bright);line-height:1.55;max-height:55vh;overflow:auto;white-space:pre;tab-size:2;user-select:text}
+.se-empty{padding:34px 18px;text-align:center;background:var(--surface-2);border:1px dashed var(--border-strong);color:var(--text-dim)}
+.se-empty .glyph{font-size:28px;color:var(--triad-significance);margin-bottom:8px}
+.se-empty-hint{font-size:11.5px;color:var(--text-faint);margin-top:6px}
+.se-empty code,.se-foot code{font-family:var(--mono);background:#fff;border:1px solid var(--border);padding:0 4px;font-size:11px}
+.se-foot{font-size:11px;color:var(--text-dim);line-height:1.55;padding-top:2px}
+.sb-export{margin:6px 14px 4px;padding:5px 8px;background:transparent;border:1px solid var(--border);color:var(--text-dim);font-family:var(--mono);font-size:11.5px;text-align:left;cursor:pointer;font-weight:500;width:calc(100% - 28px);display:block}
+.sb-export:hover{border-color:#000;color:var(--text-bright);background:#fff}
+.sb-export:disabled{opacity:.5;cursor:not-allowed}
+
 /* ── Inline +column header (airtable) ────────────────────────────────── */
 .dbgrid th.add-col{width:48px;padding:0;background:var(--surface-3);border-left:1px dashed var(--border);position:sticky;top:0;z-index:3;overflow:visible}
 .dbgrid .add-col-btn{width:100%;height:100%;min-height:30px;background:transparent;border:none;cursor:pointer;color:var(--text-dim);font-size:16px;font-weight:700;font-family:var(--mono)}
@@ -1686,6 +1706,7 @@ table.csv-preview tr:last-child td{border-bottom:none}
      leans on for arithmetic / fuzzy match / prose is loaded lazily from the
      eoreader3 deployment on first ask (override with window.EOREADER_BASE). -->
 <script src="data-chat.js"></script>
+<script src="schema-export.js"></script>
 <script type="text/babel" data-presets="react" src="tweaks-panel.jsx"></script>
 <script type="text/babel" data-presets="react" src="matrix-auth.jsx"></script>
 <script type="text/babel" data-presets="react" src="csv-import.jsx"></script>
@@ -1698,6 +1719,7 @@ table.csv-preview tr:last-child td{border-bottom:none}
 <script type="text/babel" data-presets="react" src="app-view.jsx"></script>
 <script type="text/babel" data-presets="react" src="sync-view.jsx"></script>
 <script type="text/babel" data-presets="react" src="chat-view.jsx"></script>
+<script type="text/babel" data-presets="react" src="schema-export.jsx"></script>
 <script type="text/babel" data-presets="react" src="app.jsx"></script>
 </body>
 </html>
