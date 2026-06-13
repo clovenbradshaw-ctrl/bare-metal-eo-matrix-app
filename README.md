@@ -79,6 +79,45 @@ The sweet spot is anywhere the unit of relationship is small — which is most b
 
 An AI agent joins any of these as an ordinary room member: it sees the same encrypted event stream everyone else does and emits operators into the same log — `CON` suggestions, `EVA` flags pointing at a needed `REC` — inside the encrypted boundary, not behind an API that sees everything in the clear. There is no separate AI backend to secure.
 
+## Ask your data (chat)
+
+The sidebar's **Ask your data** view lets you query a workspace in plain
+language and get back live, clickable answers — built on the deterministic
+[Cleo reading engine](https://github.com/clovenbradshaw-ctrl/eoreader3). It
+reads the same fold the table and graph views read; it **never writes** to the
+log.
+
+- **A query renders a table.** *“show open cases sorted by priority”*,
+  *“clients where tier is gold”*, *“count cases by status”* — the question is
+  parsed into a filter/sort/aggregation over the entity type and rendered
+  inline. Every row is clickable.
+- **A record renders a profile popup.** *“tell me about Acme Corp”* (or clicking
+  a row) opens a profile with every field **and every related record**, grouped
+  by relationship. Clicking a related record drills into *its* profile.
+- **Foreign keys are followed intelligently.** Related records come from the
+  `CON` edges and the `_schema.links` declarations — the same foreign-key model
+  the grid's linked columns and the graph view use — so a client surfaces its
+  cases, each case its events and notes, and so on.
+
+**How it stays private.** The query layer (type/field/value resolution, filters,
+aggregation, foreign-key traversal) is pure, deterministic JavaScript and runs
+even with no engine and no network — it's exercised headlessly in
+`test/data-chat.test.cjs`. The Cleo engine is loaded **lazily, on first ask,
+from the eoreader3 deployment** (it's developed in that repo, so this app always
+tracks the latest engine — see `public/data-chat.js`'s `EOREADER_DEFAULT`, or
+set `window.EOREADER_BASE` to point at a local eoreader3 while you work on both).
+It adds arithmetic, fuzzy matching, and prose answers. A **“Smart parse”**
+toggle can additionally load a **small on-device model** (wllama / WebAssembly)
+to interpret looser questions — it runs entirely in your browser. There is **no
+cloud LLM option**: nothing about your data leaves the tab.
+
+The two pieces:
+
+- `public/data-chat.js` — `window.DataChat`: the deterministic NL→query bridge
+  over the fold (and the schema-validated `plan → execute` path the local model
+  feeds, so a model can only ever propose a *read*).
+- `public/chat-view.jsx` — `window.ChatView`: the Ask view + the profile popup.
+
 ## Honest scope
 
 This removes the backend-as-a-service tier wherever the unit of trust is small. It does **not** replace large public consumer apps, and pretending otherwise would be dishonest:

@@ -514,6 +514,15 @@ function Sidebar({
         </div>
       </div>
 
+      <button
+        className={`sb-ask ${selection.kind === 'chat' ? 'active' : ''}`}
+        onClick={() => setSelection({ kind: 'chat' })}
+        title="chat with your data — ask in plain language, get tables and record profiles linked by foreign key"
+      >
+        <i className="ph ph-chat-circle-dots" aria-hidden="true"></i>
+        <span className="sb-ask-label">Ask your data</span>
+      </button>
+
       <div className="sb-section">
         <div className="sb-section-head">
           <span>sets</span>
