@@ -908,6 +908,21 @@ function App() {
     [importEntities]
   );
 
+  // The Airtable base to coordinate sync for: whichever base this workspace
+  // imported the most tables from (workspaces are typically one base). Drives
+  // the raise-hand coordinator; null when nothing Airtable was ever imported.
+  const airtableBaseId = useMemo(() => {
+    const counts = {};
+    for (const e of importEntities) {
+      if (e.source === 'airtable' && e.airtable_base) {
+        counts[e.airtable_base] = (counts[e.airtable_base] || 0) + 1;
+      }
+    }
+    let best = null, bestN = 0;
+    for (const [b, n] of Object.entries(counts)) if (n > bestN) { best = b; bestN = n; }
+    return best;
+  }, [importEntities]);
+
   // Source blobs of *superseded* import generations. A re-synced Airtable
   // base+table uploads a fresh blob each time; the old generation stops
   // materializing (CsvImport.activeImports keeps only the newest per group) but
@@ -1089,7 +1104,23 @@ function App() {
     // time-travel before an import from conjuring its rows; the second stops a
     // superseded re-sync's cached rows from duplicating the current one.
     const anchors = Object.keys(byAnchor).filter(a => state.entities?.[a] && activeImportAnchors.has(a));
-    if (!anchors.length) return state;
+
+    // Airtable inbound sync (airtable-sync.js) writes first-class entities keyed
+    // by a deterministic anchor and tagged `_origin:'airtable'` + `_recordId`.
+    // Each must SHADOW the cold blob row carrying the same `_recordId` (so an
+    // edited/created row wins and isn't shown twice), and a `_deleted` SEG must
+    // hide the record entirely. The blob baseline never mutates — we reconcile
+    // at render time. Keyed only on airtable-origin entities, so a workspace that
+    // never synced from Airtable takes the untouched fast path below.
+    const atShadow = new Map();   // _recordId → isDeleted
+    for (const e of Object.values(state.entities || {})) {
+      if (e && e._origin === 'airtable' && e._recordId != null) {
+        const deleted = e._partition === '_deleted' || state.partitions?.[e._anchor] === '_deleted';
+        atShadow.set(e._recordId, deleted);
+      }
+    }
+
+    if (!anchors.length && !atShadow.size) return state;
     const entities = {};
     for (const a of anchors) for (const row of byAnchor[a]) entities[row._anchor] = row;
     Object.assign(entities, state.entities);
@@ -1130,6 +1161,18 @@ function App() {
         }
       }
       if (derived.length) connections = [...state.connections, ...derived];
+    }
+
+    // Apply the Airtable shadow pass: drop each blob row a folded airtable
+    // entity supersedes (by _recordId), and drop both sides of a `_deleted` one.
+    if (atShadow.size) {
+      for (const key of Object.keys(entities)) {
+        const e = entities[key];
+        const rid = e && e._recordId;
+        if (rid == null || !atShadow.has(rid)) continue;
+        if (atShadow.get(rid)) delete entities[key];              // deleted → tombstone + blob row vanish
+        else if (e._origin !== 'airtable') delete entities[key];  // blob duplicate → the folded row wins
+      }
     }
 
     return { ...state, entities, connections };
@@ -1227,6 +1270,11 @@ function App() {
   sessionRef.current = session;
   const stateRef = useRef(state);
   stateRef.current = state;
+  // The Airtable coordinator + sync engine read the FULLY rendered state
+  // (folded events + materialized import rows) so copy-on-write promotion sees
+  // the blob baseline. Mirror it in a ref so the engine's getState() is cheap.
+  const renderStateRef = useRef(renderState);
+  renderStateRef.current = renderState;
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
   const currentRoomIdRef = useRef(currentRoomId);
@@ -1246,6 +1294,33 @@ function App() {
 
   const onEmitRef = useRef(onEmit);
   onEmitRef.current = onEmit;
+
+  // ── Airtable sync coordinator ──
+  // While a live room with an Airtable import is open, attach window.AirtableCoord
+  // so this member participates in turn-taking: it elects one puller among raised
+  // hands (sync FROM Airtable) and drives the auto-push (TO Airtable) seam. It
+  // runs regardless of which view is on screen — not just the Sync page — so a
+  // raised hand keeps pulling in the background. Detaches on room change / logout.
+  useEffect(() => {
+    const Coord = window.AirtableCoord;
+    const isLiveRoom = !!(session && !session.demo && currentRoomId && String(currentRoomId).startsWith('!'));
+    if (!Coord || !isLiveRoom || !airtableBaseId) {
+      if (Coord?.detach && Coord.status?.().attached) Coord.detach();
+      return;
+    }
+    let displayName = null;
+    try { displayName = window.MatrixLive?.getMyDisplayName?.() || null; } catch {}
+    Coord.attach({
+      roomId: currentRoomId,
+      baseId: airtableBaseId,
+      userId: session.mxid,
+      displayName,
+      getState: () => renderStateRef.current,
+      emit: (op, content) => onEmitRef.current(op, content),
+      log: (msg) => console.debug('[airtable]', msg),
+    });
+    return () => { try { Coord.detach(); } catch {} };
+  }, [session, currentRoomId, airtableBaseId]);
 
   const onEphemeral = useCallback((op, content) => {
     const id = ++ephCounterRef.current;

@@ -98,7 +98,12 @@
     return total;
   }
 
-  const AirtableAPI = { listBases, fetchBaseSchema, fetchRecords };
+  // `importTableChunked` + `importGroupFor` are exposed so the ongoing inbound
+  // sync (airtable-sync.js) can reuse the exact one-shot importer for its full
+  // sweep — a fresh `import_seq` supersedes the prior blob generation, no
+  // duplicates, same lazy media-blob path. Without this the sync module throws
+  // "importTableChunked not exposed — apply the airtable-import.jsx patch".
+  const AirtableAPI = { listBases, fetchBaseSchema, fetchRecords, importTableChunked, importGroupFor };
   window.AirtableAPI = AirtableAPI;
 
   const TYPE_GLYPH = {
