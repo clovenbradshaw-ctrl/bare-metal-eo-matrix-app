@@ -199,6 +199,39 @@ function pickColumns(result) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// The query, read back in EO notation. This is the "confirm what I'm asking"
+// surface: before you trust the number, see exactly how the question was
+// decomposed — SEG ｜ scope, EVA ⊨ filter, SYN △ aggregate, REC ⊛ group/math,
+// DEF ⊢ sort/window, NUL ∅ a phrase we couldn't bind. DataChat.eoTrace builds
+// these from the same spec the answer came from (read-only — nothing is emitted
+// to the log). Renders for every answer, so it works with Smart parse off.
+// ───────────────────────────────────────────────────────────────────────────
+function EOQuery({ steps }) {
+  if (!steps || !steps.length) return null;
+  return (
+    <div className="dc-eo" role="note" aria-label="query in EO notation">
+      <div className="dc-eo-head"><i className="ph ph-eye" aria-hidden="true"></i> how I read this</div>
+      <ol className="dc-eo-steps">
+        {steps.map((s, i) => (
+          <li key={i} className={`dc-eo-step${s.dim ? ' dc-eo-dim' : ''}`}>
+            <span className="dc-eo-glyph" aria-hidden="true">{s.glyph}</span>
+            <span className="dc-eo-op" title={s.word}>{s.name}</span>
+            <span className="dc-eo-label">{s.label}</span>
+            {s.detail && <span className="dc-eo-detail">{s.detail}</span>}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+// A one-line EO sketch of a not-yet-run plan (used inside confirm choices, so
+// each "which table?" option shows the query it would run).
+function eoSketch(plan) {
+  try { return (DC() && DC().eoTrace) ? DC().eoTrace(plan) : []; } catch (e) { return []; }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // One assistant result, rendered by kind.
 // ───────────────────────────────────────────────────────────────────────────
 function ResultBlock({ result, onOpenProfile, onOpenTable, onChooseConfirm }) {
@@ -239,17 +272,29 @@ function ResultBlock({ result, onOpenProfile, onOpenTable, onChooseConfirm }) {
           <span className="dc-confirm-text">{result.text}</span>
         </div>
         <div className="dc-confirm-choices">
-          {(result.choices || []).map((c, i) => (
-            <button
-              key={i}
-              className="dc-confirm-choice"
-              onClick={() => onChooseConfirm && onChooseConfirm(c, result)}
-              title={c.hint || ''}
-            >
-              <span className="dc-confirm-label">{c.label}</span>
-              {c.hint && <span className="dc-confirm-hint">{c.hint}</span>}
-            </button>
-          ))}
+          {(result.choices || []).map((c, i) => {
+            const sketch = eoSketch(c.plan);
+            return (
+              <button
+                key={i}
+                className="dc-confirm-choice"
+                onClick={() => onChooseConfirm && onChooseConfirm(c, result)}
+                title={c.hint || ''}
+              >
+                <span className="dc-confirm-label">{c.label}</span>
+                {c.hint && <span className="dc-confirm-hint">{c.hint}</span>}
+                {sketch.length > 0 && (
+                  <span className="dc-eo-inline">
+                    {sketch.map((s, j) => (
+                      <span key={j} className="dc-eo-inline-step" title={`${s.name} · ${s.word}`}>
+                        <span className="dc-eo-glyph" aria-hidden="true">{s.glyph}</span>{s.label}
+                      </span>
+                    ))}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
       </div>
     );
@@ -432,6 +477,8 @@ function ChatView({ room, state, setSelection }) {
                   {restateOf(m.result) && (
                     <div className="dc-restate"><i className="ph ph-quotes-fill" aria-hidden="true"></i><span>{restateOf(m.result)}</span></div>
                   )}
+                  {m.result && m.result.kind !== 'confirm' && m.result.spec && m.result.spec.eo &&
+                    <EOQuery steps={m.result.spec.eo} />}
                   <ResultBlock result={m.result} onOpenProfile={onOpenProfile} onOpenTable={onOpenTable} onChooseConfirm={onChooseConfirm} />
                 </div>}
           </div>

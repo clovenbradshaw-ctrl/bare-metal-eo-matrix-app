@@ -324,72 +324,149 @@ const state = {
   r = await DC.interpret('show all pings', floodState, { skipConfirm: true });
   eq('skipConfirm bypasses flood gate', r.kind, 'table');
 
-  // ── implicit value filters: name a VALUE, not the field ────────────────────
-  // The reported bug: "how many clients are from Mexico?" counted *all* clients
-  // because "from Mexico" never became a filter (Mexico isn't a select option,
-  // and the user never named the "Country" field). The parser now resolves a
-  // named value to whichever field carries it — free text OR select — so the
-  // natural phrasing works without naming the field or toggling the LLM.
+  // ── arithmetic on top of an aggregate (no engine, no Smart-parse toggle) ────
+  // "total number of clients times 2" used to mis-read as Count(Phone Number)
+  // and silently drop "times 2". It must now count rows and apply the math.
+  const phoneState = {
+    entities: {
+      z1: ent('z1', 'Client Info', { Name: 'A', 'Phone Number': '555-0001' }),
+      z2: ent('z2', 'Client Info', { Name: 'B', 'Phone Number': '555-0002' }),
+    },
+    connections: [], partitions: {},
+    schema: { tables: ['Client Info'], fields: { 'Client Info': [{ name: 'Name', type: 'text' }, { name: 'Phone Number', type: 'text' }] }, links: [] },
+    cursor: 2,
+  };
+  r = await DC.interpret('what is my total number of clients times 2', phoneState);
+  eq('count×2 → value', r.kind, 'value');
+  eq('count×2 value is 2×2=4', r.value, 4);
+  eq('count label has no phantom field', r.label, 'Count of clients');   // not "Count (Phone Number) of clients"
+  ok('count×2 records the math in spec', r.spec.arith && r.spec.arith.base === 2 && r.spec.arith.result === 4 && r.spec.arith.symbol === '×');
+  ok('count×2 note shows the computation', /2\s*×\s*2\s*=\s*4/.test(r.note || ''));
+
+  // "total number of X" alone is a plain count (no Sum, no field binding).
+  r = await DC.interpret('total number of clients', state);
+  eq('total number → count', r.kind, 'value');
+  eq('total number value', r.value, 2);
+  eq('total number label', r.label, 'Count of clients');
+
+  // other arithmetic ops, all deterministic
+  r = await DC.interpret('how many cases divided by 3', state);
+  eq('count÷3 value', r.value, 1);                                       // 3 cases / 3
+  r = await DC.interpret('sum of priority in cases plus 5', state);
+  eq('sum+5 value', r.value, 20);                                        // 15 + 5
+
+  // ── value-anchored filters: a value with no explicit field ──────────────────
+  // "clients in austin" — the location is the anchor; bind it to a location-like
+  // text field instead of dropping the whole clause.
+  r = await DC.interpret('clients in austin', state);
+  eq('value-anchored → table', r.kind, 'table');
+  eq('value-anchored type', r.type, 'Client Info');
+  ok('value-anchored filtered to Austin', r.rows.length === 1 && r.rows[0].City === 'Austin');
+  ok('value-anchored bound the City field', (r.spec.filters || []).some(f => f.field === 'City'));
+
+  // "from mexico" binds to a select OPTION when one matches — the screenshot case.
   const geoState = {
     entities: {
-      g1: ent('g1', 'Client Info', { Name: 'Acme', Country: 'Mexico', Nationality: 'Mexican' }),
-      g2: ent('g2', 'Client Info', { Name: 'Globex', Country: 'United States', Nationality: 'American' }),
-      g3: ent('g3', 'Client Info', { Name: 'Initech', Country: 'México', Nationality: 'Mexican' }),
-      g4: ent('g4', 'Client Info', { Name: 'Umbrella', Country: 'Canada', Nationality: 'Canadian' }),
+      g1: ent('g1', 'Client Info', { Name: 'Uno', Country: 'Mexico' }),
+      g2: ent('g2', 'Client Info', { Name: 'Dos', Country: 'Canada' }),
+      g3: ent('g3', 'Client Info', { Name: 'Tres', Country: 'Mexico' }),
     },
-    connections: [],
-    partitions: {},
-    schema: {
-      tables: ['Client Info'],
-      fields: {
-        'Client Info': [
-          { name: 'Name', type: 'text' },
-          { name: 'Country', type: 'text' },                                   // free text
-          { name: 'Nationality', type: 'select', options: ['Mexican', 'American', 'Canadian'] },
-        ],
-      },
-      links: [],
+    connections: [], partitions: {},
+    schema: { tables: ['Client Info'], fields: { 'Client Info': [{ name: 'Name', type: 'text' }, { name: 'Country', type: 'select', options: ['Mexico', 'Canada', 'USA'] }] }, links: [] },
+    cursor: 3,
+  };
+  r = await DC.interpret('how many clients are from mexico', geoState);
+  eq('from-option → value', r.kind, 'value');
+  eq('from-option count is filtered (2 of 3)', r.value, 2);
+  ok('from-option bound Country', (r.spec.filters || []).some(f => f.field === 'Country'));
+
+  // No matching field ⇒ don't pretend: count everything BUT surface the miss.
+  const plainState = {
+    entities: { w1: ent('w1', 'Widget', { Name: 'A' }), w2: ent('w2', 'Widget', { Name: 'B' }) },
+    connections: [], partitions: {},
+    schema: { tables: ['Widget'], fields: { 'Widget': [{ name: 'Name', type: 'text' }] }, links: [] },
+    cursor: 2,
+  };
+  r = await DC.interpret('how many widgets from mexico', plainState);
+  eq('unmapped still answers', r.kind, 'value');
+  eq('unmapped counts all', r.value, 2);
+  ok('unmapped phrase recorded', (r.spec.unmapped || []).some(u => /mexico/.test(u)));
+  ok('unmapped surfaced in note', /mexico/.test(r.note || ''));
+
+  // ── EO notation: every answer carries the query, decomposed into operators ──
+  r = await DC.interpret('how many cases times 2', state);
+  ok('result carries an eo trace', Array.isArray(r.spec.eo) && r.spec.eo.length > 0);
+  let eops = r.spec.eo.map(s => s.op);
+  ok('eo scopes with SEG', eops[0] === 'SEG');
+  ok('eo aggregates with SYN', eops.includes('SYN'));
+  ok('eo shows the math as REC', eops.includes('REC'));
+  ok('eo steps carry glyph + name + word', r.spec.eo.every(s => s.glyph && s.name && s.word));
+  eq('SEG glyph', r.spec.eo.find(s => s.op === 'SEG').glyph, '｜');
+
+  r = await DC.interpret('cases where priority > 4', state);
+  ok('filter shows as EVA', r.spec.eo.some(s => s.op === 'EVA' && /priority/i.test(s.label)));
+
+  r = await DC.interpret('count cases by status', state);
+  ok('group-by shows as REC', r.spec.eo.some(s => s.op === 'REC' && /status/i.test(s.label)));
+
+  r = await DC.interpret('tell me about Acme Corp', state);
+  eops = r.spec.eo.map(s => s.op);
+  ok('profile eo: SEG + CON (follow links)', eops.includes('SEG') && eops.includes('CON'));
+
+  r = await DC.interpret('escalation', state);
+  ok('search eo: NUL scan', r.spec.eo.some(s => s.op === 'NUL'));
+
+  // the unmapped widget query exposes the miss as an unbound NUL step
+  r = await DC.interpret('how many widgets from mexico', plainState);
+  ok('unmapped eo: a dim NUL step', r.spec.eo.some(s => s.op === 'NUL' && /mexico/.test(s.label) && s.dim));
+
+  // eoTrace is exported and works on a raw plan (what the confirm cards render)
+  const trace = DC.eoTrace({ intent: 'aggregate', type: 'Case Master View', filters: [{ field: 'Status', op: 'eq', value: 'Open' }], agg: { agg: 'count', field: null, groupBy: null } });
+  ok('eoTrace(plan): SEG then EVA then SYN', trace[0].op === 'SEG' && trace.some(s => s.op === 'EVA') && trace.some(s => s.op === 'SYN'));
+  ok('EO_OPS catalog has the nine glyphs', Object.keys(DC.EO_OPS).length === 9 && DC.EO_OPS.SEG.glyph === '｜');
+
+  // ── accent-folding + free-text / oddly-named value binding ──────────────────
+  // Complements the select-option + location-field cases above: a free-text
+  // country field, an accented value, and a field whose NAME isn't location-like
+  // (so it can only be found by scanning real record values — fieldForValue).
+  const geoTextState = {
+    entities: {
+      t1: ent('t1', 'Client Info', { Name: 'Acme', Country: 'Mexico', Background: 'Mexico' }),
+      t2: ent('t2', 'Client Info', { Name: 'Globex', Country: 'United States', Background: 'USA' }),
+      t3: ent('t3', 'Client Info', { Name: 'Initech', Country: 'México', Background: 'Mexico' }),
+      t4: ent('t4', 'Client Info', { Name: 'Umbrella', Country: 'Canada', Background: 'Canada' }),
     },
+    connections: [], partitions: {},
+    schema: { tables: ['Client Info'], fields: { 'Client Info': [
+      { name: 'Name', type: 'text' }, { name: 'Country', type: 'text' }, { name: 'Background', type: 'text' },
+    ] }, links: [] },
     cursor: 4,
   };
 
-  // the exact question from the bug report → a count of just the Mexican clients
-  r = await DC.interpret('how many clients are from mexico?', geoState);
-  eq('from-mexico count → value', r.kind, 'value');
-  eq('from-mexico count is 2 (not all 4)', r.value, 2);
-  ok('from-mexico restated the filter', /Country/i.test(r.note || ''));
+  // free-text Country (a location-named field) → count just the Mexican clients,
+  // accent-folded so an ASCII query also catches "México" (Mexico + México = 2).
+  r = await DC.interpret('how many clients are from mexico?', geoTextState);
+  eq('free-text from-mexico → value', r.kind, 'value');
+  eq('free-text from-mexico count is 2 (Mexico + México)', r.value, 2);
+  r = await DC.interpret('clients from méxico', geoTextState);
+  eq('accented query rows', r.rows.length, 2);
 
-  // accent-folding both ways: ASCII query matches "México", and the executor
-  // matches what the resolver found (Mexico + México = 2).
-  r = await DC.interpret('clients from méxico', geoState);
-  eq('accented query → table', r.kind, 'table');
-  eq('accent-folded rows', r.rows.length, 2);
+  // an oddly-named field (no location word in its name) is found by SCANNING
+  // real values — the fieldForValue fallback, exercised directly.
+  const noCountry = DC.fieldsForType(geoTextState, 'Client Info').filter(f => f.name !== 'Country');
+  const ff = DC.fieldForValue(geoTextState, 'Client Info', noCountry, 'canada');
+  ok('fieldForValue resolves a bare value by scanning records', ff && ff.field === 'Background');
 
-  // a value that lives in a SELECT field resolves to that field's option
-  r = await DC.interpret('how many clients are mexican', geoState);
-  eq('mexican (select option) count', r.value, 2);
-
-  // "in <place>" works too, and the field stays implicit
-  r = await DC.interpret('clients in canada', geoState);
-  eq('in-canada rows', r.rows.length, 1);
-
-  // value filters surface via parseValueFilters / fieldForValue directly
-  const vf = DC.parseValueFilters('clients from mexico', DC.fieldsForType(geoState, 'Client Info'), geoState, 'Client Info', []);
-  ok('parseValueFilters finds Country', vf.length === 1 && vf[0].field === 'Country');
-  const ff = DC.fieldForValue(geoState, 'Client Info', DC.fieldsForType(geoState, 'Client Info'), 'canada');
-  ok('fieldForValue resolves a bare value', ff && ff.field === 'Country');
-
-  // NO false positives: a phrase that only renames the table adds no filter,
-  // and a plain "all" question stays unfiltered.
+  // NO false positives: "in cases" just renames the table; "all" stays unfiltered.
   r = await DC.interpret('sum of priority in cases', state);
   eq('“in cases” adds no bogus filter — sum still 15', r.value, 15);
-  r = await DC.interpret('show all clients', geoState);
+  r = await DC.interpret('show all clients', geoTextState);
   ok('all clients → no value filter', (r.spec.filters || []).length === 0 && r.rows.length === 4);
 
-  // ── restatement: describe() mirrors the executed query ─────────────────────
-  r = await DC.interpret('how many clients are from mexico?', geoState);
-  ok('describe restates the count + filter', /count/i.test(DC.describe(r.spec)) && /Country/i.test(DC.describe(r.spec)));
-  r = await DC.interpret('show all clients', geoState);
+  // ── plain-English restatement: describe() mirrors the executed query ────────
+  r = await DC.interpret('how many clients are from mexico?', geoTextState);
+  ok('describe restates the count + filter', /count/i.test(DC.describe(r.spec)) && /country/i.test(DC.describe(r.spec)));
+  r = await DC.interpret('show all clients', geoTextState);
   ok('describe restates an unfiltered list', /all clients/i.test(DC.describe(r.spec)) && !/where/i.test(DC.describe(r.spec)));
   r = await DC.interpret('count cases by status', state);
   ok('describe restates a grouped count', /grouped by/i.test(DC.describe(r.spec)));

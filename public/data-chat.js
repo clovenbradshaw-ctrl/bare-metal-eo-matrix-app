@@ -353,46 +353,57 @@
     return out;
   }
 
-  // ── implicit value filters: resolve a named VALUE to its (unnamed) field ────
-  // parseFilters needs "<field> <op> <value>"; parseStandaloneOptions catches a
-  // bare SELECT option. But people rarely name the field — "clients from
-  // Mexico", "cases in California", "matters named Acme". Here we take a value
-  // the user named and find whichever field actually carries it (a select
-  // option first, then a real record value), so the field can stay implicit.
-  // Candidate values come from preposition phrases ("from/in/at/named/called
-  // <X>") and quoted text — a strong enough signal that we accept a substring
-  // match and will even match a label/Name field. A phrase that only renames
-  // the table ("…in cases") resolves to nothing and is dropped.
-  const VALUE_PREP_RE = /\b(?:from|in|at|named|called|located in|based in|living in|residing in)\s+([\p{L}\p{N}][\p{L}\p{N} .,'’&/-]*?)(?=\s+(?:and|or|but|with|where|whose|that|who|which|sorted|ordered|order|grouped|group|by|per)\b|[?.!,;:]|$)/giu;
+  // ── value-anchored filters ─────────────────────────────────────────────────
+  // "clients from mexico", "cases in austin" — a prepositional phrase whose VALUE
+  // (not its field) is the anchor. parseFilters needs "<field> <op> <value>", so
+  // "clients are from mexico" lost the whole clause (left side "clients" is not a
+  // field) and the question silently counted everything. Here we bind the value
+  // back to a field: a select/multiselect whose options include it ("Mexico" in a
+  // Country option set), else a location-named text field, else — for an oddly
+  // named field — whichever field actually carries that value (a record-value
+  // scan, fieldForValue). Matching is accent-folded, so "mexico" binds "México".
+  // When nothing matches we record the phrase as UNMATCHED so the answer can say
+  // so out loud instead of pretending the filter wasn't asked for.
+  const LOCATION_FIELD_RE = /\b(country|countries|nationality|city|cities|town|state|province|region|county|location|origin|residence|address|place|zip|postal)\b/i;
+  const VALUE_PREPS = [['based in', true], ['located in', true], ['living in', true], ['residing in', true], ['from', true], ['in', false], ['at', false]];
+  const VAL_STOP = new Set(['the', 'a', 'an', 'total', 'all', 'each', 'any', 'my', 'our', 'their', 'this', 'that', 'it', 'them', 'here', 'there']);
+  const VAL_BREAK = /^(and|or|but|with|where|whose|by|per|grouped|group|sorted|sort|order|ordered|that|having|which|is|are|was|were|times|multiplied|plus|minus|divided|over|of|for|to)$/;
   const VALUE_SCAN_CAP = 20000; // don't scan a giant table to resolve one value
-
-  function valuePhrases(q) {
+  function prepPhrases(q) {
     const out = [];
-    let m;
-    VALUE_PREP_RE.lastIndex = 0;
-    while ((m = VALUE_PREP_RE.exec(q)) !== null) {
-      const phrase = stripQuotes(m[1]).replace(/^(the|a|an)\s+/i, '').replace(/\s+/g, ' ').trim();
-      if (phrase) out.push(phrase);
+    const text = ' ' + lc(q).replace(/[?.!,]+/g, ' ') + ' ';
+    for (const [prep, strong] of VALUE_PREPS) {
+      let from = 0, idx;
+      while ((idx = text.indexOf(' ' + prep + ' ', from)) >= 0) {
+        from = idx + prep.length + 1;
+        const words = text.slice(idx + prep.length + 2).split(/\s+/).filter(Boolean);
+        const val = [];
+        for (const w of words) {
+          if (val.length >= 3 || VAL_BREAK.test(w)) break;
+          if (!val.length && VAL_STOP.has(w)) continue;   // skip leading filler ("from the texas office")
+          if (val.length && VAL_STOP.has(w)) break;
+          val.push(w);
+        }
+        const value = val.join(' ').trim();
+        if (value.length > 1 && !/^\d+$/.test(value)) out.push({ prep, strong, value });
+      }
     }
-    const quoted = String(q).match(/["“'`]([^"”'`]+)["”'`]/);
-    if (quoted && quoted[1].trim()) out.push(quoted[1].trim());
-    return uniq(out);
+    return out;
   }
 
-  // Which field carries `phrase` as a value? Returns a ready filter or null.
+  // Scan a type's records for whichever field carries `phrase` as a value — the
+  // fallback when the value is neither a select option nor in a location-named
+  // field. Accent-folded; prefers an exact, non-label match, then exact-on-label,
+  // then a word-boundary contains. Bounded so a giant table can't stall a query.
   function fieldForValue(state, type, fields, phrase) {
     const p = nfold(phrase);
     if (!p || p.length < 2) return null;
     if (typeVariants(type).map(nfold).indexOf(p) >= 0) return null; // just the table name
-    // 1) a select / multiselect option — canonical, most trustworthy
     for (const f of fields) {
       if (!Array.isArray(f.options) || !f.options.length) continue;
       const opt = f.options.find(o => nfold(o) === p) || f.options.find(o => (' ' + nfold(o) + ' ').indexOf(' ' + p + ' ') >= 0);
       if (opt) return { field: f.name, op: filterKind(f.type) === 'multiselect' ? 'contains' : 'eq', value: opt, kind: filterKind(f.type) };
     }
-    // 2) a real value on a record. Prefer an exact, non-label match; fall back
-    //    to exact-on-label, then a word-boundary contains. (Free-text phrase,
-    //    so numbers/dates compare as text — which is what a contains needs.)
     const records = entitiesOfType(state, type);
     if (records.length > VALUE_SCAN_CAP) return null;
     let exactNon = null, exactLabel = null, containsNon = null, containsLabel = null;
@@ -422,15 +433,28 @@
     return { field: hit.field, op: hit.op, value: hit.value, kind: filterKind(fd ? fd.type : 'text') };
   }
 
-  function parseValueFilters(q, fields, state, type, alreadyFiltered) {
-    if (!type || !fields || !fields.length) return [];
-    const used = new Set((alreadyFiltered || []).map(f => f.field));
-    const out = [];
-    for (const phrase of valuePhrases(q)) {
-      const hit = fieldForValue(state, type, fields, phrase);
-      if (hit && !used.has(hit.field)) { out.push(hit); used.add(hit.field); }
+  function parseValueAnchoredFilters(q, fields, already, state, type) {
+    const used = new Set((already || []).map(f => f.field));
+    const filters = [], unmapped = [];
+    for (const { prep, strong, value } of prepPhrases(q)) {
+      let bound = false;
+      const optF = fieldWithOption(fields, value);
+      if (optF && !used.has(optF.name)) {
+        const opt = optF.options.find(o => nfold(o) === nfold(value)) || value;
+        filters.push({ field: optF.name, op: filterKind(optF.type) === 'multiselect' ? 'contains' : 'eq', value: opt, kind: filterKind(optF.type) });
+        used.add(optF.name); bound = true;
+      }
+      if (!bound) {
+        const locF = fields.find(f => LOCATION_FIELD_RE.test(norm(f.name)) && filterKind(f.type) === 'text' && !used.has(f.name));
+        if (locF) { filters.push({ field: locF.name, op: 'contains', value, kind: 'text' }); used.add(locF.name); bound = true; }
+      }
+      if (!bound && state && type) {
+        const hit = fieldForValue(state, type, fields, value);
+        if (hit && !used.has(hit.field)) { filters.push(hit); used.add(hit.field); bound = true; }
+      }
+      if (!bound && strong) unmapped.push(prep + ' ' + value);
     }
-    return out;
+    return { filters, unmapped };
   }
 
   function lastNoun(s) { const parts = norm(s).split(' ').filter(Boolean); return parts[parts.length - 1] || ''; }
@@ -448,10 +472,15 @@
     let agg = null;
     for (const [re, name] of AGG_WORDS) { if (re.test(q)) { agg = name; break; } }
     if (!agg) return null;
-    // field the aggregate runs over (sum/avg/min/max need one; count usually not)
+    // field the aggregate runs over (sum/avg/min/max need one; count never does
+    // — it counts rows). Binding a field on a count is how "total number of
+    // clients" used to mis-read as Sum/Count of a "Phone Number" field: "total"
+    // tripped this regex and "number" fuzzy-matched a field. Count takes no field.
     let field = null;
-    const m = q.match(/\b(?:sum|total|average|avg|mean|maximum|max|minimum|min)\s+(?:of\s+|the\s+)?([a-z0-9 _]+?)(?:\s+(?:by|per|for|where|with|in|of)\b|[?.!]|$)/i);
-    if (m) field = resolveField(fields, m[1].trim());
+    if (agg !== 'count') {
+      const m = q.match(/\b(?:sum|total|average|avg|mean|maximum|max|minimum|min)\s+(?:of\s+|the\s+)?([a-z0-9 _]+?)(?:\s+(?:by|per|for|where|with|in|of)\b|[?.!]|$)/i);
+      if (m) field = resolveField(fields, m[1].trim());
+    }
     // group dimension
     let groupBy = null;
     const g = q.match(/\b(?:by|per|grouped by|group by|for each)\s+([a-z0-9 _]+?)(?:\s+(?:where|with|and)\b|[?.!]|$)/i);
@@ -482,6 +511,53 @@
     return { grouped: true, rows };
   }
   function round(n) { return Math.round(n * 1e6) / 1e6; }
+
+  // ── arithmetic on top of an aggregate ──────────────────────────────────────
+  // "total number of clients times 2", "count of cases × 1.5", "sum of bond / 3".
+  // The deterministic core computes the aggregate, then applies ONE scalar op to
+  // it — so a count comes back as a real number you can scale, instead of the
+  // raw count with "times 2" silently dropped. Uses math.js when the engine is
+  // loaded (browser); falls back to exact JS arithmetic headlessly (and in Node
+  // tests), so the answer is the same with or without an engine.
+  const ARITH_OPS = [
+    [/\b(?:times|multiplied\s+by)\s+(-?\d[\d,]*(?:\.\d+)?)/i, '*', '×'],
+    [/[×*]\s*(-?\d[\d,]*(?:\.\d+)?)/i, '*', '×'],
+    [/\b(?:divided\s+by|over)\s+(-?\d[\d,]*(?:\.\d+)?)/i, '/', '÷'],
+    [/[÷/]\s*(-?\d[\d,]*(?:\.\d+)?)/i, '/', '÷'],
+    [/\bplus\s+(-?\d[\d,]*(?:\.\d+)?)/i, '+', '+'],
+    [/(?:^|\s)\+\s*(\d[\d,]*(?:\.\d+)?)/i, '+', '+'],
+    [/\bminus\s+(\d[\d,]*(?:\.\d+)?)/i, '-', '−'],
+  ];
+  function parseArithmetic(q) {
+    let best = null;
+    for (const [re, op, symbol] of ARITH_OPS) {
+      const m = String(q).match(re);
+      if (!m) continue;
+      const operand = parseFloat(String(m[1]).replace(/,/g, ''));
+      if (!Number.isFinite(operand)) continue;
+      if (best === null || m.index < best.index) best = { op, symbol, operand, index: m.index };
+    }
+    if (!best) return null;
+    return { op: best.op, symbol: best.symbol, operand: best.operand };
+  }
+  function arithEngine() {
+    return (typeof window !== 'undefined' && window.math && typeof window.math.evaluate === 'function') ? 'math.js' : 'computed';
+  }
+  function applyArith(value, arith) {
+    if (!arith || typeof value !== 'number' || !Number.isFinite(value)) return null;
+    const n = arith.operand;
+    let out = null;
+    if (typeof window !== 'undefined' && window.math && typeof window.math.evaluate === 'function') {
+      try { const r = window.math.evaluate(value + ' ' + arith.op + ' ' + n); if (typeof r === 'number') out = r; } catch (e) { /* fall through */ }
+    }
+    if (out == null) {
+      if (arith.op === '*') out = value * n;
+      else if (arith.op === '/') out = n === 0 ? null : value / n;
+      else if (arith.op === '+') out = value + n;
+      else if (arith.op === '-') out = value - n;
+    }
+    return (out == null || !Number.isFinite(out)) ? null : round(out);
+  }
 
   // ── sort & limit ──────────────────────────────────────────────────────────
   function parseSort(q, fields) {
@@ -707,13 +783,17 @@
     const fields = type ? fieldsForType(state, type) : [];
     let filters = parseFilters(q, fields);
     filters = filters.concat(parseStandaloneOptions(q, fields, filters));
-    filters = filters.concat(parseValueFilters(q, fields, state, type, filters));
+    const va = parseValueAnchoredFilters(q, fields, filters, state, type);
+    filters = filters.concat(va.filters);
     const agg = parseAggregate(q, fields);
+    // a scalar arithmetic op ("× 2") only makes sense on a single aggregate value
+    const arith = (agg && !agg.groupBy) ? parseArithmetic(q) : null;
     const sort = parseSort(q, fields);
     const limit = parseLimit(q);
     return {
       intent: agg ? 'aggregate' : 'query',
-      type, record: null, filters, agg, sort, limit,
+      type, record: null, filters, agg, sort, limit, arith,
+      unmapped: va.unmapped.length ? va.unmapped : null,
       source: source || 'deterministic',
     };
   }
@@ -742,6 +822,10 @@
     const plan = buildPlanForType(q, state, type, 'deterministic');
     let conf = ts.confident ? 0.8 : 0.5;
     if (plan.filters.length || plan.agg || plan.sort || plan.limit) conf += 0.12;
+    // a phrase we couldn't bind ("from mexico" with no matching field) means the
+    // deterministic read is incomplete — drop below the LLM threshold so Smart
+    // parse, when it's on, gets a shot at the part we missed.
+    if (plan.unmapped && plan.unmapped.length) conf = Math.min(conf, 0.5);
     return { plan, confidence: Math.min(1, conf), alternatives: ts.candidates };
   }
 
@@ -753,11 +837,17 @@
     const q = ctx.q || '';
     const spec = { question: q, intent: plan.intent, source: plan.source || 'deterministic' };
 
+    // phrases we couldn't bind to a field travel with the plan so the answer can
+    // own up to them ("counted everything · couldn't match: from mexico").
+    const unmapped = Array.isArray(plan.unmapped) && plan.unmapped.length ? plan.unmapped : null;
+    const noteFrom = (parts) => parts.filter(Boolean).join(' · ') || null;
+    const unmappedNote = unmapped ? 'couldn’t match: ' + unmapped.join(', ') : null;
+
     if (plan.intent === 'profile') {
       const hit = resolveRecord(state, plan.record, plan.type)
         || await fuzzyResolveRecord(state, plan.record, plan.type)
         || resolveRecord(state, plan.record, null);
-      if (hit) return { kind: 'profile', anchor: hit.anchor, type: hit.type, spec: { ...spec, target: plan.record } };
+      if (hit) return attachEO({ kind: 'profile', anchor: hit.anchor, type: hit.type, spec: { ...spec, type: hit.type, target: plan.record } });
       plan = { ...plan, intent: 'search' }; // couldn't find the record → search
     }
 
@@ -771,45 +861,57 @@
       if (agg) {
         const res = aggregate(filtered, agg);
         if (!res.grouped) {
-          return { kind: 'value', label: aggLabel(agg) + ' of ' + plural(plan.type), value: res.value == null ? '—' : res.value, note: filters.length ? whereNote(filters) : null, spec: { ...spec, type: plan.type, filters, agg } };
+          // apply a trailing scalar op ("× 2") to the aggregate, via math.js / JS
+          let value = res.value, arith = null;
+          if (plan.arith && typeof value === 'number') {
+            const out = applyArith(value, plan.arith);
+            if (out != null) { arith = { ...plan.arith, base: value, result: out, engine: arithEngine() }; value = out; }
+          }
+          const arithNote = arith ? (arith.base.toLocaleString() + ' ' + arith.symbol + ' ' + arith.operand + ' = ' + arith.result.toLocaleString() + ' · ' + arith.engine) : null;
+          return attachEO({
+            kind: 'value', label: aggLabel(agg) + ' of ' + plural(plan.type),
+            value: value == null ? '—' : value,
+            note: noteFrom([filters.length ? whereNote(filters) : null, arithNote, unmappedNote]),
+            spec: { ...spec, type: plan.type, filters, agg, arith: arith || null, unmapped },
+          });
         }
-        return {
+        return attachEO({
           kind: 'table', type: plan.type, title: aggLabel(agg) + ' of ' + plural(plan.type) + ' by ' + agg.groupBy,
           columns: [{ name: agg.groupBy, type: 'text' }, { name: aggLabel(agg), type: 'number' }, { name: 'count', type: 'number' }],
           rows: res.rows.map(r => ({ _anchor: '__agg__' + r.key, _type: plan.type, [agg.groupBy]: r.key, [aggLabel(agg)]: r.value, count: r.count, _agg: true })),
-          note: filters.length ? whereNote(filters) : null, spec: { ...spec, type: plan.type, filters, agg },
-        };
+          note: noteFrom([filters.length ? whereNote(filters) : null, unmappedNote]), spec: { ...spec, type: plan.type, filters, agg, unmapped },
+        });
       }
 
       const sort = validateSort(plan.sort, fields);
       const limit = plan.limit > 0 ? (plan.limit | 0) : null;
       let rows = sortRecords(filtered, sort);
       if (limit) rows = rows.slice(0, limit);
-      return {
+      return attachEO({
         kind: 'table', type: plan.type, title: titleFor(plan.type, filters, sort, limit),
         columns: preferredColumns(state, plan.type, { filters, sort, agg: null }),
         rows, total: filtered.length,
-        note: filters.length ? whereNote(filters) : null, alternatives: ctx.alternatives,
-        spec: { ...spec, type: plan.type, filters, sort, limit },
-      };
+        note: noteFrom([filters.length ? whereNote(filters) : null, unmappedNote]), alternatives: ctx.alternatives,
+        spec: { ...spec, type: plan.type, filters, sort, limit, unmapped },
+      });
     }
 
     // search / catch-all — a global record scan, optionally narrated by the engine
     const hits = globalSearch(state, q, 30);
     const proseNote = await engineAnswer(state, q, ctx.opts).catch(() => null);
     if (hits.length) {
-      return {
+      return attachEO({
         kind: 'table', type: null, title: 'Records matching “' + q.replace(/[?.!]+$/, '') + '”',
         columns: [{ name: 'type', type: 'text' }, { name: 'record', type: 'text' }],
         rows: hits.map(e => ({ _anchor: e._anchor, _type: e._type, type: e._type, record: recordLabel(e) })),
-        total: hits.length, note: proseNote || null, mixed: true, spec,
-      };
+        total: hits.length, note: proseNote || null, mixed: true, spec: { ...spec, intent: 'search' },
+      });
     }
-    return {
+    return attachEO({
       kind: proseNote ? 'answer' : 'empty', text: proseNote || null, records: [],
       message: proseNote ? null : 'No records matched that. Try a table name, e.g. ' + plural(knownTypes(state)[0]) + '.',
-      suggestions: suggestions(state), spec,
-    };
+      suggestions: suggestions(state), spec: { ...spec, intent: 'search' },
+    });
   }
 
   // plan validators — resolve names to real fields, normalize operators/dirs.
@@ -957,7 +1059,7 @@
       if (typeof window !== 'undefined' && window.EOCompute && window.EOCompute.detect) {
         const calc = window.EOCompute.detect(q);
         if (calc && calc.kind === 'calc') {
-          return { kind: 'value', label: 'Result', value: calc.display, note: 'Computed locally with math.js — no model did this arithmetic.', spec: { question: q, intent: 'calc' } };
+          return attachEO({ kind: 'value', label: 'Result', value: calc.display, note: 'Computed locally with math.js — no model did this arithmetic.', spec: { question: q, intent: 'calc' } });
         }
       }
     } catch (e) { /* calculator never fatal */ }
@@ -1174,6 +1276,78 @@
     }).join(' and ');
   }
   function opWord(op) { return { eq: 'is', neq: 'is not', contains: 'contains', ncontains: 'excludes', gt: '>', gte: '≥', lt: '<', lte: '≤' }[op] || op; }
+
+  // ── EO notation: read the query back in the operator algebra ───────────────
+  // The app's whole model is nine operators (see README). A *read* query has a
+  // natural decomposition into the same algebra, so the Ask view can show you
+  // exactly how it understood the question before you trust the number:
+  //   SEG ｜ scope to a table/partition      EVA ⊨ a filter predicate
+  //   CON ⤫ follow a relationship/foreign key SYN △ an aggregate (rows → a whole)
+  //   REC ⊛ recontextualize (group-by / a math transform on the value)
+  //   DEF ⊢ set the read frame (sort / window) NUL ∅ an unbound observation
+  // These are descriptive only — eoTrace never emits an operator to the log
+  // (this module is read-only). Presented in reading order (scope → filter →
+  // group → aggregate → frame), which is how a person reads a query.
+  const EO_OPS = {
+    NUL: { glyph: '∅', word: 'Observe' },
+    SIG: { glyph: '○', word: 'Attend' },
+    INS: { glyph: '●', word: 'Instantiate' },
+    SEG: { glyph: '｜', word: 'Segment' },
+    CON: { glyph: '⤫', word: 'Connect' },
+    SYN: { glyph: '△', word: 'Synthesize' },
+    DEF: { glyph: '⊢', word: 'Define' },
+    EVA: { glyph: '⊨', word: 'Evaluate' },
+    REC: { glyph: '⊛', word: 'Recontextualize' },
+  };
+  function eoFilterPhrase(f) {
+    if (f.op === 'empty') return f.field + ' is empty';
+    if (f.op === 'notempty') return f.field + ' is set';
+    return f.field + ' ' + opWord(f.op) + ' ' + f.value;
+  }
+  // Accepts a finalized result spec OR a raw plan (both carry type/filters/agg/
+  // sort/limit/arith) and returns ordered steps { op, glyph, name, word, label,
+  // detail, dim? }.
+  function eoTrace(spec) {
+    if (!spec) return [];
+    const steps = [];
+    const add = (op, label, detail, extra) => steps.push(Object.assign(
+      { op, glyph: EO_OPS[op].glyph, name: op, word: EO_OPS[op].word, label, detail: detail || null }, extra || {}));
+    const intent = spec.intent;
+    const target = spec.target != null ? spec.target : spec.record;
+    const q = spec.question ? String(spec.question).replace(/[?.!]+$/, '') : '';
+    if (intent === 'calc') { add('SYN', 'compute' + (q ? ' ' + q : ''), 'arithmetic'); return steps; }
+    if (intent === 'profile') {
+      add('SEG', spec.type || 'all records', 'scope');
+      if (target) add('EVA', 'name is “' + target + '”', 'locate record');
+      add('CON', 'follow links', 'related records');
+      return steps;
+    }
+    if (intent === 'search' || !spec.type) {
+      add('NUL', 'scan all records', q ? '“' + q + '”' : 'free-text');
+      return steps;
+    }
+    add('SEG', spec.type, 'partition');
+    for (const f of (spec.filters || [])) add('EVA', eoFilterPhrase(f), 'filter');
+    if (spec.agg && spec.agg.groupBy) add('REC', 'by ' + spec.agg.groupBy, 'group');
+    if (spec.agg) add('SYN', aggLabel(spec.agg), 'aggregate');
+    if (spec.sort) add('DEF', 'order by ' + spec.sort.field + ' ' + spec.sort.dir, 'sort');
+    if (spec.limit) add('DEF', 'first ' + spec.limit, 'window');
+    if (spec.arith) {
+      const a = spec.arith;
+      const label = a.base != null
+        ? Number(a.base).toLocaleString() + ' ' + a.symbol + ' ' + a.operand + ' = ' + Number(a.result).toLocaleString()
+        : a.symbol + ' ' + a.operand;
+      add('REC', label, a.engine || 'math');
+    }
+    for (const u of (spec.unmapped || [])) add('NUL', 'unmatched: ' + u, 'not bound', { dim: true });
+    return steps;
+  }
+  function attachEO(result) {
+    if (result && result.spec && !result.spec.eo) {
+      try { result.spec.eo = eoTrace(result.spec); } catch (e) { /* never fatal */ }
+    }
+    return result;
+  }
   function titleFor(type, filters, sort, limit) {
     let t = (limit ? 'Top ' + limit + ' ' : '') + plural(type);
     if (filters.length) t += ' ' + whereNote(filters);
@@ -1364,12 +1538,15 @@
     loadModel, ensurePython, pythonReady, ensureAnalysis, describe,
     defaultLLMKey, schemaPrompt, parsePlanJSON,
     maybeTypeConfirm, maybeFloodConfirm,
+    // EO-notation read-back of a query (also the query the Ask view renders so
+    // you can confirm the interpretation) + the arithmetic/value-anchor parsers.
+    eoTrace, EO_OPS, parseArithmetic, applyArith, parseValueAnchoredFilters,
     // pure helpers (exposed for tests + the chat view's profile popup)
     recordLabel, knownTypes, fieldsForType, columnsForType, preferredColumns, entitiesOfType,
     matchType, matchTypeScored, resolveField, validateFilters, applyFilters, parseFilters,
     parseAggregate, aggregate, parseSort, parseLimit, sortRecords, relatedRecords,
     linkedTypesFor, resolveRecord, globalSearch, selectFieldsForPrompt,
-    parseValueFilters, fieldForValue, displayValue, plural, _version: '3',
+    fieldForValue, displayValue, plural, _version: '3',
   };
   if (typeof window !== 'undefined') window.DataChat = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
