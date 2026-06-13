@@ -848,6 +848,24 @@ function App() {
     [importEntities]
   );
 
+  // Source blobs of *superseded* import generations. A re-synced Airtable
+  // base+table uploads a fresh blob each time; the old generation stops
+  // materializing (CsvImport.activeImports keeps only the newest per group) but
+  // its mirrored blob lingers in OPFS forever — unbounded growth across
+  // re-syncs. Collect the dead mxcs (excluding any still referenced by a live
+  // generation) so the sync page can reclaim that disk on demand.
+  const reclaimableMedia = useMemo(() => {
+    const activeMxc = new Set(importEntities.map(e => e.file?.mxc).filter(Boolean));
+    const dead = new Set();
+    for (const e of Object.values(state.entities || {})) {
+      if (e?._type === 'import' && e.file?.mxc &&
+          !activeImportAnchors.has(e._anchor) && !activeMxc.has(e.file.mxc)) {
+        dead.add(e.file.mxc);
+      }
+    }
+    return Array.from(dead);
+  }, [state, importEntities, activeImportAnchors]);
+
   // The table the user is looking at — its import chunks materialize first.
   const activeSet = selection?.tableId || null;
 
@@ -1451,6 +1469,11 @@ function App() {
               pendingPart={pendingPart.length}
               eventsTotal={total}
               scrubber={scrubberEl}
+              reclaimableMedia={reclaimableMedia}
+              onReclaimMedia={() =>
+                window.MatrixLive?.purgeMediaBlobs
+                  ? window.MatrixLive.purgeMediaBlobs(reclaimableMedia)
+                  : Promise.resolve({ removed: 0, bytes: 0 })}
               onRefreshTables={() => {
                 // Restart the self-healing retry loop from scratch (in case it
                 // exhausted its patience on a slow/cold download).

@@ -214,6 +214,45 @@ export async function getCachedMediaBytes(mxc) {
 }
 
 /**
+ * Delete the locally-mirrored blobs for a specific set of mxc URIs.
+ *
+ * Unlike wipeMediaCache (logout — drops everything), this is the targeted
+ * reclaim used by the sync page to drop blobs that are still on disk but no
+ * longer referenced by the live workspace — the classic case being the source
+ * blobs of *superseded* import generations (a re-synced Airtable table uploads
+ * fresh blobs each time; the old generation's rows stop materializing but its
+ * mirror lingers forever). Each entry is keyed by the same mxc→filename hash
+ * the cache writer uses, so a caller that knows the dead mxcs can free exactly
+ * their bytes. Returns `{ removed, bytes }`. Best-effort; a blob that was never
+ * mirrored (or already gone) is skipped silently. Deleting a blob that turns
+ * out to still be wanted is non-destructive: it simply re-downloads on next
+ * read, exactly as on a fresh device.
+ */
+export async function purgeMediaByMxc(mxcList) {
+  const result = { removed: 0, bytes: 0 };
+  if (!Array.isArray(mxcList) || mxcList.length === 0) return result;
+  const root = await getOpfsRoot();
+  if (!root) return result;
+  const seen = new Set();
+  for (const mxc of mxcList) {
+    if (!mxc || seen.has(mxc)) continue;
+    seen.add(mxc);
+    try {
+      const name = await mxcToFileName(mxc);
+      let size = 0;
+      try { size = (await (await root.getFileHandle(name)).getFile()).size; }
+      catch { continue; }   // not mirrored — nothing to reclaim
+      await root.removeEntry(name);
+      result.removed++;
+      result.bytes += size;
+    } catch (e) {
+      console.warn('[media] purge failed for', mxc, e?.message || e);
+    }
+  }
+  return result;
+}
+
+/**
  * Wipe every cached media blob from OPFS. Called on logout.
  */
 export async function wipeMediaCache() {

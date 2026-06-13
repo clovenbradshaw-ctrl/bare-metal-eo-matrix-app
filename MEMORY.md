@@ -174,3 +174,48 @@ Edit the constants in `src/main.js` (`MAX_OPEN_ROOMS`, `MEMORY_BUDGET_BYTES`)
 and `src/memory.js` (`SOFT_FRACTION`, `CRITICAL_FRACTION`,
 `SAMPLE_INTERVAL_MS`). Lower `MAX_OPEN_ROOMS` to 1 if your rooms are very
 large; raise the budget if you target desktop-only and want fewer reloads.
+
+## Storage is not memory (the sync page)
+
+Everything above is about the tab's **heap** (RAM). The number that alarms
+users is usually **on-disk origin storage** — the "Sync & storage" page's
+device section — and it has different consumers, none of which the heap
+governor sees. The whole origin lives in four buckets:
+
+| Bucket | What | Where it's measured |
+|--------|------|---------------------|
+| **OPFS** | this app's own cache — per-room event logs (`room_*.bin`, ~binary, tiny) + the vault-encrypted media mirror (`media_*`, where imported source blobs live) | `getOpfsBreakdown` in `src/store.js` |
+| **IndexedDB** | the matrix-js-sdk **Rust-crypto store** — every megolm session + device key for the user's *whole account*, not just this app's rooms — plus the outbox | `usageDetails.indexedDB` from `navigator.storage.estimate()` |
+| **Cache Storage** | the Service Worker app shell (`sw.js`) — `babel.js` (~3 MB), `react-dom.js`, the source files | `getCacheStorageUsage` in `src/store.js`, or `usageDetails.caches` |
+| **localStorage** | vault meta, session token, small caches | negligible |
+
+The surprise in "why is this 'lightweight binary app' holding gigabytes" is
+almost always the **encryption store**: it scales with the account's entire
+Matrix footprint and is invisible to both the heap governor (it's native +
+WASM-backed IDB) and the old OPFS-only breakdown. `getStorageStatus`
+(`src/main.js`) now returns `usageDetails`, a measured `caches` figure, the
+IndexedDB database names, and an `estimateReliable` flag, so the page itemizes
+all four buckets instead of showing only OPFS against a whole-origin total.
+
+Two footguns the page now handles:
+
+* **Fuzzed estimates.** Brave and Tor randomize `navigator.storage.estimate()`
+  for fingerprint resistance, which is why a real session can report
+  `usage > quota` (impossible) pinned at 100%. When `usage > quota` the page
+  flags the estimate as unreliable and leads with `measuredBytes` (OPFS +
+  Cache Storage, counted directly).
+* **Orphaned import blobs.** Re-syncing an Airtable base uploads a *fresh*
+  source blob per generation; `CsvImport.activeImports` drops the old
+  generation from the fold, but its mirrored OPFS blob lingers forever —
+  unbounded growth across re-syncs. `app.jsx` collects the superseded mxcs
+  (`reclaimableMedia`) and the sync page's **Reclaim** button calls
+  `ML.purgeMediaBlobs` (`purgeMediaByMxc` in `src/media.js`) to free exactly
+  those bytes. Dropping a still-wanted blob is non-destructive — it
+  re-downloads on next read — so the reclaim is safe even if over-eager.
+
+The encryption store itself isn't pruned from the app (matrix-js-sdk doesn't
+expose a safe per-room session delete, and this stack's recovery design makes
+the crypto store *disposable* anyway): signing out and back in, or "Clear all"
+in tweaks, rebuilds it from the homeserver while this workspace's history comes
+back from the durable block chain. The page surfaces that guidance when the
+IndexedDB bucket dominates.

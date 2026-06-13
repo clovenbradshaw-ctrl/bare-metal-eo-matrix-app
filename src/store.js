@@ -512,6 +512,45 @@ export async function getOpfsBreakdown() {
 }
 
 /**
+ * Measure the Cache Storage (Service Worker app-shell cache) footprint.
+ *
+ * This is part of "what this app holds locally" but lives outside OPFS, so
+ * getOpfsBreakdown never sees it — the sync page would otherwise undercount
+ * the real on-device total. Sizes come from each cached response's
+ * Content-Length header (the SW only caches same-origin `basic` responses,
+ * which carry it); we avoid reading bodies so this stays cheap enough to call
+ * on the sync page's refresh interval. Best-effort: resolves to zeros when the
+ * Cache API is unavailable rather than throwing.
+ */
+export async function getCacheStorageUsage() {
+  const out = { bytes: 0, entries: 0, caches: [] };
+  if (typeof caches === 'undefined') return out;
+  try {
+    const names = await caches.keys();
+    for (const name of names) {
+      const cache = await caches.open(name);
+      const reqs = await cache.keys();
+      let bytes = 0;
+      for (const req of reqs) {
+        try {
+          const resp = await cache.match(req);
+          if (!resp) continue;
+          const len = resp.headers.get('content-length');
+          if (len) bytes += parseInt(len, 10) || 0;
+          else { try { bytes += (await resp.clone().blob()).size; } catch {} }
+        } catch {}
+      }
+      out.caches.push({ name, entries: reqs.length, bytes });
+      out.bytes += bytes;
+      out.entries += reqs.length;
+    }
+  } catch (e) {
+    console.warn('[store] cache-storage measure failed:', e?.message || e);
+  }
+  return out;
+}
+
+/**
  * Wipe every room file and checkpoint from OPFS. Called on logout.
  */
 export async function wipeAllRoomData() {
