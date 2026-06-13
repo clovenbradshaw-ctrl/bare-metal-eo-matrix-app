@@ -17,13 +17,22 @@
 const { useState, useEffect, useRef, useMemo, useCallback } = React;
 const DC = () => window.DataChat;
 
-// On-device intent models offered in the Smart-parse picker. CPU (wllama) only
-// — never the cloud (Anthropic) backend, so phrasing/parse stay fully local.
+// On-device intent models. CPU (wllama) only — never the cloud (Anthropic)
+// backend, so phrasing/parse stay fully local. Smallest first: it's the
+// auto-load default, which keeps the memory footprint sane on big workspaces.
 const LOCAL_MODELS = [
-  { key: 'wllama:smollm2-360m', label: 'SmolLM2 360M · fast, ~270 MB' },
-  { key: 'wllama:qwen25-05b',   label: 'Qwen2.5 0.5B · recommended, ~380 MB' },
+  { key: 'wllama:smollm2-360m', label: 'SmolLM2 360M · light, ~270 MB' },
+  { key: 'wllama:qwen25-05b',   label: 'Qwen2.5 0.5B · balanced, ~380 MB' },
   { key: 'wllama:llama32-1b',   label: 'Llama 3.2 1B · best, ~770 MB' },
 ];
+
+// A short restatement of what a result actually queried, shown above the answer
+// so a misread is obvious at a glance. Skips kinds where it would just be noise.
+function restateOf(result) {
+  if (!result || result.kind === 'confirm' || result.kind === 'empty') return '';
+  if (result.kind === 'answer' && !(result.spec && result.spec.type)) return '';
+  try { return (DC() && DC().describe) ? DC().describe(result.spec) : ''; } catch (e) { return ''; }
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Profile popup — a record, all its fields, and every related record reached
@@ -264,39 +273,53 @@ function ChatView({ room, state, setSelection }) {
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [profile, setProfile] = useState(null);   // {anchor,type} | null
-  const [smart, setSmart] = useState(false);       // local-LLM intent toggle
-  const [model, setModel] = useState('wllama:qwen25-05b');
-  const [status, setStatus] = useState(null);      // engine/model loading text
+  const [model, setModel] = useState('wllama:smollm2-360m');
+  const [status, setStatus] = useState(null);      // per-question thinking text
+  const [modelStage, setModelStage] = useState('off'); // 'off' | 'loading' | 'ready'
+  const [modelMsg, setModelMsg] = useState('');        // status-pill text
   const scrollRef = useRef(null);
   const stateRef = useRef(state);
   stateRef.current = state;
+  const entityCount = Object.keys(state.entities || {}).length;
 
   const starters = useMemo(() => {
     try { const t = (DC().knownTypes(state) || []); return suggestStarters(state, t); } catch (e) { return []; }
   }, [state && state.cursor, Object.keys(state.entities || {}).length]);
 
-  // Warm the engine (compromise + math + reading engine) when the view opens,
-  // so the first question doesn't also pay the load. Pure-deterministic queries
-  // already work without it; this just enables arithmetic / prose / fuzzy match.
+  // Auto-load the analysis stack once the workspace data is in (Smart parse is
+  // always on — there's no toggle). Order is memory-conscious: the deterministic
+  // engine + math.js first (cheap, always useful), THEN the on-device model
+  // weights, THEN the Python (numpy/pandas) runtime — but only if there's heap
+  // headroom, so we never OOM a big workspace pulling in a WASM stack. Every
+  // step is best-effort: deterministic queries answer immediately regardless,
+  // so a failed or skipped download never blocks asking.
   useEffect(() => {
+    if (!entityCount) return; // wait until the data has loaded
+    const dc = DC();
+    if (!dc || !dc.ensureAnalysis) return;
     let alive = true;
-    if (DC() && DC().ensureEngine) {
-      DC().ensureEngine().then(() => { if (alive && DC().warmEmbeddings) DC().warmEmbeddings(); }).catch(() => {});
-    }
+    setModelStage('loading'); setModelMsg('Loading engine…');
+    dc.ensureAnalysis({
+      modelKey: model,
+      loadPython: true,
+      onModelProgress: (p) => {
+        if (!alive) return;
+        const pct = p && typeof p.progress === 'number' ? Math.round(p.progress * 100) : null;
+        setModelMsg(`Installing model${pct != null ? ` · ${pct}%` : '…'}`);
+      },
+      onStatus: (s) => { if (alive) setModelMsg(s); },
+    }).then((caps) => {
+      if (!alive) return;
+      if (dc.warmEmbeddings) dc.warmEmbeddings();
+      if (caps && caps.model) { setModelStage('ready'); setModelMsg(caps.python ? 'Model + Python ready' : 'Model ready · Python off'); }
+      else { setModelStage('off'); setModelMsg('Local parsing'); }
+    }).catch(() => { if (alive) { setModelStage('off'); setModelMsg('Local parsing'); } });
     return () => { alive = false; };
-  }, []);
+  }, [entityCount > 0, model]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages, busy]);
-
-  // When Smart parse is switched on, prefetch the on-device LLM runtime (the
-  // llm.js + engine scripts) so its load overlaps with the user typing rather
-  // than blocking the first question. This does NOT download model weights —
-  // those stay gated on the first ask, so toggling can't surprise-spend data.
-  useEffect(() => {
-    if (smart && DC() && DC().ensureLLM) DC().ensureLLM().catch(() => {});
-  }, [smart]);
 
   const onOpenProfile = useCallback((anchor, type) => setProfile({ anchor, type }), []);
   const onOpenTable = useCallback((type) => {
@@ -333,10 +356,19 @@ function ChatView({ room, state, setSelection }) {
     setBusy(true);
     setStatus(null);
     try {
+      // Restate the interpretation up front (deterministic + instant) so the
+      // user sees what we're about to run BEFORE the answer comes back.
+      try {
+        const dc = DC();
+        if (dc && dc.buildPlan && dc.describe) {
+          const det = dc.buildPlan(q, stateRef.current);
+          const say = dc.describe(Object.assign({ question: q, target: det.plan.record }, det.plan));
+          if (say) setStatus(say);
+        }
+      } catch (e) { /* restatement is best-effort */ }
       if (DC().ensureEngine) await DC().ensureEngine();
-      if (smart && DC().ensureLLM) { setStatus('Preparing on-device model…'); await DC().ensureLLM(); }
       const opts = {
-        useLLM: smart,
+        useLLM: true,                 // Smart parse is always on
         llmKey: model,
         onModelProgress: (p) => {
           const pct = p && typeof p.progress === 'number' ? Math.round(p.progress * 100) : null;
@@ -353,7 +385,7 @@ function ChatView({ room, state, setSelection }) {
       setBusy(false);
       setStatus(null);
     }
-  }, [busy, smart, model]);
+  }, [busy, model]);
 
   const onSubmit = (e) => { e.preventDefault(); ask(input); };
 
@@ -361,15 +393,16 @@ function ChatView({ room, state, setSelection }) {
     <div className="dc-view">
       <div className="dc-bar">
         <div className="dc-bar-title"><i className="ph ph-chat-circle-dots" aria-hidden="true"></i> Ask {room ? room.title : 'your data'}</div>
-        <label className="dc-smart" title="Use a small on-device model to interpret tricky questions. Runs locally — nothing leaves your browser.">
-          <input type="checkbox" checked={smart} onChange={e => setSmart(e.target.checked)} />
-          <i className="ph ph-sparkle" aria-hidden="true"></i> Smart parse
-        </label>
-        {smart && (
-          <select className="dc-model" value={model} onChange={e => setModel(e.target.value)} title="on-device model">
+        <div className="dc-bar-right">
+          <span className={`dc-status is-${modelStage === 'ready' ? 'ready' : modelStage === 'loading' ? 'loading' : 'off'}`}
+                title="Smart parse is always on: a small model + a local Python (pandas) runtime run entirely in your browser. Nothing leaves the page.">
+            <span className="dc-dot" aria-hidden="true"></span>
+            {modelMsg || (modelStage === 'ready' ? 'Model ready' : 'Local parsing')}
+          </span>
+          <select className="dc-model" value={model} onChange={e => setModel(e.target.value)} title="on-device model — pick a lighter one if memory is tight">
             {LOCAL_MODELS.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}
           </select>
-        )}
+        </div>
       </div>
 
       <div className="dc-thread" ref={scrollRef}>
@@ -386,7 +419,7 @@ function ChatView({ room, state, setSelection }) {
                 {starters.map((s, i) => <button key={i} className="dc-starter" onClick={() => ask(s)}>{s}</button>)}
               </div>
             )}
-            {smart && <p className="dc-note">Smart parse will download a small model the first time you ask ({LOCAL_MODELS.find(m => m.key === model)?.label}). It then runs offline.</p>}
+            <p className="dc-note">Smart parse is always on. A small model ({LOCAL_MODELS.find(m => m.key === model)?.label}) and a local Python (pandas) runtime load automatically once your data is in, then run fully offline — but you can ask right away, since local parsing answers immediately.</p>
           </div>
         )}
 
@@ -396,6 +429,9 @@ function ChatView({ room, state, setSelection }) {
               ? <div className="dc-bubble">{m.text}</div>
               : <div className="dc-assistant">
                   {m.viaLLM && <div className="dc-via">interpreted with on-device model</div>}
+                  {restateOf(m.result) && (
+                    <div className="dc-restate"><i className="ph ph-quotes-fill" aria-hidden="true"></i><span>{restateOf(m.result)}</span></div>
+                  )}
                   <ResultBlock result={m.result} onOpenProfile={onOpenProfile} onOpenTable={onOpenTable} onChooseConfirm={onChooseConfirm} />
                 </div>}
           </div>

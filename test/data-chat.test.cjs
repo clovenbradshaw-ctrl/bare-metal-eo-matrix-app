@@ -324,5 +324,85 @@ const state = {
   r = await DC.interpret('show all pings', floodState, { skipConfirm: true });
   eq('skipConfirm bypasses flood gate', r.kind, 'table');
 
+  // ── implicit value filters: name a VALUE, not the field ────────────────────
+  // The reported bug: "how many clients are from Mexico?" counted *all* clients
+  // because "from Mexico" never became a filter (Mexico isn't a select option,
+  // and the user never named the "Country" field). The parser now resolves a
+  // named value to whichever field carries it — free text OR select — so the
+  // natural phrasing works without naming the field or toggling the LLM.
+  const geoState = {
+    entities: {
+      g1: ent('g1', 'Client Info', { Name: 'Acme', Country: 'Mexico', Nationality: 'Mexican' }),
+      g2: ent('g2', 'Client Info', { Name: 'Globex', Country: 'United States', Nationality: 'American' }),
+      g3: ent('g3', 'Client Info', { Name: 'Initech', Country: 'México', Nationality: 'Mexican' }),
+      g4: ent('g4', 'Client Info', { Name: 'Umbrella', Country: 'Canada', Nationality: 'Canadian' }),
+    },
+    connections: [],
+    partitions: {},
+    schema: {
+      tables: ['Client Info'],
+      fields: {
+        'Client Info': [
+          { name: 'Name', type: 'text' },
+          { name: 'Country', type: 'text' },                                   // free text
+          { name: 'Nationality', type: 'select', options: ['Mexican', 'American', 'Canadian'] },
+        ],
+      },
+      links: [],
+    },
+    cursor: 4,
+  };
+
+  // the exact question from the bug report → a count of just the Mexican clients
+  r = await DC.interpret('how many clients are from mexico?', geoState);
+  eq('from-mexico count → value', r.kind, 'value');
+  eq('from-mexico count is 2 (not all 4)', r.value, 2);
+  ok('from-mexico restated the filter', /Country/i.test(r.note || ''));
+
+  // accent-folding both ways: ASCII query matches "México", and the executor
+  // matches what the resolver found (Mexico + México = 2).
+  r = await DC.interpret('clients from méxico', geoState);
+  eq('accented query → table', r.kind, 'table');
+  eq('accent-folded rows', r.rows.length, 2);
+
+  // a value that lives in a SELECT field resolves to that field's option
+  r = await DC.interpret('how many clients are mexican', geoState);
+  eq('mexican (select option) count', r.value, 2);
+
+  // "in <place>" works too, and the field stays implicit
+  r = await DC.interpret('clients in canada', geoState);
+  eq('in-canada rows', r.rows.length, 1);
+
+  // value filters surface via parseValueFilters / fieldForValue directly
+  const vf = DC.parseValueFilters('clients from mexico', DC.fieldsForType(geoState, 'Client Info'), geoState, 'Client Info', []);
+  ok('parseValueFilters finds Country', vf.length === 1 && vf[0].field === 'Country');
+  const ff = DC.fieldForValue(geoState, 'Client Info', DC.fieldsForType(geoState, 'Client Info'), 'canada');
+  ok('fieldForValue resolves a bare value', ff && ff.field === 'Country');
+
+  // NO false positives: a phrase that only renames the table adds no filter,
+  // and a plain "all" question stays unfiltered.
+  r = await DC.interpret('sum of priority in cases', state);
+  eq('“in cases” adds no bogus filter — sum still 15', r.value, 15);
+  r = await DC.interpret('show all clients', geoState);
+  ok('all clients → no value filter', (r.spec.filters || []).length === 0 && r.rows.length === 4);
+
+  // ── restatement: describe() mirrors the executed query ─────────────────────
+  r = await DC.interpret('how many clients are from mexico?', geoState);
+  ok('describe restates the count + filter', /count/i.test(DC.describe(r.spec)) && /Country/i.test(DC.describe(r.spec)));
+  r = await DC.interpret('show all clients', geoState);
+  ok('describe restates an unfiltered list', /all clients/i.test(DC.describe(r.spec)) && !/where/i.test(DC.describe(r.spec)));
+  r = await DC.interpret('count cases by status', state);
+  ok('describe restates a grouped count', /grouped by/i.test(DC.describe(r.spec)));
+  eq('describe handles a profile', DC.describe({ intent: 'profile', target: 'Acme Corp' }), 'Opening the profile for “Acme Corp”.');
+
+  // ── crash-proofing: interpret never throws, even on a hostile state ─────────
+  let threw = false;
+  try {
+    const bad = { entities: { x: { _anchor: 'x', _type: 'T', f: { nested: 1 } } }, get connections() { throw new Error('boom'); }, schema: { tables: ['T'] }, cursor: 1 };
+    const safe = await DC.interpret('how many T from anywhere', bad);
+    ok('interpret recovers from a throwing state', safe && typeof safe.kind === 'string');
+  } catch (e) { threw = true; }
+  ok('interpret did not propagate the throw', threw === false);
+
   console.log(`data-chat.test: ${passed} assertions passed`);
 })().catch(e => { console.error(e); process.exit(1); });
