@@ -203,6 +203,13 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
  * wide tables don't push the "open record" affordance off-screen. */
 .dbgrid td.add-col-spacer{background:var(--surface-3);border-left:1px dashed var(--border);color:var(--text-faint);text-align:center;cursor:pointer;font-size:12px;width:48px;position:sticky;right:0;z-index:2}
 .dbgrid td.add-col-spacer:hover{background:#fff;color:var(--text-bright)}
+/* Row-expand rail — pinned to the LEFT edge of the scrolling viewport so wide
+ * tables keep the "open record" affordance reachable. Mirror of the add-column
+ * rail on the right. */
+.dbgrid th.row-expand-head{width:48px;padding:0;background:var(--surface-3);border-right:1px dashed var(--border);position:sticky;top:0;left:0;z-index:4}
+.dbgrid td.row-expand{background:var(--surface-3);border-right:1px dashed var(--border);color:var(--text-faint);text-align:center;cursor:pointer;font-size:14px;line-height:1;width:48px;position:sticky;left:0;z-index:2}
+.dbgrid td.row-expand:hover{background:#fff;color:var(--text-bright);font-weight:700}
+.dbgrid td.row-expand-spacer{background:var(--surface-3);border-right:1px dashed var(--border);width:48px;position:sticky;left:0;z-index:2}
 
 /* formula field column styling */
 .dbgrid th.formula{background:var(--surface-3);color:var(--text-dim);font-style:italic}
@@ -505,10 +512,6 @@ input:focus,textarea:focus,select:focus{border-color:#000;box-shadow:inset 0 0 0
 .tv-hide-name{font-weight:600}
 .tv-hide-kind{margin-left:auto;font-size:9.5px;text-transform:uppercase;letter-spacing:1px;color:var(--text-faint);font-weight:700}
 
-/* Row-expand affordance — opens the record detail side panel */
-.dbgrid td.row-expand{font-size:14px;line-height:1}
-.dbgrid td.row-expand:hover{color:var(--text-bright);font-weight:700}
-
 /* Record detail side panel — slides in from the right when a row is expanded */
 .record-detail-backdrop{position:fixed;inset:0;z-index:300;background:rgba(20,18,12,.18);animation:rd-fade .12s ease-out}
 .record-detail-panel{position:fixed;top:0;right:0;height:100%;width:440px;max-width:92vw;background:#fff;border-left:1px solid var(--border-strong);box-shadow:-22px 0 50px -18px rgba(0,0,0,.4);z-index:301;display:flex;flex-direction:column;font-family:var(--mono);animation:rd-slide .16s ease-out}
@@ -614,7 +617,7 @@ table.dbgrid th,table.dbgrid td{padding:7px 12px;text-align:left;vertical-align:
 table.dbgrid:not(.schema-grid) th,table.dbgrid:not(.schema-grid) td{min-width:var(--col-min-w);max-width:var(--col-default-w);overflow:hidden;text-overflow:ellipsis}
 /* Utility columns (add-column rail, row-expand, the no-content gutters) keep
    their own tight widths — don't let the default band stretch them. */
-table.dbgrid th.add-col,table.dbgrid td.add-col-spacer,table.dbgrid td.row-expand{min-width:0}
+table.dbgrid th.add-col,table.dbgrid td.add-col-spacer,table.dbgrid td.row-expand,table.dbgrid th.row-expand-head,table.dbgrid td.row-expand-spacer{min-width:0}
 table.dbgrid th.add-col{overflow:visible}
 table.dbgrid th:last-child,table.dbgrid td:last-child{border-right:none}
 table.dbgrid thead th{background:var(--surface-3);color:var(--text);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:1.3px;position:sticky;top:0;z-index:3;border-bottom:2px solid var(--border-strong);box-shadow:inset 0 -2px 0 var(--border-strong)}
@@ -723,7 +726,7 @@ table.dbgrid.schema-grid tr:hover .schema-remove-btn{color:var(--text-dim);borde
 /* ── Stable column widths so adding a column doesn't jump existing ones ─ */
 table.dbgrid th, table.dbgrid td.cell{min-width:120px}
 table.dbgrid th.pk, table.dbgrid td.anchor{min-width:90px}
-table.dbgrid th.add-col, table.dbgrid td.add-col-spacer{min-width:0;width:48px}
+table.dbgrid th.add-col, table.dbgrid td.add-col-spacer, table.dbgrid th.row-expand-head, table.dbgrid td.row-expand, table.dbgrid td.row-expand-spacer{min-width:0;width:48px}
 table.dbgrid thead th.editable{cursor:pointer}
 table.dbgrid thead th.editable:hover{background:var(--surface-2)}
 
