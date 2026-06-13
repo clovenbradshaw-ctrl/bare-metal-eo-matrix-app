@@ -373,7 +373,14 @@ function Sidebar({
   }
 
   function openTable(t) {
-    setSelection({ kind: 'slice', sliceId: `${t.id}.table`, tableId: t.id, sliceKind: 'table' });
+    // Meta sets (_synthesis, _violations) have no schema page — fall back to
+    // their data table. For real entity sets, the table name lands on the
+    // overview: stats + the schema rendered as a table.
+    if (t.kind === 'meta') {
+      setSelection({ kind: 'slice', sliceId: `${t.id}.table`, tableId: t.id, sliceKind: 'table' });
+    } else {
+      setSelection({ kind: 'slice', sliceId: `${t.id}.schema`, tableId: t.id, sliceKind: 'schema' });
+    }
     setCollapsed(s => ({ ...s, [t.id]: false }));
   }
   function openSchema(t) {
@@ -419,7 +426,7 @@ function Sidebar({
           <button
             className="sb-table-link"
             onClick={() => openTable(t)}
-            title="open this set's data"
+            title={t.kind === 'meta' ? "open this set's data" : "overview · stats and the schema as a table"}
           >
             <span className="sb-table-name">{t.name}</span>
             {!t.declared && t.kind !== 'meta' && (
