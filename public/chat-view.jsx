@@ -290,6 +290,14 @@ function ChatView({ room, state, setSelection }) {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages, busy]);
 
+  // When Smart parse is switched on, prefetch the on-device LLM runtime (the
+  // llm.js + engine scripts) so its load overlaps with the user typing rather
+  // than blocking the first question. This does NOT download model weights —
+  // those stay gated on the first ask, so toggling can't surprise-spend data.
+  useEffect(() => {
+    if (smart && DC() && DC().ensureLLM) DC().ensureLLM().catch(() => {});
+  }, [smart]);
+
   const onOpenProfile = useCallback((anchor, type) => setProfile({ anchor, type }), []);
   const onOpenTable = useCallback((type) => {
     setSelection && setSelection({ kind: 'slice', sliceId: `${type}.table`, tableId: type, sliceKind: 'table' });
