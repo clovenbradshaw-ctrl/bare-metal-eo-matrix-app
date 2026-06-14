@@ -38,6 +38,8 @@
     const bump = useCallback(() => setTick(t => t + 1), []);
     const [token, setToken] = useState('');
     const [busy, setBusy] = useState('');     // 'share' | 'revoke' | 'sweep' | ''
+    const [sweepingTable, setSweepingTable] = useState(''); // table name being manually synced
+    const [sweptAt, setSweptAt] = useState({}); // table name → ts of its last manual sync
     const [error, setError] = useState('');
     const mounted = useRef(true);
 
@@ -84,6 +86,15 @@
       try { await window.AirtableSync.sweepNow(); if (mounted.current) bump(); }
       catch (e) { if (mounted.current) setError(e?.message || String(e)); }
       finally { if (mounted.current) setBusy(''); }
+    }
+    async function onSweepTable(name) {
+      if (!window.AirtableSync?.sweepTable || sweepingTable) return;
+      setSweepingTable(name); setError('');
+      try {
+        await window.AirtableSync.sweepTable(name);
+        if (mounted.current) { setSweptAt(m => ({ ...m, [name]: Date.now() })); bump(); }
+      } catch (e) { if (mounted.current) setError(e?.message || String(e)); }
+      finally { if (mounted.current) setSweepingTable(''); }
     }
 
     const pull = cs.pull || { running: false };
@@ -215,6 +226,9 @@
                 Pulling FROM Airtable is turn-based so clients don't all replay the same
                 changes and race the cursor. Raise your hand to take a turn — exactly one
                 member pulls at a time, and the turn passes on automatically if they drop off.
+                {cs.iAmActive
+                  ? ' It’s your turn: re-sync the whole base or refresh individual tables on demand below.'
+                  : ' Once it’s your turn you can re-sync the whole base or refresh individual tables on demand.'}
               </span>
               <button
                 className={`sync-btn ${cs.myHandRaised ? '' : 'primary'}`}
@@ -231,6 +245,38 @@
                 </button>
               )}
             </div>
+
+            {/* ── Per-table manual sync (active puller only) ── */}
+            {cs.iAmActive && (pull.watching?.length > 0) && (
+              <div style={{ marginTop: 12 }}>
+                <div className="sync-substats" style={{ marginTop: 0, marginBottom: 8 }}>
+                  <span>
+                    Sync a single table from Airtable now — re-snapshots just that
+                    table without disturbing the others' live diff stream.
+                  </span>
+                </div>
+                <div className="sync-tables">
+                  {pull.watching.map(name => (
+                    <div className="sync-table-row" key={name}>
+                      <span className="sync-table-name">{name}</span>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
+                        {sweptAt[name] && (
+                          <span className="sync-actions-meta">synced {relTime(sweptAt[name])}</span>
+                        )}
+                        <button
+                          className="sync-btn"
+                          onClick={() => onSweepTable(name)}
+                          disabled={!!sweepingTable}
+                          title={`re-snapshot "${name}" from Airtable now`}
+                        >
+                          {sweepingTable === name ? 'syncing…' : 'Sync now'}
+                        </button>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* turn queue */}
             {cs.hands && cs.hands.length > 0 && (
