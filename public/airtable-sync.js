@@ -64,7 +64,8 @@
  *
  *   window.AirtableSync.start({ roomId, baseId, token, getState, emit, log })
  *   window.AirtableSync.stop()
- *   window.AirtableSync.sweepNow()      // force a full re-snapshot
+ *   window.AirtableSync.sweepNow()      // force a full re-snapshot (all tables)
+ *   window.AirtableSync.sweepTable(name)// re-snapshot one watched table now
  *   window.AirtableSync.status()        // { running, cursor, lastSync, lastError, ... }
  *
  * This module is PULL only. The symmetric push (operator log → Airtable upsert
@@ -601,6 +602,40 @@
     return status();
   }
 
+  // ── Single-table manual refresh ──────────────────────────────────────────-
+  // Re-snapshot ONE watched table through the chunked importer (a new import_seq
+  // supersedes that table's prior blob generation — no duplicates) and leave the
+  // webhook + cursor UNTOUCHED, so the diff stream for every OTHER watched table
+  // keeps flowing. Pending diffs for this table replay idempotently onto the
+  // fresh blob (deterministic anchors + last-write-wins DEF), so they converge
+  // rather than duplicate. This is the per-table analogue of recreateAndSweep —
+  // it deliberately does NOT recreate the webhook (that would reset the cursor to
+  // "now" and silently drop pending changes for the tables we didn't sweep).
+  async function sweepOneTable(run, setName) {
+    if (!window.AirtableAPI.importTableChunked) {
+      throw new Error('importTableChunked not exposed — apply the airtable-import.jsx patch');
+    }
+    const byName = new Map((run.parsed.tables || []).map(t => [t.name, t]));
+    const table = byName.get(setName);
+    if (!table) throw new Error(`"${setName}" is not in the base's current schema`);
+    run.log(`sync: manual re-import of ${setName}`);
+    const res = await window.AirtableAPI.importTableChunked({
+      token: run.token, baseId: run.baseId, table, roomId: run.roomId,
+      state: run.getState(),
+      onProgress: (n) => run.log(`re-import ${setName}: ${n} rows`),
+    });
+    run.log(`sync: ${setName} re-imported (${res?.rows ?? 0} row(s))`);
+    return res;
+  }
+
+  async function sweepTable(setName) {
+    if (!RUN) throw new Error('sync not running');
+    if (!setName) throw new Error('sweepTable needs a table name');
+    if (!RUN.watchNames.has(setName)) throw new Error(`"${setName}" is not a watched table`);
+    await sweepOneTable(RUN, setName);
+    return status();
+  }
+
   // Per-cycle context handed to the translators.
   function makeCtx(run) {
     return {
@@ -620,5 +655,5 @@
     return out;
   }
 
-  window.AirtableSync = { start, stop, sweepNow, status, anchorFor, ORIGIN, DELETED_PARTITION };
+  window.AirtableSync = { start, stop, sweepNow, sweepTable, status, anchorFor, ORIGIN, DELETED_PARTITION };
 })();
