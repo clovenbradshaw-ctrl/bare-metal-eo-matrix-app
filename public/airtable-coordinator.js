@@ -61,6 +61,44 @@
     return state?.schema?.sync?.airtable?.[baseId]?.runner || null;
   }
 
+  // Airtable tables this workspace has imported ROWS for, by set name (from the
+  // import entities — always available, but misses tables imported empty).
+  function importDerivedTables(state, baseId) {
+    const out = [];
+    const seen = new Set();
+    for (const e of Object.values(state?.entities || {})) {
+      if (e?._type === 'import' && e.source === 'airtable' &&
+          e.airtable_base === baseId && e.derived_set && !seen.has(e.derived_set)) {
+        seen.add(e.derived_set);
+        out.push(e.derived_set);
+      }
+    }
+    return out;
+  }
+
+  // Every Airtable source this workspace has from `baseId`, for the Sync page's
+  // per-table list. Prefer the live base-table list (fetched once with the shared
+  // token — includes tables that were empty at import), intersected with what the
+  // workspace actually declared/imported. Fall back to the engine's persisted
+  // watch list, then to the import-derived names, so SOMETHING shows before the
+  // schema fetch or a puller run has happened.
+  function airtableTablesFor(state, baseId, baseTableNames) {
+    const imported = importDerivedTables(state, baseId);
+    if (Array.isArray(baseTableNames) && baseTableNames.length) {
+      const declared = new Set(state?.schema?.tables || []);
+      const importedSet = new Set(imported);
+      const out = baseTableNames.filter(n => declared.has(n) || importedSet.has(n));
+      // A table imported AFTER the base-table list was cached won't be in it yet;
+      // make sure it still shows rather than vanishing until the next refresh.
+      const have = new Set(out);
+      for (const n of imported) if (!have.has(n)) out.push(n);
+      return out;
+    }
+    const persisted = state?.schema?.sync?.airtable?.[baseId]?.tables;
+    if (Array.isArray(persisted) && persisted.length) return persisted;
+    return imported;
+  }
+
   const Coord = {
     _ctx: null,            // { roomId, baseId, userId, displayName, getState, emit, log }
     _unsub: null,          // MatrixLive subscription
@@ -72,6 +110,8 @@
     _listeners: new Set(),
     _lastStatus: null,
     _pushStarted: false,
+    _baseTables: null,     // base-table names (fetched once with the token) for the per-table UI
+    _baseTablesInflight: false,
 
     attach(ctx) {
       if (!ctx || !ctx.roomId || !ctx.baseId || !ctx.userId ||
@@ -85,6 +125,8 @@
       if (!same) {
         this._badSince = 0;
         this._token = null;
+        this._baseTables = null;
+        this._baseTablesInflight = false;
         const ML = window.MatrixLive;
         if (ML?.subscribe) {
           this._unsub = ML.subscribe((reason) => {
@@ -113,6 +155,8 @@
       this._ctx = null;
       this._token = null;
       this._badSince = 0;
+      this._baseTables = null;
+      this._baseTablesInflight = false;
     },
 
     // ── Hand controls (emit into the fold; every client re-elects) ──
@@ -173,6 +217,51 @@
       return this._token;
     },
 
+    // Fetch the base's table list ONCE (with the shared token) so the Sync page
+    // can list every Airtable source — including tables imported empty, which
+    // carry no import entity and so are invisible to the import-derived fallback.
+    // Cached for the life of the attachment; failures leave it null to retry.
+    async _ensureBaseTables(token) {
+      if (this._baseTables || this._baseTablesInflight || !token) return;
+      const c = this._ctx; if (!c) return;
+      if (!window.AirtableAPI?.fetchBaseSchema || !window.AirtableSchema?.parse) return;
+      this._baseTablesInflight = true;
+      try {
+        const schemaJson = await window.AirtableAPI.fetchBaseSchema(token, c.baseId);
+        const parsed = window.AirtableSchema.parse(schemaJson);
+        const names = (parsed.tables || []).map(t => t && t.name).filter(Boolean);
+        if (this._ctx === c) { this._baseTables = names; this._emitChange(); }
+      } catch (e) {
+        c.log('airtable: could not list base tables — ' + (e?.message || e));
+      } finally {
+        this._baseTablesInflight = false;
+      }
+    },
+
+    // Re-snapshot ONE table from Airtable on demand. Anyone with the shared token
+    // can do this — it's the per-table "Sync now" the Sync page exposes for every
+    // Airtable source. When WE'RE the running puller and the table is in our live
+    // watch set, use the cursor-preserving sweep (reuses the engine's schema and
+    // leaves the diff stream flowing); otherwise do a standalone one-shot import.
+    async syncTableOnce(tableName) {
+      const c = this._ctx;
+      if (!c) throw new Error('airtable sync is not attached to this workspace');
+      if (!tableName) throw new Error('syncTableOnce needs a table name');
+      const token = await this._resolveToken();
+      if (!token) throw new Error('no Airtable token shared yet — share one above first');
+      const S = window.AirtableSync;
+      if (!S) throw new Error('airtable sync engine not loaded');
+      const st = S.status ? S.status() : null;
+      if (this._running && st?.running && (st.watching || []).includes(tableName) && S.sweepTable) {
+        return S.sweepTable(tableName);
+      }
+      if (!S.syncTableOnce) throw new Error('this build cannot sync a single table on demand');
+      return S.syncTableOnce({
+        roomId: c.roomId, baseId: c.baseId, token, tableName,
+        getState: c.getState, emit: c.emit, log: c.log,
+      });
+    },
+
     _scheduleEval() {
       if (this._evalTimer) return;
       this._evalTimer = setTimeout(() => { this._evalTimer = null; this._evaluate(); }, EVAL_DEBOUNCE_MS);
@@ -182,6 +271,8 @@
       const c = this._ctx;
       if (!c) return;
       const token = await this._resolveToken();
+      // Populate the per-table source list for the Sync page (once, background).
+      this._ensureBaseTables(token);
       // ── PUSH: every member drains their own changes, token permitting. ──
       this._drivePush(token);
       // ── PULL: only the elected member runs the inbound loop. ──
@@ -259,6 +350,9 @@
         })),
         elected,
         iAmActive: elected === c.userId && this._running,
+        // Every Airtable source in this workspace, for the per-table sync list —
+        // available to all members, not just the active puller.
+        airtableTables: airtableTablesFor(state, c.baseId, this._baseTables),
         pull: (window.AirtableSync?.status && window.AirtableSync.status()) || { running: false },
         push: {
           available: pushAvailable,

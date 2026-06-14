@@ -65,8 +65,10 @@
  *   window.AirtableSync.start({ roomId, baseId, token, getState, emit, log })
  *   window.AirtableSync.stop()
  *   window.AirtableSync.sweepNow()      // force a full re-snapshot (all tables)
- *   window.AirtableSync.sweepTable(name)// re-snapshot one watched table now
- *   window.AirtableSync.status()        // { running, cursor, lastSync, lastError, ... }
+ *   window.AirtableSync.sweepTable(name)// re-snapshot one watched table now (needs RUN)
+ *   window.AirtableSync.syncTableOnce({ roomId, baseId, token, tableName, getState, emit })
+ *                                       // one-shot per-table re-snapshot, no RUN / no turn
+ *   window.AirtableSync.status()        // { running, cursor, lastSync, lastError, watching }
  *
  * This module is PULL only. The symmetric push (operator log → Airtable upsert
  * on a `_anchor` merge field) is a separate drain; the provenance hooks it needs
@@ -213,6 +215,19 @@
     return next;
   }
 
+  // Mirror the watched-table NAMES into the persisted sync state so any member's
+  // Sync page can enumerate the Airtable sources (and offer per-table sync)
+  // without being the active puller or re-fetching the base schema. Idempotent —
+  // only emits when the published list actually changed, so re-elections and
+  // restarts don't churn the log.
+  function persistWatchedTables(run) {
+    const names = [...run.watch.values()];
+    const prev = readSyncState(run.getState(), run.baseId)?.tables;
+    const same = Array.isArray(prev) && prev.length === names.length &&
+      prev.every((n, i) => n === names[i]);
+    if (!same) writeSyncState(run.emit, run.getState(), run.baseId, { tables: names });
+  }
+
   // ── Maps derived from the base schema + the existing import entities ───────
   // Webhook payloads key tables and cells by ID; the workspace keys by NAME.
   function buildMaps(parsedSchema) {
@@ -225,15 +240,34 @@
     return { tableNameById, fieldNameById, primaryByTable };
   }
 
-  // Tables this workspace imported from `baseId`, as { id, name } — the watch
-  // set. Derived from import entities so sync follows exactly what was imported.
-  function watchedTables(state, baseId) {
+  // The watch set: every Airtable table from `baseId` that this workspace knows
+  // about, as Map(tableId → setName). Two sources, unioned, so sync follows ALL
+  // imported sources — not just the ones that happened to arrive with rows:
+  //   1. tables we imported ROWS for (an `import` entity exists), and
+  //   2. tables we imported the SCHEMA for but that were EMPTY at import time
+  //      (declared in `_schema.tables`, no import entity — importTableChunked
+  //      only writes a blob when a table has ≥1 row). Without (2) a table that
+  //      was empty when imported would never sync the rows you add to it later
+  //      in Airtable. (2) needs the base schema to map names → real table ids and
+  //      to confirm the declared table actually belongs to this base, so it only
+  //      applies when `parsed` is supplied (after the schema fetch in start()).
+  function watchedTables(state, baseId, parsed) {
     const out = new Map();
+    const importedNames = new Set();
     for (const e of Object.values(state?.entities || {})) {
       if (e?._type !== 'import') continue;
       if (e.source !== 'airtable' || e.airtable_base !== baseId) continue;
       if (!e.derived_set) continue;
       out.set(e.airtable_table || e.derived_set, e.derived_set);
+      importedNames.add(e.derived_set);
+    }
+    if (parsed) {
+      const declared = new Set(state?.schema?.tables || []);
+      for (const t of (parsed.tables || [])) {
+        if (t && t.id && t.name && !importedNames.has(t.name) && declared.has(t.name)) {
+          out.set(t.id, t.name);
+        }
+      }
     }
     return out; // tableId (or name) → set/_type name
   }
@@ -382,10 +416,12 @@
     };
     RUN = run;
 
-    // Resolve the watch set + schema maps once.
+    // Resolve the watch set + schema maps once. The pre-schema check uses the
+    // import-derived set (no `parsed` yet) purely to fail fast when this base was
+    // never imported here; the real watch set is (re)built below once we hold the
+    // base schema, so it can also pick up empty-at-import declared tables.
     const state0 = getState();
-    const watch = watchedTables(state0, baseId);
-    if (watch.size === 0) {
+    if (watchedTables(state0, baseId).size === 0) {
       RUN = null;
       throw new Error(`no Airtable import found for base ${baseId} — import it once before enabling sync`);
     }
@@ -406,9 +442,14 @@
       RUN = null;
       throw new Error('could not read base schema: ' + e.message);
     }
+    const watch = watchedTables(state0, baseId, parsed);
     run.watch = watch;
     run.watchNames = new Set(watch.values());
     run.tableIdByName = invert(watch); // name → id (for fetchRecord/scope)
+    // Publish the watched-table NAMES into the fold so every member's Sync page
+    // can list the Airtable sources (and offer per-table sync) without holding
+    // the puller turn or re-fetching the schema themselves.
+    persistWatchedTables(run);
 
     // Ensure a live webhook + a cursor.
     await ensureWebhook(run);
@@ -636,6 +677,43 @@
     return status();
   }
 
+  // ── One-shot per-table sync, independent of the puller turn ────────────────
+  // Re-snapshot ONE table from Airtable on demand WITHOUT needing the running
+  // engine (RUN) or the raise-hand turn: any member who holds the shared token
+  // can refresh a single table. Like sweepOneTable it re-imports through the
+  // chunked importer (a fresh import_seq supersedes that table's prior generation
+  // — no duplicates) and touches NEITHER the webhook NOR the cursor, so it can't
+  // disturb the active puller's live diff stream. Drives the Sync page's
+  // per-table "Sync now" button for everyone, not just the elected puller.
+  async function syncTableOnce({ roomId, baseId, token, tableName, getState, emit, log = () => {} }) {
+    if (!roomId || !baseId || !token || !tableName ||
+        typeof getState !== 'function' || typeof emit !== 'function') {
+      throw new Error('syncTableOnce needs { roomId, baseId, token, tableName, getState, emit }');
+    }
+    if (!window.AirtableAPI?.importTableChunked || !window.AirtableSchema?.parse) {
+      throw new Error('airtable import/schema not loaded');
+    }
+    // Reuse the running engine's already-parsed schema when it's for this base;
+    // otherwise fetch the base schema once for this call.
+    let table = null;
+    if (RUN && RUN.baseId === baseId && RUN.parsed) {
+      table = (RUN.parsed.tables || []).find(t => t.name === tableName) || null;
+    }
+    if (!table) {
+      const schemaJson = await window.AirtableAPI.fetchBaseSchema(token, baseId);
+      const parsed = window.AirtableSchema.parse(schemaJson);
+      table = (parsed.tables || []).find(t => t.name === tableName) || null;
+    }
+    if (!table) throw new Error(`"${tableName}" is not a table in this Airtable base`);
+    log(`sync: manual re-import of ${tableName}`);
+    const res = await window.AirtableAPI.importTableChunked({
+      token, baseId, table, roomId, state: getState(),
+      onProgress: (n) => log(`re-import ${tableName}: ${n} rows`),
+    });
+    log(`sync: ${tableName} re-imported (${res?.rows ?? 0} row(s))`);
+    return res;
+  }
+
   // Per-cycle context handed to the translators.
   function makeCtx(run) {
     return {
@@ -655,5 +733,5 @@
     return out;
   }
 
-  window.AirtableSync = { start, stop, sweepNow, sweepTable, status, anchorFor, ORIGIN, DELETED_PARTITION };
+  window.AirtableSync = { start, stop, sweepNow, sweepTable, syncTableOnce, status, anchorFor, ORIGIN, DELETED_PARTITION };
 })();
