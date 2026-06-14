@@ -88,10 +88,10 @@
       finally { if (mounted.current) setBusy(''); }
     }
     async function onSweepTable(name) {
-      if (!window.AirtableSync?.sweepTable || sweepingTable) return;
+      if (!Coord?.syncTableOnce || sweepingTable) return;
       setSweepingTable(name); setError('');
       try {
-        await window.AirtableSync.sweepTable(name);
+        await Coord.syncTableOnce(name);
         if (mounted.current) { setSweptAt(m => ({ ...m, [name]: Date.now() })); bump(); }
       } catch (e) { if (mounted.current) setError(e?.message || String(e)); }
       finally { if (mounted.current) setSweepingTable(''); }
@@ -100,6 +100,7 @@
     const pull = cs.pull || { running: false };
     const push = cs.push || { pending: true };
     const elected = cs.elected;
+    const tables = cs.airtableTables || []; // every Airtable source, for per-table sync
 
     return (
       <div className="page-section">
@@ -194,7 +195,7 @@
                 <div className="sync-stat-label">pull ← Airtable</div>
               </div>
               <div className="sync-stat">
-                <div className="sync-stat-value" style={{ fontSize: 13 }}>{pull.watching?.length || 0}</div>
+                <div className="sync-stat-value" style={{ fontSize: 13 }}>{tables.length || pull.watching?.length || 0}</div>
                 <div className="sync-stat-label">tables watched</div>
               </div>
               <div className="sync-stat">
@@ -246,34 +247,41 @@
               )}
             </div>
 
-            {/* ── Per-table manual sync (active puller only) ── */}
-            {cs.iAmActive && (pull.watching?.length > 0) && (
+            {/* ── Per-table sync — every Airtable source, any member, on demand ── */}
+            {tables.length > 0 && (
               <div style={{ marginTop: 12 }}>
                 <div className="sync-substats" style={{ marginTop: 0, marginBottom: 8 }}>
                   <span>
-                    Sync a single table from Airtable now — re-snapshots just that
-                    table without disturbing the others' live diff stream.
+                    Every Airtable source in this workspace. <b>Sync now</b> re-snapshots
+                    just that table from Airtable — available to anyone with the shared
+                    token (no turn needed), and it never disturbs the live diff stream.
                   </span>
                 </div>
                 <div className="sync-tables">
-                  {pull.watching.map(name => (
-                    <div className="sync-table-row" key={name}>
-                      <span className="sync-table-name">{name}</span>
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
-                        {sweptAt[name] && (
-                          <span className="sync-actions-meta">synced {relTime(sweptAt[name])}</span>
-                        )}
-                        <button
-                          className="sync-btn"
-                          onClick={() => onSweepTable(name)}
-                          disabled={!!sweepingTable}
-                          title={`re-snapshot "${name}" from Airtable now`}
-                        >
-                          {sweepingTable === name ? 'syncing…' : 'Sync now'}
-                        </button>
-                      </span>
-                    </div>
-                  ))}
+                  {tables.map(name => {
+                    const live = cs.iAmActive && (pull.watching || []).includes(name);
+                    return (
+                      <div className="sync-table-row" key={name}>
+                        <span className="sync-table-name">
+                          {name}
+                          {live && <span className="sync-table-tag" title="in your live diff stream">live</span>}
+                        </span>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
+                          {sweptAt[name] && (
+                            <span className="sync-actions-meta">synced {relTime(sweptAt[name])}</span>
+                          )}
+                          <button
+                            className="sync-btn"
+                            onClick={() => onSweepTable(name)}
+                            disabled={!!sweepingTable || !info.shared}
+                            title={info.shared ? `re-snapshot "${name}" from Airtable now` : 'share an Airtable token first'}
+                          >
+                            {sweepingTable === name ? 'syncing…' : 'Sync now'}
+                          </button>
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
