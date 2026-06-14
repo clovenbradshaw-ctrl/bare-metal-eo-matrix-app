@@ -1130,10 +1130,37 @@
     if (typeof window === 'undefined' || !window.EOLLM) return null;
     try {
       const models = window.EOLLM.wllamaModels ? window.EOLLM.wllamaModels() : {};
-      if (models['qwen25-05b']) return 'wllama:qwen25-05b';
+      // Prefer the lightest model the host actually serves. The on-device model
+      // only ever emits a small JSON intent plan here, so a tiny model is plenty
+      // — and one that finishes downloading in seconds beats a bigger one that
+      // stalls (the whole "models not loading" complaint). Validate against the
+      // live registry so a stale deployment that lacks an id doesn't hard-fail.
+      for (const id of ['smollm2-135m', 'smollm2-360m', 'qwen25-05b']) {
+        if (models[id]) return 'wllama:' + id;
+      }
       if (window.EOLLM.fallbackKey) return window.EOLLM.fallbackKey();
     } catch (e) {}
     return window.EOLLM.fallbackKey ? window.EOLLM.fallbackKey() : null;
+  }
+
+  // Resolve a requested model key against what the model host ACTUALLY serves.
+  // The wllama registry lives in the separately-deployed eoreader3 llm.js, so a
+  // key this app offers might not exist in the deployed build; rather than fail
+  // the load outright, fall back to the best small model the host does serve.
+  function resolveModelKey(key) {
+    if (typeof window === 'undefined' || !window.EOLLM) return key || null;
+    try {
+      const isW = window.EOLLM.isWllama
+        ? window.EOLLM.isWllama(key)
+        : (typeof key === 'string' && key.indexOf('wllama:') === 0);
+      if (key && isW && window.EOLLM.wllamaModels) {
+        const models = window.EOLLM.wllamaModels() || {};
+        const id = key.slice('wllama:'.length);
+        if (models[id]) return key;            // served as requested
+        return defaultLLMKey();                 // registry mismatch → best available
+      }
+    } catch (e) {}
+    return key || defaultLLMKey();
   }
 
   // Pull the first balanced {...} object out of a model's reply and parse it.
@@ -1446,7 +1473,15 @@
     if (_llmPromise) return _llmPromise;
     _llmPromise = (async () => {
       await ensureEngine();
-      try { if (!window.EOLLM) await loadScript(eoreaderBase() + 'llm.js'); return !!window.EOLLM; }
+      try {
+        if (!window.EOLLM) await loadScript(eoreaderBase() + 'llm.js');
+        // Mark this origin's storage persistent so cached model weights survive
+        // eviction between sessions — otherwise a multi-hundred-MB model can be
+        // silently dropped and re-downloaded every visit. Best-effort; a no-op
+        // where the Storage API or permission is unavailable.
+        try { if (window.EOLLM && window.EOLLM.persistStorage) window.EOLLM.persistStorage(); } catch (_) {}
+        return !!window.EOLLM;
+      }
       catch (e) { return false; }
     })();
     return _llmPromise;
@@ -1458,16 +1493,28 @@
   // chat can actually use it. Idempotent + best-effort — returns false if the
   // model backend (eoreader3 llm.js) or the download isn't available, so a
   // failure here never blocks the deterministic query core.
+  // Why a model load failed, for the UI to surface instead of degrading to
+  // "Local parsing" with no explanation. Set on every loadModel() outcome.
+  let _lastModelError = null;
+  function lastModelError() { return _lastModelError; }
   async function loadModel(key, onProgress) {
     const ready = await ensureLLM();
-    if (!ready || typeof window === 'undefined' || !window.EOLLM || !window.EOLLM.load) return false;
-    const k = key || defaultLLMKey();
-    if (!k) return false;
+    if (!ready || typeof window === 'undefined' || !window.EOLLM || !window.EOLLM.load) {
+      _lastModelError = 'Couldn’t reach the on-device model runtime (network or content blocker).';
+      return false;
+    }
+    const k = resolveModelKey(key);
+    if (!k) { _lastModelError = 'No on-device model is available from the model host.'; return false; }
     try {
-      if (window.EOLLM.isLoaded && window.EOLLM.isLoaded(k)) return true;
+      if (window.EOLLM.isLoaded && window.EOLLM.isLoaded(k)) { _lastModelError = null; return true; }
       const ok = await window.EOLLM.load(k, onProgress);
-      return ok !== false;
-    } catch (e) { return false; }
+      if (ok === false) { _lastModelError = 'The model could not be loaded.'; return false; }
+      _lastModelError = null;
+      return true;
+    } catch (e) {
+      _lastModelError = (e && e.message) ? e.message : 'The model failed to load.';
+      return false;
+    }
   }
 
   // Is there heap headroom to pull in a heavy WASM runtime? This app governs a
@@ -1526,17 +1573,25 @@
     opts = opts || {};
     await ensureEngine();                       // compromise + math.js + EOCompute + EOEmbed
     let model = false, python = false;
+    _lastModelError = null;
     if (opts.loadModel !== false) model = await loadModel(opts.modelKey, opts.onModelProgress).catch(() => false);
+    // Python (Pyodide + numpy + pandas) stays OFF unless explicitly requested:
+    // it's a heavy WASM download that nothing currently queries, so auto-loading
+    // it only starves the model download of bandwidth and the tab of its memory
+    // budget. Kept available (opt-in) for a future pandas-backed analysis step.
     if (opts.loadPython) python = await ensurePython(opts).catch(() => false);
     const w = (typeof window !== 'undefined') ? window : {};
-    return { engine: !!w.EOEngine, math: !!w.math, model: !!model, python: !!python };
+    return {
+      engine: !!w.EOEngine, math: !!w.math, model: !!model, python: !!python,
+      modelError: model ? null : _lastModelError, modelKey: opts.modelKey || null,
+    };
   }
 
   // ── exports ───────────────────────────────────────────────────────────────
   const api = {
     interpret, buildPlan, buildPlanForType, executePlan, planWithLLM, ensureEngine, ensureLLM, warmEmbeddings,
-    loadModel, ensurePython, pythonReady, ensureAnalysis, describe,
-    defaultLLMKey, schemaPrompt, parsePlanJSON,
+    loadModel, lastModelError, ensurePython, pythonReady, ensureAnalysis, describe,
+    defaultLLMKey, resolveModelKey, schemaPrompt, parsePlanJSON,
     maybeTypeConfirm, maybeFloodConfirm,
     // EO-notation read-back of a query (also the query the Ask view renders so
     // you can confirm the interpretation) + the arithmetic/value-anchor parsers.

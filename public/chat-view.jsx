@@ -21,6 +21,7 @@ const DC = () => window.DataChat;
 // backend, so phrasing/parse stay fully local. Smallest first: it's the
 // auto-load default, which keeps the memory footprint sane on big workspaces.
 const LOCAL_MODELS = [
+  { key: 'wllama:smollm2-135m', label: 'SmolLM2 135M · fastest, ~95 MB' },
   { key: 'wllama:smollm2-360m', label: 'SmolLM2 360M · light, ~270 MB' },
   { key: 'wllama:qwen25-05b',   label: 'Qwen2.5 0.5B · balanced, ~380 MB' },
   { key: 'wllama:llama32-1b',   label: 'Llama 3.2 1B · best, ~770 MB' },
@@ -318,10 +319,14 @@ function ChatView({ room, state, setSelection }) {
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [profile, setProfile] = useState(null);   // {anchor,type} | null
-  const [model, setModel] = useState('wllama:smollm2-360m');
+  // Default to the lightest model: ~95 MB downloads in seconds and loads on any
+  // connection, so the on-device path is actually available instead of stalling
+  // on a big fetch. Heavier, higher-quality models are one tap away in the picker.
+  const [model, setModel] = useState('wllama:smollm2-135m');
   const [status, setStatus] = useState(null);      // per-question thinking text
   const [modelStage, setModelStage] = useState('off'); // 'off' | 'loading' | 'ready'
   const [modelMsg, setModelMsg] = useState('');        // status-pill text
+  const [modelErr, setModelErr] = useState('');        // why the model is off, if it failed
   const scrollRef = useRef(null);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -334,31 +339,33 @@ function ChatView({ room, state, setSelection }) {
   // Auto-load the analysis stack once the workspace data is in (Smart parse is
   // always on — there's no toggle). Order is memory-conscious: the deterministic
   // engine + math.js first (cheap, always useful), THEN the on-device model
-  // weights, THEN the Python (numpy/pandas) runtime — but only if there's heap
-  // headroom, so we never OOM a big workspace pulling in a WASM stack. Every
-  // step is best-effort: deterministic queries answer immediately regardless,
-  // so a failed or skipped download never blocks asking.
+  // weights. We deliberately do NOT pull the Python (Pyodide/pandas) runtime —
+  // nothing queries it yet, and downloading it here only starves the model fetch
+  // of bandwidth and the tab of its memory budget. Every step is best-effort:
+  // deterministic queries answer immediately regardless, so a failed or skipped
+  // download never blocks asking.
   useEffect(() => {
     if (!entityCount) return; // wait until the data has loaded
     const dc = DC();
     if (!dc || !dc.ensureAnalysis) return;
     let alive = true;
-    setModelStage('loading'); setModelMsg('Loading engine…');
+    setModelStage('loading'); setModelMsg('Loading engine…'); setModelErr('');
     dc.ensureAnalysis({
       modelKey: model,
-      loadPython: true,
-      onModelProgress: (p) => {
+      onModelProgress: (p, msg) => {
         if (!alive) return;
-        const pct = p && typeof p.progress === 'number' ? Math.round(p.progress * 100) : null;
-        setModelMsg(`Installing model${pct != null ? ` · ${pct}%` : '…'}`);
+        // eoreader3's load() reports progress as (fraction, message) — fraction
+        // is a 0..1 number, not an object. (Tolerate the object shape too.)
+        const frac = typeof p === 'number' ? p : (p && typeof p.progress === 'number' ? p.progress : null);
+        const pct = frac != null ? Math.round(frac * 100) : null;
+        setModelMsg(pct != null ? `Installing model · ${pct}%` : (msg || 'Installing model…'));
       },
-      onStatus: (s) => { if (alive) setModelMsg(s); },
     }).then((caps) => {
       if (!alive) return;
       if (dc.warmEmbeddings) dc.warmEmbeddings();
-      if (caps && caps.model) { setModelStage('ready'); setModelMsg(caps.python ? 'Model + Python ready' : 'Model ready · Python off'); }
-      else { setModelStage('off'); setModelMsg('Local parsing'); }
-    }).catch(() => { if (alive) { setModelStage('off'); setModelMsg('Local parsing'); } });
+      if (caps && caps.model) { setModelStage('ready'); setModelMsg('Model ready'); setModelErr(''); }
+      else { setModelStage('off'); setModelMsg('Local parsing'); setModelErr((caps && caps.modelError) || ''); }
+    }).catch(() => { if (alive) { setModelStage('off'); setModelMsg('Local parsing'); setModelErr(''); } });
     return () => { alive = false; };
   }, [entityCount > 0, model]);
 
@@ -415,9 +422,10 @@ function ChatView({ room, state, setSelection }) {
       const opts = {
         useLLM: true,                 // Smart parse is always on
         llmKey: model,
-        onModelProgress: (p) => {
-          const pct = p && typeof p.progress === 'number' ? Math.round(p.progress * 100) : null;
-          setStatus(`Loading on-device model${pct != null ? ` · ${pct}%` : '…'}`);
+        onModelProgress: (p, msg) => {
+          const frac = typeof p === 'number' ? p : (p && typeof p.progress === 'number' ? p.progress : null);
+          const pct = frac != null ? Math.round(frac * 100) : null;
+          setStatus(pct != null ? `Loading on-device model · ${pct}%` : (msg || 'Loading on-device model…'));
         },
       };
       const result = await DC().interpret(q, stateRef.current, opts);
@@ -440,7 +448,9 @@ function ChatView({ room, state, setSelection }) {
         <div className="dc-bar-title"><i className="ph ph-chat-circle-dots" aria-hidden="true"></i> Ask {room ? room.title : 'your data'}</div>
         <div className="dc-bar-right">
           <span className={`dc-status is-${modelStage === 'ready' ? 'ready' : modelStage === 'loading' ? 'loading' : 'off'}`}
-                title="Smart parse is always on: a small model + a local Python (pandas) runtime run entirely in your browser. Nothing leaves the page.">
+                title={modelErr
+                  ? `On-device model unavailable — ${modelErr} Answering with local parsing instead; nothing leaves the page.`
+                  : 'Smart parse is always on: a small on-device model runs entirely in your browser. Nothing leaves the page.'}>
             <span className="dc-dot" aria-hidden="true"></span>
             {modelMsg || (modelStage === 'ready' ? 'Model ready' : 'Local parsing')}
           </span>
@@ -464,7 +474,7 @@ function ChatView({ room, state, setSelection }) {
                 {starters.map((s, i) => <button key={i} className="dc-starter" onClick={() => ask(s)}>{s}</button>)}
               </div>
             )}
-            <p className="dc-note">Smart parse is always on. A small model ({LOCAL_MODELS.find(m => m.key === model)?.label}) and a local Python (pandas) runtime load automatically once your data is in, then run fully offline — but you can ask right away, since local parsing answers immediately.</p>
+            <p className="dc-note">Smart parse is always on. A small on-device model ({LOCAL_MODELS.find(m => m.key === model)?.label}) loads automatically once your data is in, then runs fully offline — but you can ask right away, since local parsing answers immediately.</p>
           </div>
         )}
 
