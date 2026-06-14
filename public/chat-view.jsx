@@ -326,6 +326,8 @@ function ChatView({ room, state, setSelection }) {
   const [status, setStatus] = useState(null);      // per-question thinking text
   const [modelStage, setModelStage] = useState('off'); // 'off' | 'loading' | 'ready'
   const [modelMsg, setModelMsg] = useState('');        // status-pill text
+  const [armed, setArmed] = useState(false);           // user engaged → start loading the model
+  const arm = useCallback(() => setArmed(true), []);   // idempotent; React bails if unchanged
   const [modelErr, setModelErr] = useState('');        // why the model is off, if it failed
   const scrollRef = useRef(null);
   const stateRef = useRef(state);
@@ -336,19 +338,23 @@ function ChatView({ room, state, setSelection }) {
     try { const t = (DC().knownTypes(state) || []); return suggestStarters(state, t); } catch (e) { return []; }
   }, [state && state.cursor, Object.keys(state.entities || {}).length]);
 
-  // Auto-load the analysis stack once the workspace data is in (Smart parse is
-  // always on — there's no toggle). Order is memory-conscious: the deterministic
-  // engine + math.js first (cheap, always useful), THEN the on-device model
-  // weights. We deliberately do NOT pull the Python (Pyodide/pandas) runtime —
-  // nothing queries it yet, and downloading it here only starves the model fetch
-  // of bandwidth and the tab of its memory budget. Every step is best-effort:
-  // deterministic queries answer immediately regardless, so a failed or skipped
-  // download never blocks asking.
+  // Load the analysis stack LAZILY — only once the user actually engages with
+  // the Ask view (clicks/types/asks), never just because data arrived. On a
+  // heavy workspace a model is hundreds of MB, so we don't pile it onto the tab
+  // until there's intent to use it. Order: the deterministic engine + math.js
+  // first (cheap), THEN the on-device model weights. We deliberately do NOT pull
+  // the Python (Pyodide/pandas) runtime — nothing queries it yet, and fetching
+  // it here only starves the model download of bandwidth and the tab of memory.
+  // Every step is best-effort and narrates its progress (engine → downloading
+  // model · % → preparing → ready); deterministic queries answer immediately
+  // regardless, so a slow or failed download never blocks asking.
   useEffect(() => {
-    if (!entityCount) return; // wait until the data has loaded
+    if (!armed || !entityCount) return; // lazy: wait for engagement + data
     const dc = DC();
     if (!dc || !dc.ensureAnalysis) return;
     let alive = true;
+    const picked = LOCAL_MODELS.find(m => m.key === model);
+    const shortName = picked ? picked.label.split('·')[0].trim() : 'model';
     setModelStage('loading'); setModelMsg('Loading engine…'); setModelErr('');
     dc.ensureAnalysis({
       modelKey: model,
@@ -358,16 +364,20 @@ function ChatView({ room, state, setSelection }) {
         // is a 0..1 number, not an object. (Tolerate the object shape too.)
         const frac = typeof p === 'number' ? p : (p && typeof p.progress === 'number' ? p.progress : null);
         const pct = frac != null ? Math.round(frac * 100) : null;
-        setModelMsg(pct != null ? `Installing model · ${pct}%` : (msg || 'Installing model…'));
+        if (pct != null && pct >= 99) setModelMsg(`Preparing ${shortName}…`);
+        else setModelMsg(pct != null ? `Downloading ${shortName} · ${pct}%` : (msg || `Downloading ${shortName}…`));
       },
     }).then((caps) => {
       if (!alive) return;
       if (dc.warmEmbeddings) dc.warmEmbeddings();
-      if (caps && caps.model) { setModelStage('ready'); setModelMsg('Model ready'); setModelErr(''); }
-      else { setModelStage('off'); setModelMsg('Local parsing'); setModelErr((caps && caps.modelError) || ''); }
+      if (caps && caps.model) {
+        setModelStage('ready'); setModelMsg(shortName + ' ready'); setModelErr('');
+      } else {
+        setModelStage('off'); setModelMsg('Local parsing'); setModelErr((caps && caps.modelError) || '');
+      }
     }).catch(() => { if (alive) { setModelStage('off'); setModelMsg('Local parsing'); setModelErr(''); } });
     return () => { alive = false; };
-  }, [entityCount > 0, model]);
+  }, [armed, entityCount > 0, model]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -403,6 +413,7 @@ function ChatView({ room, state, setSelection }) {
   const ask = useCallback(async (text) => {
     const q = String(text || '').trim();
     if (!q || busy) return;
+    arm();              // asking is engagement → bring the model up if it isn't
     setInput('');
     setMessages(m => [...m, { role: 'user', text: q }]);
     setBusy(true);
@@ -438,12 +449,15 @@ function ChatView({ room, state, setSelection }) {
       setBusy(false);
       setStatus(null);
     }
-  }, [busy, model]);
+  }, [busy, model, arm]);
 
   const onSubmit = (e) => { e.preventDefault(); ask(input); };
 
+  // Clicking/typing anywhere in the Ask view is "engagement" → arm the lazy
+  // model load. Focus alone (e.g. the input's autoFocus) deliberately doesn't,
+  // so the heavy download waits for real intent.
   return (
-    <div className="dc-view">
+    <div className="dc-view" onMouseDown={arm}>
       <div className="dc-bar">
         <div className="dc-bar-title"><i className="ph ph-chat-circle-dots" aria-hidden="true"></i> Ask {room ? room.title : 'your data'}</div>
         <div className="dc-bar-right">
@@ -474,7 +488,7 @@ function ChatView({ room, state, setSelection }) {
                 {starters.map((s, i) => <button key={i} className="dc-starter" onClick={() => ask(s)}>{s}</button>)}
               </div>
             )}
-            <p className="dc-note">Smart parse is always on. A small on-device model ({LOCAL_MODELS.find(m => m.key === model)?.label}) loads automatically once your data is in, then runs fully offline — but you can ask right away, since local parsing answers immediately.</p>
+            <p className="dc-note">Ask right away — local parsing answers instantly. The first time you click in here, a small on-device model ({LOCAL_MODELS.find(m => m.key === model)?.label}) starts loading in the background to sharpen trickier questions, then runs fully offline.</p>
           </div>
         )}
 
@@ -502,7 +516,7 @@ function ChatView({ room, state, setSelection }) {
           className="dc-input"
           value={input}
           placeholder="Ask about your data…"
-          onChange={e => setInput(e.target.value)}
+          onChange={e => { setInput(e.target.value); arm(); }}
           disabled={busy}
           autoFocus
         />

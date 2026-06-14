@@ -1190,13 +1190,14 @@
 
   async function planWithLLM(q, state, opts) {
     if (typeof window === 'undefined' || !window.EOLLM || !window.EOLLM.phrase) return null;
-    const key = (opts && opts.llmKey) || defaultLLMKey();
+    const requested = (opts && opts.llmKey) || defaultLLMKey();
+    if (!requested) return null;
+    // Load (or reuse) the model through loadModel, which watchdogs a hung
+    // download and falls back to deterministic local parsing rather than letting
+    // the ask hang. Returns the key actually loaded (or null → no model).
+    const key = await loadModel(requested, opts && opts.onModelProgress, opts && opts.onStatus);
     if (!key) return null;
     try {
-      if (window.EOLLM.isLoaded && !window.EOLLM.isLoaded(key)) {
-        const ok = await window.EOLLM.load(key, opts && opts.onModelProgress);
-        if (ok === false) return null;
-      }
       const user = schemaPrompt(state, q) + '\n\nQuestion: ' + q + '\nJSON:';
       const raw = await window.EOLLM.phrase({ mlcKey: key, mode: 'plain-chat', sysOverride: LLM_SYSTEM, question: user, maxTokens: 220, onToken: opts && opts.onPlanToken });
       const plan = parsePlanJSON(raw);
@@ -1488,13 +1489,41 @@
   }
   function warmEmbeddings() { try { if (window.EOEmbed && window.EOEmbed.warm) window.EOEmbed.warm(); } catch (e) {} }
 
+  // ── on-device model: lazy, watchdog-protected loading ──────────────────────
+  // wllama streams a model's weights into WASM memory, so a load can take a
+  // while — and the "stuck on Loading engine…" the chat showed was a download
+  // that stalled without ever reporting progress. Two guards keep that from
+  // freezing the view: the Ask view loads LAZILY (only once the user engages —
+  // see chat-view.jsx), and the load below is raced against a stall-watchdog so
+  // a hung fetch falls back to local parsing instead of spinning forever.
+  const MODEL_LOAD_STALL_MS = 60000;  // no progress for this long ⇒ treat as hung
+
+  // Race a model load against a stall watchdog: while progress keeps ticking we
+  // wait, but a long silence (hung download) resolves false so the caller can
+  // fall back. The underlying load can't be cancelled, but the view is no longer
+  // held hostage to it. Progress args are forwarded verbatim so the
+  // (fraction, message) shape eoreader3 emits reaches onProgress intact.
+  function loadWithWatchdog(key, onProgress) {
+    return new Promise((resolve) => {
+      let settled = false, lastBeat = Date.now();
+      const finish = (v) => { if (!settled) { settled = true; clearInterval(iv); resolve(v); } };
+      const iv = setInterval(() => {
+        if (!settled && Date.now() - lastBeat > MODEL_LOAD_STALL_MS) finish(false);
+      }, 5000);
+      let p;
+      try { p = window.EOLLM.load(key, (...args) => { lastBeat = Date.now(); if (onProgress) onProgress(...args); }); }
+      catch (e) { return finish(false); }
+      Promise.resolve(p).then((r) => finish(r !== false), () => finish(false));
+    });
+  }
+
   // Install the on-device intent model's WEIGHTS (the heavy part). ensureLLM
   // loads only the runtime; this downloads/initializes the chosen model so the
-  // chat can actually use it. Idempotent + best-effort — returns false if the
-  // model backend (eoreader3 llm.js) or the download isn't available, so a
-  // failure here never blocks the deterministic query core.
-  // Why a model load failed, for the UI to surface instead of degrading to
-  // "Local parsing" with no explanation. Set on every loadModel() outcome.
+  // chat can use it. The Ask view calls it LAZILY (only once the user engages),
+  // and the load is raced against a stall-watchdog so a hung download falls back
+  // to local parsing instead of spinning forever. Idempotent + best-effort:
+  // returns the key actually loaded (truthy) or false, recording _lastModelError
+  // (surfaced by the UI) so a failure never blocks the deterministic query core.
   let _lastModelError = null;
   function lastModelError() { return _lastModelError; }
   async function loadModel(key, onProgress) {
@@ -1505,16 +1534,15 @@
     }
     const k = resolveModelKey(key);
     if (!k) { _lastModelError = 'No on-device model is available from the model host.'; return false; }
-    try {
-      if (window.EOLLM.isLoaded && window.EOLLM.isLoaded(k)) { _lastModelError = null; return true; }
-      const ok = await window.EOLLM.load(k, onProgress);
-      if (ok === false) { _lastModelError = 'The model could not be loaded.'; return false; }
-      _lastModelError = null;
-      return true;
-    } catch (e) {
-      _lastModelError = (e && e.message) ? e.message : 'The model failed to load.';
-      return false;
-    }
+    if (window.EOLLM.isLoaded && window.EOLLM.isLoaded(k)) { _lastModelError = null; return k; }
+    // Reclaim caches before a big allocation (the model may exceed the app's
+    // soft memory budget), then watchdog the load so a hung download can't
+    // freeze the Ask view — it falls back to local parsing instead of spinning.
+    try { if (window.MatrixLive && window.MatrixLive.checkMemory) window.MatrixLive.checkMemory(); } catch (e) {}
+    const ok = await loadWithWatchdog(k, onProgress);
+    if (!ok) { _lastModelError = 'The model took too long or failed to load.'; return false; }
+    _lastModelError = null;
+    return k;
   }
 
   // Is there heap headroom to pull in a heavy WASM runtime? This app governs a
@@ -1583,7 +1611,8 @@
     const w = (typeof window !== 'undefined') ? window : {};
     return {
       engine: !!w.EOEngine, math: !!w.math, model: !!model, python: !!python,
-      modelError: model ? null : _lastModelError, modelKey: opts.modelKey || null,
+      modelError: model ? null : _lastModelError,
+      modelKey: (typeof model === 'string' ? model : (opts.modelKey || null)),
     };
   }
 
