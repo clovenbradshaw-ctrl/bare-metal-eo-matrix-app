@@ -1752,6 +1752,12 @@ table.csv-preview tr:last-child td{border-bottom:none}
 <script src="engine.js"></script>
 <script src="formula.js"></script>
 <script src="airtable-schema.js"></script>
+<!-- Airtable ongoing inbound sync (window.AirtableSync) + the over-Matrix
+     turn-taking coordinator (window.AirtableCoord). Plain modules: they only
+     touch window.AirtableAPI / MatrixEngine at runtime, so load order vs the
+     babel views below doesn't matter. -->
+<script src="airtable-sync.js"></script>
+<script src="airtable-coordinator.js"></script>
 <!-- "Ask" view: chat with your data. data-chat.js is the deterministic
      query bridge over the fold (window.DataChat); the Cleo reading engine it
      leans on for arithmetic / fuzzy match / prose is loaded lazily from the
@@ -1769,6 +1775,7 @@ table.csv-preview tr:last-child td{border-bottom:none}
 <script type="text/babel" data-presets="react" src="graph-view.jsx"></script>
 <script type="text/babel" data-presets="react" src="app-view.jsx"></script>
 <script type="text/babel" data-presets="react" src="sync-view.jsx"></script>
+<script type="text/babel" data-presets="react" src="airtable-panel.jsx"></script>
 <script type="text/babel" data-presets="react" src="chat-view.jsx"></script>
 <script type="text/babel" data-presets="react" src="schema-export.jsx"></script>
 <script type="text/babel" data-presets="react" src="app.jsx"></script>

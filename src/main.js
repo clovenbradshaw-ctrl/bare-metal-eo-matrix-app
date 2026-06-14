@@ -28,7 +28,7 @@ import { planLazyImport } from './dataset.js';
 import { fold, foldFrom, initial, stateHash } from './fold.js';
 import { createRoom as mxCreateRoom, discoverRooms, getTimeline, onTimeline,
          loadTimelineSince, invite, getMembers, loadRoomMembers, myPowerLevel, kickMember,
-         setMemberPowerLevel, onMembersChange, acceptInvite, onRoomChanges,
+         setMemberPowerLevel, onMembersChange, onRoomStateType, acceptInvite, onRoomChanges,
          onDecrypted, onLocalEchoUpdated, EventStatus,
          setName as mxSetRoomName, getDisplayName as mxGetDisplayName,
          setDisplayName as mxSetDisplayName } from './rooms.js';
@@ -42,7 +42,8 @@ import { loadManifest, saveManifest } from './roomManifest.js';
 import * as memory from './memory.js';
 import { ensureIdentity, loadIdentityFromVault, getIdentity, clearIdentity } from './crypto/identity.js';
 import { ensureWorkspaceKey, publishMemberKey, grantWorkspaceKey,
-         adoptGrantedKey, clearWorkspaceKeys } from './crypto/workspaceKey.js';
+         adoptGrantedKey, clearWorkspaceKeys, getCachedWorkspaceKey } from './crypto/workspaceKey.js';
+import { encryptBytesWithKey, decryptBytesWithKey, b64, unb64 } from './crypto/envelope.js';
 import { appendBlock, loadChains, readOwnHead } from './blocks.js';
 import * as driveBackup from './drivebackup.js';
 
@@ -70,6 +71,19 @@ const SDK_MAINTENANCE_INTERVAL_MS = 15_000;
 // State-event type stamped on every room this app creates. Its presence is how
 // we tell "a workspace this app owns" from "some other room the account is in".
 const META_STATE_TYPE = `${NAMESPACE}.meta`;
+
+// Sender-scoped state event carrying a member's WCK-encrypted Airtable PAT.
+// Room state is never megolm-encrypted, so the token is AES-GCM-sealed under
+// the workspace key before it's published — the homeserver only ever sees an
+// opaque blob, and only room members holding the WCK can open it. The token is
+// NEVER written into the operator log / durable chain (airtable-sync.js's
+// contract): the op-log carries only the webhook id + cursor.
+const AIRTABLE_PAT_TYPE = `${NAMESPACE}.airtable_pat`;
+
+// Decrypted shared PATs, held in memory only for the life of the tab — exactly
+// the posture airtable-import.jsx takes with a hand-pasted token. roomId →
+// token string. Cleared on logout/teardown; never touches disk.
+const sharedAirtableTokens = new Map();
 
 setNamespace(NAMESPACE);
 
@@ -681,6 +695,8 @@ async function tearDownLiveState() {
   roomBlockSync.clear();
   clearWorkspaceKeys();
   clearIdentity();
+  sharedAirtableTokens.clear();
+  if (window.AirtableSync?.stop) { try { window.AirtableSync.stop(); } catch {} }
   driveBackup.flushBackup().catch(() => {});   // drain a partial batch first
   driveBackup.clearConfig();
   identityReady = Promise.resolve(null);
@@ -937,6 +953,9 @@ async function openRoom(roomId) {
         }
       }));
       fns.push(onMembersChange(roomId, () => notify('members')));
+      // A member published / revoked a shared Airtable PAT: re-evaluate so the
+      // coordinator can pick it up (or stop) and the sync page can re-render.
+      fns.push(onRoomStateType(roomId, AIRTABLE_PAT_TYPE, () => notify('airtable')));
     } catch (e) {
       logProgress(`Subscribe ${roomId}: ${e.message}`);
     }
@@ -1409,6 +1428,118 @@ async function emit(roomId, op, content) {
   }
 }
 
+// ── Shared Airtable PAT (E2EE secret distribution over Matrix) ──
+//
+// One member pastes a PAT; every member gets it, without it ever reaching the
+// homeserver in the clear or being written into the append-only log. The token
+// is sealed under the room's Workspace Content Key (the same key the durable
+// block chain uses) and published as a sender-scoped room-state event. Other
+// members read that state, unseal it with the WCK they already hold, and keep
+// the plaintext in memory only — so airtable-sync.js / a push drain can use it.
+
+// Resolve a usable WCK for the room: cache → ensure (mint/self-unwrap) → adopt
+// a grant. Null only when the user has no envelope identity / power to publish.
+async function airtableWorkspaceKey(roomId) {
+  const client = getClient();
+  let wck = getCachedWorkspaceKey(roomId);
+  if (!wck && client) {
+    try {
+      wck = await ensureWorkspaceKey(client, NAMESPACE, roomId);
+      if (!wck) wck = await adoptGrantedKey(client, NAMESPACE, roomId);
+    } catch (e) { console.warn('[airtable] workspace key resolve failed:', e?.message || e); }
+  }
+  return wck || null;
+}
+
+// Seal `token` under the WCK and publish it at our own state_key. Members on
+// this base can now enable sync without ever seeing the raw token cross the
+// homeserver. Also caches it locally so this tab can use it immediately.
+async function shareAirtableToken(roomId, token, baseId = null) {
+  const client = getClient();
+  if (!client) throw new Error('Sign in before sharing an Airtable token');
+  const tok = String(token || '').trim();
+  if (!tok) throw new Error('empty token');
+  const wck = await airtableWorkspaceKey(roomId);
+  if (!wck) throw new Error('workspace key not ready — open the room and retry');
+  const blob = await encryptBytesWithKey(wck, new TextEncoder().encode(tok));
+  const mxid = client.getUserId();
+  await client.sendStateEvent(roomId, AIRTABLE_PAT_TYPE, {
+    v: 1, base: baseId || null, blob: b64(blob), by: mxid, ts: Date.now(),
+  }, mxid);
+  sharedAirtableTokens.set(roomId, tok);
+  notify('airtable');
+  return true;
+}
+
+// The plaintext token for this room, or null. Prefers the copy already
+// unsealed this session; otherwise scans every member's share (newest, not
+// revoked) and unseals the first one the WCK opens. Held in memory only.
+async function getSharedAirtableToken(roomId) {
+  if (sharedAirtableTokens.has(roomId)) return sharedAirtableTokens.get(roomId);
+  const client = getClient();
+  const room = client?.getRoom?.(roomId);
+  if (!room) return null;
+  let entries = [];
+  try { entries = room.currentState.getStateEvents(AIRTABLE_PAT_TYPE) || []; }
+  catch { return null; }
+  const candidates = entries
+    .map(ev => ev.getContent())
+    .filter(c => c && !c.revoked && c.blob)
+    .sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  if (!candidates.length) return null;
+  const wck = await airtableWorkspaceKey(roomId);
+  if (!wck) return null;
+  for (const c of candidates) {
+    try {
+      const bytes = await decryptBytesWithKey(wck, unb64(c.blob));
+      const tok = new TextDecoder().decode(bytes);
+      if (tok) { sharedAirtableTokens.set(roomId, tok); return tok; }
+    } catch { /* not openable with our WCK — try the next share */ }
+  }
+  return null;
+}
+
+// Non-secret summary for the UI: who shared, for which base, when — without
+// ever returning the token itself.
+function getAirtableTokenInfo(roomId) {
+  const client = getClient();
+  const room = client?.getRoom?.(roomId);
+  if (!room) return { shared: false };
+  let entries = [];
+  try { entries = room.currentState.getStateEvents(AIRTABLE_PAT_TYPE) || []; }
+  catch { return { shared: false }; }
+  const shares = entries
+    .map(ev => ({ content: ev.getContent(), key: ev.getStateKey() }))
+    .filter(x => x.content && !x.content.revoked && x.content.blob)
+    .sort((a, b) => (b.content.ts || 0) - (a.content.ts || 0));
+  if (!shares.length) return { shared: false, haveToken: sharedAirtableTokens.has(roomId) };
+  const top = shares[0].content;
+  return {
+    shared: true,
+    by: top.by || shares[0].key,
+    base: top.base || null,
+    ts: top.ts || 0,
+    sharers: shares.map(s => s.content.by || s.key),
+    haveToken: sharedAirtableTokens.has(roomId),
+  };
+}
+
+// Clear our own share (a revoked tombstone — Matrix auth only lets us write our
+// own state_key) and drop the in-memory copy. Other members' shares, if any,
+// stay theirs to revoke.
+async function revokeAirtableToken(roomId) {
+  sharedAirtableTokens.delete(roomId);
+  const client = getClient();
+  if (client) {
+    const mxid = client.getUserId();
+    try {
+      await client.sendStateEvent(roomId, AIRTABLE_PAT_TYPE,
+        { v: 1, revoked: true, by: mxid, ts: Date.now() }, mxid);
+    } catch (e) { logProgress('Airtable token revoke failed: ' + (e?.message || e)); }
+  }
+  notify('airtable');
+}
+
 // ── File import ──
 //
 // Encrypt the file in the browser, upload the ciphertext to the
@@ -1787,6 +1918,13 @@ window.MatrixLive = {
   // File import / media
   importFile: importFileToRoom,
   readMedia,
+  // Shared Airtable PAT: E2EE secret distribution over Matrix (WCK-sealed room
+  // state). Lets one member's token enable Airtable sync for the whole room
+  // without the homeserver or the op-log ever seeing it.
+  shareAirtableToken,
+  getSharedAirtableToken,
+  getAirtableTokenInfo,
+  revokeAirtableToken,
   // Media-store block chain (durable storage / wipe recovery)
   getBlockStats,
   forceBlockSync,
