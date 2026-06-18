@@ -135,6 +135,28 @@ function validSavedSelection(sel) {
   return ['table', 'schema', 'kanban', 'notebook', 'graph', 'timeline'].includes(sel.sliceKind);
 }
 
+// ── Left-panel layout — resizable width + collapsed state, persisted locally ─
+const SIDEBAR_KEY = 'matrix-events.sidebar.v1';
+const SIDEBAR_DEFAULT_WIDTH = 236;
+const SIDEBAR_MIN_WIDTH = 180;
+const SIDEBAR_MAX_WIDTH = 520;
+
+function clampSidebarWidth(w) {
+  if (!Number.isFinite(w)) return SIDEBAR_DEFAULT_WIDTH;
+  return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(w)));
+}
+
+function loadSidebarState() {
+  try {
+    const v = JSON.parse(localStorage.getItem(SIDEBAR_KEY) || '{}');
+    return { width: clampSidebarWidth(v?.width), collapsed: !!v?.collapsed };
+  } catch { return { width: SIDEBAR_DEFAULT_WIDTH, collapsed: false }; }
+}
+
+function saveSidebarState(state) {
+  try { localStorage.setItem(SIDEBAR_KEY, JSON.stringify(state)); } catch {}
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Cold-start sync status — the bridge proactively pulls every workspace
 // back from its durable media-store chain on a fresh load. This hook
@@ -776,6 +798,42 @@ function App() {
   // We also force-open it whenever the cursor is *not* live, so the user
   // can always see/return from a scrubbed state.
   const [scrubberOpen, setScrubberOpen] = useState(false);
+
+  // Left panel (sidebar): user-resizable width + a hide/show toggle, both
+  // persisted across reloads. The live width drives a CSS var on .shell-body.
+  const [sidebarWidth, setSidebarWidth] = useState(() => loadSidebarState().width);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => loadSidebarState().collapsed);
+  const sidebarWidthRef = useRef(sidebarWidth);
+  sidebarWidthRef.current = sidebarWidth;
+  useEffect(() => {
+    saveSidebarState({ width: sidebarWidth, collapsed: sidebarCollapsed });
+  }, [sidebarWidth, sidebarCollapsed]);
+
+  // Drag the divider to resize. We coalesce moves into one state update per
+  // frame (rAF) so the heavy view tree doesn't re-layout on every mousemove.
+  const onSidebarResizeStart = useCallback((e) => {
+    if (e.button != null && e.button !== 0) return; // primary button / touch only
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWidthRef.current;
+    let raf = 0;
+    let latest = startW;
+    const onMove = (ev) => {
+      latest = clampSidebarWidth(startW + (ev.clientX - startX));
+      if (!raf) raf = requestAnimationFrame(() => { raf = 0; setSidebarWidth(latest); });
+    };
+    const onUp = () => {
+      if (raf) cancelAnimationFrame(raf);
+      setSidebarWidth(latest);
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+      document.body.classList.remove('resizing-sidebar');
+    };
+    document.body.classList.add('resizing-sidebar');
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+  }, []);
+
   // Demo mode has no homeserver to push room renames to, so we keep the
   // user's chosen names in-memory and merge them into the rooms list.
   const [demoTitleOverrides, setDemoTitleOverrides] = useDemoTitleOverrides();
@@ -1598,6 +1656,15 @@ function App() {
   return (
     <div className="shell" onClickCapture={onActivityCapture}>
       <div className="topbar">
+        <button
+          className={`topbar-toggle ${sidebarCollapsed ? 'off' : ''}`}
+          onClick={() => setSidebarCollapsed(c => !c)}
+          title={sidebarCollapsed ? 'show the left panel' : 'hide the left panel'}
+          aria-label={sidebarCollapsed ? 'show the left panel' : 'hide the left panel'}
+          aria-pressed={!sidebarCollapsed}
+        >
+          <i className="ph ph-sidebar-simple" aria-hidden="true"></i>
+        </button>
         <window.IdentityChip
           session={session}
           onSignOut={handleSignOut}
@@ -1667,7 +1734,10 @@ function App() {
         </div>
       )}
 
-      <div className="shell-body">
+      <div
+        className={`shell-body ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}
+        style={{ '--sidebar-w': sidebarWidth + 'px' }}
+      >
         <window.Sidebar
           room={currentRoom}
           state={renderState}
@@ -1686,6 +1756,16 @@ function App() {
           lastEventTs={lastEventTs}
           syncOutOfDate={syncOutOfDate}
           syncByTable={syncByTable}
+        />
+
+        <div
+          className="sidebar-resizer"
+          onPointerDown={onSidebarResizeStart}
+          onDoubleClick={() => setSidebarWidth(SIDEBAR_DEFAULT_WIDTH)}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="resize the left panel"
+          title="drag to resize · double-click to reset"
         />
 
         <div className="view-area">
