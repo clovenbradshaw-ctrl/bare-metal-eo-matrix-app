@@ -963,6 +963,22 @@ async function openRoom(roomId) {
   roomUnsubs.set(roomId, fns);
   enforceRoomCap();
 
+  // Persist a checkpoint (folded state + dedup set) so a LATER open of this
+  // room can skip re-decrypting and re-folding the history covered by it —
+  // see store.js's own header comment. store.saveCheckpoint/loadCheckpoint
+  // existed with no caller anywhere in this codebase before this; this is
+  // that wiring. Cheap and safe to call every open: it costs one fold of
+  // events already sitting in memory (no new decrypt) and one small
+  // encrypted write, gated so an empty room never bothers.
+  const finalEvents = roomEvents.get(roomId) || [];
+  if (finalEvents.length > 0) {
+    try {
+      await store.saveCheckpoint(fold(finalEvents));
+    } catch (e) {
+      console.warn('[bridge] checkpoint save failed:', e?.message || e);
+    }
+  }
+
   // Durable system of record: reconcile this room with its media-store
   // block chain (recover anything the megolm timeline lost, back-fill
   // anything the chain doesn't have yet). Fire-and-forget — the room is
