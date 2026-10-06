@@ -60,7 +60,7 @@ export const OP = {
   SYN: { key: 'syn', glyph: '△', triad: 'structure',    order: 5, stored: true  },
   DEF: { key: 'def', glyph: '⊢', triad: 'significance', order: 6, stored: true  },
   EVA: { key: 'eva', glyph: '⊨', triad: 'significance', order: 7, stored: true  },
-  REC: { key: 'rec', glyph: '⊛', triad: 'significance', order: 8, stored: true  },
+  REC: { key: 'rec', glyph: '◉', triad: 'significance', order: 8, stored: true  },
 };
 
 export function eventType(op) {

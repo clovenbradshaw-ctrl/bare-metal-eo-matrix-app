@@ -403,7 +403,9 @@ emit(operator)**. There is nothing else.
 | `SYN` | △ | structure | Merging multiple anchors into a new synthesized one. The synthesis is a new entity, not a mutation. |
 | `DEF` | ⊢ | significance | Setting a value on an existing entity within the current frame. This is the workhorse — ~80% of your emits. |
 | `EVA` | ⊨ | significance | Recording a judgment: did this entity satisfy a criterion? Pass/fail/hold + a note. EVA without prior DEF is flagged as "criterionless judgment." |
-| `REC` | ⊛ | significance | The frame itself changed. A schema reinterpretation. Rare. Every entity is now legible under a new context. |
+| `REC` | ◉ | significance | The frame itself changed. A schema reinterpretation. Rare. Every entity is now legible under a new context. |
+
+> REC's glyph is ◉ (a ring around a filled circle: the retraced run kept as record, inside a new open frame). It was ⊛ until 2026-10-06. Events stored earlier keep ⊛; read both as REC. See the EO wiki, "Operator Naming".
 
 **Dependency rule** (enforced as advisory `_violations` by the fold, not as
 hard errors): an entity's high-water mark cannot retreat. `EVA` on an entity

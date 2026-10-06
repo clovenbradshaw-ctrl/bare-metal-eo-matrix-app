@@ -1311,7 +1311,7 @@
   // exactly how it understood the question before you trust the number:
   //   SEG ｜ scope to a table/partition      EVA ⊨ a filter predicate
   //   CON ⤫ follow a relationship/foreign key SYN △ an aggregate (rows → a whole)
-  //   REC ⊛ recontextualize (group-by / a math transform on the value)
+  //   REC ◉ recontextualize (group-by / a math transform on the value)
   //   DEF ⊢ set the read frame (sort / window) NUL ∅ an unbound observation
   // These are descriptive only — eoTrace never emits an operator to the log
   // (this module is read-only). Presented in reading order (scope → filter →
@@ -1325,7 +1325,7 @@
     SYN: { glyph: '△', word: 'Synthesize' },
     DEF: { glyph: '⊢', word: 'Define' },
     EVA: { glyph: '⊨', word: 'Evaluate' },
-    REC: { glyph: '⊛', word: 'Recontextualize' },
+    REC: { glyph: '◉', word: 'Recontextualize' },
   };
   function eoFilterPhrase(f) {
     if (f.op === 'empty') return f.field + ' is empty';

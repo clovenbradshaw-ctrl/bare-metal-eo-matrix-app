@@ -202,7 +202,7 @@ function pickColumns(result) {
 // ───────────────────────────────────────────────────────────────────────────
 // The query, read back in EO notation. This is the "confirm what I'm asking"
 // surface: before you trust the number, see exactly how the question was
-// decomposed — SEG ｜ scope, EVA ⊨ filter, SYN △ aggregate, REC ⊛ group/math,
+// decomposed — SEG ｜ scope, EVA ⊨ filter, SYN △ aggregate, REC ◉ group/math,
 // DEF ⊢ sort/window, NUL ∅ a phrase we couldn't bind. DataChat.eoTrace builds
 // these from the same spec the answer came from (read-only — nothing is emitted
 // to the log). Renders for every answer, so it works with Smart parse off.

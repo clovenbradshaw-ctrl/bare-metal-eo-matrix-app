@@ -30,7 +30,7 @@ const SLICE_KINDS = {
   timeline:  { icon: '⏚', label: 'timeline',  blurb: 'per-anchor event lifeline'                },
   graph:     { icon: '△', label: 'graph',     blurb: 'node-link view of related rows'           },
   notebook:  { icon: '▤', label: 'notebook',  blurb: 'chronological narrative entries'          },
-  synthesis: { icon: '⊛', label: 'synthesis', blurb: 'SYN-rollup view'                          },
+  synthesis: { icon: '◉', label: 'synthesis', blurb: 'SYN-rollup view'                          },
   schema:    { icon: '⊢', label: 'schema',    blurb: 'declared shape of the set'                },
   log:       { icon: '⊟', label: 'log',       blurb: 'append-only event timeline'               },
 };

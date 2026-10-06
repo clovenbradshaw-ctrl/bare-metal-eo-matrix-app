@@ -21,7 +21,7 @@ const OP = {
   SYN: { key: 'syn', glyph: '△', name: 'Synthesize',      triad: 'structure',    order: 5, stored: true  },
   DEF: { key: 'def', glyph: '⊢', name: 'Define',          triad: 'significance', order: 6, stored: true  },
   EVA: { key: 'eva', glyph: '⊨', name: 'Evaluate',        triad: 'significance', order: 7, stored: true  },
-  REC: { key: 'rec', glyph: '⊛', name: 'Recontextualize', triad: 'significance', order: 8, stored: true  },
+  REC: { key: 'rec', glyph: '◉', name: 'Recontextualize', triad: 'significance', order: 8, stored: true  },
 };
 
 const STORED_OPS = Object.values(OP).filter(o => o.stored);
