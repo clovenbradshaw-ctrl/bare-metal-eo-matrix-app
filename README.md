@@ -51,13 +51,13 @@ Nine operators. A closed algebra. Every change to application state decomposes i
 | SIG | ○ | Attention (ephemeral, not stored) |
 | **INS** | ● | Instantiate — create a new entity with a permanent anchor ID |
 | **SEG** | ｜ | Segment — move an entity across a partition boundary |
-| **CON** | ⤫ | Connect — typed relationship between two anchors |
+| **CON** | ⋈ | Connect — typed relationship between two anchors |
 | **SYN** | △ | Synthesize — merge inputs into a whole |
 | **DEF** | ⊢ | Define — set a value within the current frame |
 | **EVA** | ⊨ | Evaluate — test a particular against a general |
 | **REC** | ◉ | Recontextualize — change what the data means |
 
-> REC's glyph is ◉ (a ring around a filled circle: the retraced run kept as record, inside a new open frame). It was ⊛ until 2026-10-06. Events stored earlier keep ⊛; read both as REC. See the EO wiki, "Operator Naming".
+> REC's glyph is ◉ (a ring around a filled circle: the retraced run kept as record, inside a new open frame). It was ⊛ until 2026-10-06. Events stored earlier keep ⊛; read both as REC. See the EO wiki, "Operator Naming". CON's glyph is ⋈; it was ⤫.
 
 The seven stored operators become Matrix timeline events. The fold replays them into current state. They are dependency-ordered (`NUL → SIG → INS → SEG → CON → SYN → DEF → EVA → REC`): each operator's preconditions are satisfied by the ones before it, and the fold flags transformations that skip a dependency. This is what a relational schema can't represent about its own evolution — the kind of a change, ordered so the ordering rejects malformed ones.
 

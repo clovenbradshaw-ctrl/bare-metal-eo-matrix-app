@@ -1310,7 +1310,7 @@
   // natural decomposition into the same algebra, so the Ask view can show you
   // exactly how it understood the question before you trust the number:
   //   SEG ｜ scope to a table/partition      EVA ⊨ a filter predicate
-  //   CON ⤫ follow a relationship/foreign key SYN △ an aggregate (rows → a whole)
+  //   CON ⋈ follow a relationship/foreign key SYN △ an aggregate (rows → a whole)
   //   REC ◉ recontextualize (group-by / a math transform on the value)
   //   DEF ⊢ set the read frame (sort / window) NUL ∅ an unbound observation
   // These are descriptive only — eoTrace never emits an operator to the log
@@ -1321,7 +1321,7 @@
     SIG: { glyph: '○', word: 'Attend' },
     INS: { glyph: '●', word: 'Instantiate' },
     SEG: { glyph: '｜', word: 'Segment' },
-    CON: { glyph: '⤫', word: 'Connect' },
+    CON: { glyph: '⋈', word: 'Connect' },
     SYN: { glyph: '△', word: 'Synthesize' },
     DEF: { glyph: '⊢', word: 'Define' },
     EVA: { glyph: '⊨', word: 'Evaluate' },
